@@ -332,11 +332,13 @@ name = "coffeepos-desktop"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -1,15 +1,19 @@
-# Runtime — hợp đồng Phase 2 (chưa triển khai)
+# Runtime — hợp đồng Phase 2
 
 Nguồn sự thật kiến trúc: [ARCHITECTURE.md](../ARCHITECTURE.md).
 
 - Runtime production resolve từ Tauri resource directory + verified manifest; không lấy từ PATH/LocalWP/Homebrew.
 - Development resolve qua cấu hình developer riêng, đường dẫn tuyệt đối bên `runtime/development/`; không yêu cầu PHP/DB global.
 - Manifest theo target: `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, `x86_64-apple-darwin`. Mỗi artifact pin version/hash/source/license và dependent DLL/dylib.
-- PHP candidate 8.4 NTS trên Windows; test mysqli, curl, openssl, mbstring, intl, zip, gd, fileinfo, DOM/XML và extension requirements của exact WP/WC/plugin bundle. Pin php.ini/CA trust, không kế thừa cấu hình PHP máy người dùng.
-- MariaDB candidate 11.4; explicit defaults-file, basedir/datadir/port/bind-address, minimal privileges và credential riêng. Không đọc my.ini/my.cnf global. Windows init utility và macOS init scripts phải được thử trên bundle thật.
+- Windows x64 development runtime hiện pin PHP 8.4.25 NTS VS17 x64 (`43a8f67ed2e5223fafb21293c85976361808855405278cef2cf3037c3ae2529c`) và MariaDB 11.4.13 winx64 ZIP (`d62986d433eeebfde218560b276103831604a61e929e87f1a17f5aebd80257e2`). Template manifest và `php.ini` nằm trong `scripts/runtime-development/`; `scripts/stage-runtime-development.ps1` xác minh hash trước extract vào `runtime/development/x86_64-pc-windows-msvc/` (ignored).
+- PHP development `php.ini` bật mysqli, PDO MySQL, curl, openssl, mbstring, intl, zip, gd và fileinfo từ bundle đã pin. DOM/XML được kiểm bằng module list vì các module tương ứng là phần của build PHP. Không kế thừa cấu hình PHP máy người dùng.
+- MariaDB dùng `mariadbd.exe`, `mariadb.exe` và `mariadb-install-db.exe` từ bundle đã pin; runtime manager phải truyền explicit defaults-file, basedir/datadir/port/bind-address. Không đọc my.ini/my.cnf global và Phase 2 startup không tự initialize datadir chưa provision.
 - MariaDB readiness là authenticated SQL probe; PHP readiness là response nhận diện đúng instance; application health do plugin xác nhận.
 - PHP document root là `site/`; router script thuộc desktop layer phải xử lý permalink, static files, path traversal và chặn file nhạy cảm, không sửa WP core.
+- Trước provisioning, Phase 2 dùng fixture riêng `fixture/router.php` cho HTTP readiness tại `/__coffeepos_runtime_health`. Fixture này chỉ chứng minh đúng PHP process đã sẵn sàng; không thay application health của WordPress/plugin.
 - Mỗi start attempt có timeout, stderr redaction, cleanup toàn bộ child đã tạo. Shutdown/crash/parent-kill phải test riêng trên từng OS.
 - Log tách application/runtime/php/database/wordpress, có size bounds và export redacted.
+- Windows runtime manager hiện dùng Job Object `KILL_ON_JOB_CLOSE`, `CREATE_NO_WINDOW`, dynamic loopback ports và authenticated SQL probe. PHP readiness dùng file nonce riêng cho từng start attempt; `fs::canonicalize` chỉ phục vụ kiểm tra containment, còn đường dẫn truyền sang Windows PHP/MariaDB được chuyển về dạng command-compatible thay vì `\\?\...`.
+- Smoke test 2026-09-17 với datadir disposable đã PASS chuỗi `start → stop → restart-from-stopped → restart-while-running → stop`, dùng đúng PHP/MariaDB staged; sau test không còn process staged chạy nền.
 
 Trước khi sang provisioning phải chứng minh bundle chạy trên máy không có LocalWP/PHP/MariaDB dev tools. Trên macOS kiểm tra `otool -L`, rpath và dependencies để loại đường dẫn `/opt/homebrew` hoặc build-machine paths.

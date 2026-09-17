@@ -1,6 +1,6 @@
 # CoffeePOS Desktop — Kiến trúc
 
-Ngày khảo sát: 2026-09-17. Trạng thái: thiết kế nền tảng + mã nguồn Phase 1; runtime Phase 2–8 chưa triển khai.
+Ngày khảo sát: 2026-09-17. Trạng thái: Phase 1 Windows hoàn tất; Phase 2 runtime manager Windows-first đã triển khai và smoke-test với PHP/MariaDB thật; Phase 3–8 chưa triển khai.
 
 ## 1. Mục tiêu và ranh giới
 

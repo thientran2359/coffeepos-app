@@ -12,7 +12,7 @@ npm run doctor
 npm run dev
 ```
 
-Phase 1 mở desktop shell, tạo thư mục dữ liệu và đọc/lưu cấu hình. **Chưa khởi chạy PHP/MariaDB, chưa cài WordPress và chưa mở POS.** Nút cài đặt được vô hiệu hóa, không mô phỏng runtime đã sẵn sàng.
+Phase 1 Windows đã hoàn tất shell/config. Phase 2 Windows-first đã có runtime manager cho PHP + MariaDB portable với start/stop/restart, dynamic loopback ports, SQL/HTTP readiness, logging và process containment. **WordPress/WooCommerce/CoffeePOS provisioning vẫn chưa được thực hiện; đó là Phase 3–4.**
 
 ```sh
 npm run dev:ui    # preview trong trình duyệt; không có native IPC hoặc persistence
@@ -27,6 +27,7 @@ npm test          # Rust tests cho cấu hình/persistence/locking
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): ranh giới kiến trúc, khảo sát Windows/macOS, quyết định và rủi ro.
 - [Phase 1](docs/PHASE-01.md): phạm vi, checklist nghiệm thu và bằng chứng kiểm tra.
+- [Phase 2](docs/PHASE-02.md): runtime manager Windows-first, pinned binaries và bằng chứng start/stop/restart.
 - [Development](docs/DEVELOPMENT.md): setup từng hệ điều hành, lệnh chạy, vị trí dữ liệu.
 - [Runtime](docs/RUNTIME.md): hợp đồng runtime cho Phase 2.
 - [Provisioning](docs/PROVISIONING.md): kế hoạch Phase 3–4 và health API đề xuất.

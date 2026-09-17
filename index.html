@@ -7,13 +7,24 @@
   </head>
   <body>
     <main>
-      <header><span class="mark" aria-hidden="true">C</span><div><h1>CoffeePOS</h1><p>Môi trường bán hàng tại cửa hàng</p></div><span class="phase">Phase 1</span></header>
+      <header><span class="mark" aria-hidden="true">C</span><div><h1>CoffeePOS</h1><p>Môi trường bán hàng tại cửa hàng</p></div><span class="phase">Phase 2</span></header>
       <section class="card" aria-labelledby="status-title">
         <span class="eyebrow">COFFEEPOS DESKTOP</span>
         <h2 id="status-title">Đang đọc cấu hình…</h2>
         <p id="status-description" role="status" aria-live="polite">Vui lòng chờ.</p>
         <button id="retry" type="button" hidden>Thử lại</button>
-        <div id="setup" hidden><button type="button" disabled>Cài đặt CoffeePOS</button><p class="hint">Cài đặt môi trường sẽ có ở Phase 2–4.</p></div>
+        <div id="setup" hidden><button type="button" disabled>Cài đặt CoffeePOS</button><p class="hint">Provisioning WordPress/database sẽ được thực hiện ở Phase 3–4.</p></div>
+      </section>
+      <section class="card" id="runtime" hidden aria-labelledby="runtime-title">
+        <span class="eyebrow">LOCAL RUNTIME</span>
+        <h2 id="runtime-title">Runtime</h2>
+        <p id="runtime-description" role="status" aria-live="polite">Đang kiểm tra runtime…</p>
+        <div class="actions">
+          <button id="runtime-start" type="button">Khởi động</button>
+          <button id="runtime-stop" type="button">Dừng</button>
+          <button id="runtime-restart" type="button">Khởi động lại</button>
+        </div>
+        <dl><dt>Trạng thái</dt><dd id="runtime-state">—</dd><dt>PHP</dt><dd id="runtime-php">—</dd><dt>MariaDB</dt><dd id="runtime-mariadb">—</dd><dt>HTTP</dt><dd id="runtime-http">—</dd><dt>Database</dt><dd id="runtime-database">—</dd></dl>
       </section>
       <section class="card" id="settings" hidden aria-labelledby="settings-title">
         <h2 id="settings-title">Cấu hình ứng dụng</h2>

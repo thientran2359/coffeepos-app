@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-pc-windows-msvc",
+  "runtime_version": "2026-09-17.windows-dev.1",
+  "php": {
+    "version": "8.4.25",
+    "archive": "php-8.4.25-nts-Win32-vs17-x64.zip",
+    "source": "https://downloads.php.net/~windows/releases/archives/php-8.4.25-nts-Win32-vs17-x64.zip",
+    "checksum_source": "https://www.php.net/downloads.php?os=windows&version=8.4",
+    "archive_sha256": "43a8f67ed2e5223fafb21293c85976361808855405278cef2cf3037c3ae2529c",
+    "license": "PHP-3.01",
+    "license_file": "php/license.txt",
+    "executable": "php/php.exe",
+    "ini": "php/php.ini"
+  },
+  "mariadb": {
+    "version": "11.4.13",
+    "archive": "mariadb-11.4.13-winx64.zip",
+    "source": "https://archive.mariadb.org/mariadb-11.4.13/winx64-packages/mariadb-11.4.13-winx64.zip",
+    "checksum_source": "https://downloads.mariadb.org/rest-api/mariadb/11.4.13/mariadb-11.4.13-winx64.zip/checksum/",
+    "archive_sha256": "d62986d433eeebfde218560b276103831604a61e929e87f1a17f5aebd80257e2",
+    "license": "GPL-2.0-only",
+    "license_file": "mariadb/COPYING",
+    "server": "mariadb/bin/mariadbd.exe",
+    "client": "mariadb/bin/mariadb.exe",
+    "install_db": "mariadb/bin/mariadb-install-db.exe"
+  },
+  "http_fixture": {
+    "router": "fixture/router.php",
+    "document_root": "fixture/site",
+    "health_path": "/__coffeepos_runtime_health"
+  }
+}

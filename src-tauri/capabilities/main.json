@@ -1,7 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "Only bundled shell can read and save application configuration.",
+  "description": "Only the bundled shell can read configuration and control the managed local runtime.",
   "windows": ["main"],
-  "permissions": ["allow-get-shell-info", "allow-save-store-name"]
+  "permissions": [
+    "allow-get-shell-info",
+    "allow-save-store-name",
+    "allow-get-runtime-info",
+    "allow-start-runtime",
+    "allow-stop-runtime",
+    "allow-restart-runtime"
+  ]
 }

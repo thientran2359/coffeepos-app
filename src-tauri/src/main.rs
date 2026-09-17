@@ -1,14 +1,22 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+mod runtime;
 
 use config::{AppConfig, Store};
+use runtime::{RuntimeInfo, RuntimeManager};
 use serde::Serialize;
+#[cfg(debug_assertions)]
+use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{Manager, State};
 
 #[derive(Default)]
-struct ShellState(Mutex<Option<Store>>);
+struct ShellState {
+    store: Mutex<Option<Store>>,
+    runtime: Mutex<Option<RuntimeManager>>,
+}
 
 #[derive(Serialize)]
 struct ShellInfo {
@@ -23,7 +31,7 @@ fn with_store(
     operation: impl FnOnce(&mut Store) -> Result<(), String>,
 ) -> Result<ShellInfo, String> {
     let mut guard = state
-        .0
+        .store
         .lock()
         .map_err(|_| "Application state unavailable. Restart CoffeePOS Desktop.")?;
     if guard.is_none() {
@@ -43,6 +51,79 @@ fn with_store(
     })
 }
 
+#[cfg(debug_assertions)]
+fn data_root(app: &tauri::AppHandle, state: &ShellState) -> Result<PathBuf, String> {
+    let mut guard = state
+        .store
+        .lock()
+        .map_err(|_| "Application state unavailable. Restart CoffeePOS Desktop.")?;
+    if guard.is_none() {
+        let root = app.path().app_local_data_dir().map_err(|e| {
+            format!("Cannot locate application data: {e}. Check your OS user profile.")
+        })?;
+        *guard = Some(Store::open(root)?);
+    }
+    guard
+        .as_ref()
+        .map(|store| store.root.clone())
+        .ok_or_else(|| "Configuration unavailable. Retry startup.".to_string())
+}
+
+#[cfg(debug_assertions)]
+fn development_runtime_paths() -> Result<(PathBuf, PathBuf), String> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let project_root = manifest_dir
+        .parent()
+        .ok_or("Cannot resolve CoffeePOS Desktop project root for the development runtime.")?
+        .to_path_buf();
+    let target = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "x86_64-pc-windows-msvc"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "x86_64-apple-darwin"
+    } else {
+        return Err("No development runtime target is configured for this platform.".into());
+    };
+    let manifest = project_root
+        .join("runtime")
+        .join("development")
+        .join(target)
+        .join("manifest.json");
+    Ok((project_root, manifest))
+}
+
+fn with_runtime(
+    _app: &tauri::AppHandle,
+    state: &ShellState,
+    operation: impl FnOnce(&mut RuntimeManager) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo>,
+) -> Result<RuntimeInfo, String> {
+    #[cfg(debug_assertions)]
+    let root = data_root(_app, state)?;
+    let mut guard = state
+        .runtime
+        .lock()
+        .map_err(|_| "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string())?;
+    if guard.is_none() {
+        #[cfg(debug_assertions)]
+        {
+            let (project_root, manifest) = development_runtime_paths()?;
+            *guard = Some(
+                RuntimeManager::from_development(&project_root, &manifest, root)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            return Err("Bundled Phase 2 runtime resources are not packaged yet. Use a development build until runtime packaging is implemented.".into());
+        }
+    }
+    let manager = guard
+        .as_mut()
+        .ok_or_else(|| "Runtime manager unavailable. Retry startup.".to_string())?;
+    operation(manager).map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 fn get_shell_info(
     app: tauri::AppHandle,
@@ -60,10 +141,49 @@ fn save_store_name(
     with_store(&app, &state, |store| store.save_name(&store_name))
 }
 
+#[tauri::command]
+fn get_runtime_info(
+    app: tauri::AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<RuntimeInfo, String> {
+    with_runtime(&app, &state, |runtime| Ok(runtime.refresh()))
+}
+
+#[tauri::command]
+fn start_runtime(
+    app: tauri::AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<RuntimeInfo, String> {
+    with_runtime(&app, &state, RuntimeManager::start)
+}
+
+#[tauri::command]
+fn stop_runtime(
+    app: tauri::AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<RuntimeInfo, String> {
+    with_runtime(&app, &state, RuntimeManager::stop)
+}
+
+#[tauri::command]
+fn restart_runtime(
+    app: tauri::AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<RuntimeInfo, String> {
+    with_runtime(&app, &state, RuntimeManager::restart)
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(ShellState::default())
-        .invoke_handler(tauri::generate_handler![get_shell_info, save_store_name])
+        .invoke_handler(tauri::generate_handler![
+            get_shell_info,
+            save_store_name,
+            get_runtime_info,
+            start_runtime,
+            stop_runtime,
+            restart_runtime
+        ])
         .run(tauri::generate_context!())
         .expect("CoffeePOS Desktop could not start the native shell");
 }

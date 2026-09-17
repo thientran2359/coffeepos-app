@@ -11,6 +11,8 @@ h1 { font-size: 23px; margin: 0; } header p { margin: 4px 0 0; font-size: 13px; 
 h2 { font-size: 21px; margin: 14px 0; } p { line-height: 1.6; }
 button { border: 0; border-radius: 8px; padding: 11px 18px; background: #244c3c; color: #fff; font: inherit; cursor: pointer; }
 button:disabled { background: #e4e9e5; color: #59685d; cursor: not-allowed; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }
+.actions button { flex: 0 0 auto; }
 input { display: block; width: 100%; border: 1px solid #b9c6bd; padding: 12px; border-radius: 8px; font: inherit; margin-top: 8px; }
 label { font-weight: 600; font-size: 14px; }
 .hint, footer { color: #607067; font-size: 13px; }
