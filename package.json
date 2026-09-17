@@ -1,0 +1,27 @@
+{
+  "name": "coffeepos-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "^20.19.0 || >=22.12.0" },
+  "scripts": {
+    "dev": "tauri dev",
+    "dev:ui": "vite --host 127.0.0.1",
+    "build:ui": "tsc --noEmit && vite build",
+    "build": "tauri build --no-bundle -- --locked",
+    "package": "tauri build -- --locked",
+    "lint:ui": "tsc --noEmit",
+    "lint": "npm run lint:ui && cargo fmt --manifest-path src-tauri/Cargo.toml --check && cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml --locked",
+    "doctor": "node scripts/doctor.mjs",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
+  }
+}

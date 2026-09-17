@@ -1,0 +1,22 @@
+:root { font-family: "Segoe UI", system-ui, sans-serif; color: #293b35; background: #f4f3ef; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { width: min(760px, 100%); margin: 0 auto; padding: 40px 24px; }
+header { display: flex; gap: 14px; align-items: center; margin-bottom: 32px; }
+.mark { display: grid; place-items: center; width: 48px; height: 48px; border-radius: 14px; background: #244c3c; color: white; font-size: 28px; font-weight: 700; }
+h1 { font-size: 23px; margin: 0; } header p { margin: 4px 0 0; font-size: 13px; }
+.phase { margin-left: auto; font-size: 12px; border: 1px solid #c5cfc9; border-radius: 20px; padding: 6px 10px; white-space: nowrap; }
+.card { background: #fff; padding: 28px; margin: 18px 0; border: 1px solid #dfe4df; border-radius: 16px; }
+.eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 1.7px; color: #63786b; }
+h2 { font-size: 21px; margin: 14px 0; } p { line-height: 1.6; }
+button { border: 0; border-radius: 8px; padding: 11px 18px; background: #244c3c; color: #fff; font: inherit; cursor: pointer; }
+button:disabled { background: #e4e9e5; color: #59685d; cursor: not-allowed; }
+input { display: block; width: 100%; border: 1px solid #b9c6bd; padding: 12px; border-radius: 8px; font: inherit; margin-top: 8px; }
+label { font-weight: 600; font-size: 14px; }
+.hint, footer { color: #607067; font-size: 13px; }
+dl { border-top: 1px solid #e2e7e3; padding-top: 20px; font-size: 13px; }
+dt { color: #607067; margin-top: 12px; } dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+footer { text-align: center; margin-top: 26px; }
+:focus-visible { outline: 3px solid #c38b42; outline-offset: 3px; }
+[hidden] { display: none !important; }
+@media (max-width: 500px) { main { padding: 24px 16px; } .card { padding: 20px; } header p { max-width: 180px; } }

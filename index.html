@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CoffeePOS Desktop</title>
+  </head>
+  <body>
+    <main>
+      <header><span class="mark" aria-hidden="true">C</span><div><h1>CoffeePOS</h1><p>Môi trường bán hàng tại cửa hàng</p></div><span class="phase">Phase 1</span></header>
+      <section class="card" aria-labelledby="status-title">
+        <span class="eyebrow">COFFEEPOS DESKTOP</span>
+        <h2 id="status-title">Đang đọc cấu hình…</h2>
+        <p id="status-description" role="status" aria-live="polite">Vui lòng chờ.</p>
+        <button id="retry" type="button" hidden>Thử lại</button>
+        <div id="setup" hidden><button type="button" disabled>Cài đặt CoffeePOS</button><p class="hint">Cài đặt môi trường sẽ có ở Phase 2–4.</p></div>
+      </section>
+      <section class="card" id="settings" hidden aria-labelledby="settings-title">
+        <h2 id="settings-title">Cấu hình ứng dụng</h2>
+        <form id="settings-form">
+          <label for="store-name">Tên cửa hàng dự kiến</label>
+          <input id="store-name" name="storeName" maxlength="80" required autocomplete="organization" />
+          <p class="hint">Nhãn cấu hình ban đầu; chưa tạo cửa hàng WordPress.</p>
+          <button id="save" type="submit">Lưu cấu hình</button>
+          <p id="save-status" role="status" aria-live="polite"></p>
+        </form>
+        <dl><dt>Kết nối mặc định</dt><dd>Chỉ trên máy này · 127.0.0.1</dd><dt>Thư mục dữ liệu</dt><dd id="data-dir"></dd><dt>Phiên bản</dt><dd id="version"></dd></dl>
+      </section>
+      <footer>Dữ liệu cửa hàng được lưu riêng với ứng dụng.</footer>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
