@@ -1605,7 +1605,9 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
-    use crate::runtime::{resolve_development_manifest, RuntimeManager, RuntimeState};
+    use crate::runtime::{
+        resolve_development_manifest, RuntimeManager, RuntimeState, WordPressHealthState,
+    };
 
     #[test]
     fn sql_literal_escapes_quotes_and_backslashes() {
@@ -1705,11 +1707,58 @@ mod tests {
         assert_eq!(installed.state, ProvisioningState::Ready);
         assert_eq!(provisioner.inspect().state, ProvisioningState::Ready);
 
+        let post_install_health = manager.refresh_wordpress_health();
+        assert_eq!(
+            post_install_health.wordpress_health,
+            WordPressHealthState::Healthy
+        );
+        assert!(post_install_health.wordpress_error.is_none());
+
+        let healthy = manager.restart().unwrap();
+        assert_eq!(healthy.state, RuntimeState::Running);
+        assert_eq!(healthy.wordpress_health, WordPressHealthState::Healthy);
+        assert!(healthy.wordpress_error.is_none());
+
+        manager.kill_php_for_test();
+        let child_failed = manager.refresh();
+        assert_eq!(child_failed.state, RuntimeState::Stopped);
+        assert_eq!(
+            child_failed.wordpress_health,
+            WordPressHealthState::Unavailable
+        );
+        assert!(child_failed.last_error.is_some());
+
+        let recovered_after_child_exit = manager.start().unwrap();
+        assert_eq!(recovered_after_child_exit.state, RuntimeState::Running);
+        assert_eq!(
+            recovered_after_child_exit.wordpress_health,
+            WordPressHealthState::Healthy
+        );
+
+        manager.stop().unwrap();
+        let original_php =
+            manager.replace_php_executable_for_test(data_root.join("missing-phase4-2-php.exe"));
+        assert!(manager.start().is_err());
+        let failed_start = manager.info();
+        assert_eq!(failed_start.state, RuntimeState::Stopped);
+        assert_eq!(
+            failed_start.wordpress_health,
+            WordPressHealthState::Unavailable
+        );
+        manager.replace_php_executable_for_test(original_php);
+        let retried_start = manager.start().unwrap();
+        assert_eq!(retried_start.state, RuntimeState::Running);
+        assert_eq!(
+            retried_start.wordpress_health,
+            WordPressHealthState::Healthy
+        );
+
         let sentinel = data_root.join("site/wp-content/coffeepos-phase3-e2e-sentinel.txt");
         fs::write(&sentinel, b"preserve me").unwrap();
 
         let stopped = manager.stop().unwrap();
         assert_eq!(stopped.state, RuntimeState::Stopped);
+        assert_eq!(stopped.wordpress_health, WordPressHealthState::Unavailable);
         assert!(stopped.database_pid.is_none());
         assert!(stopped.php_pid.is_none());
         assert!(stopped.database_port.is_none());
@@ -1721,6 +1770,10 @@ mod tests {
 
         let running_again = manager.start().unwrap();
         assert_eq!(running_again.state, RuntimeState::Running);
+        assert_eq!(
+            running_again.wordpress_health,
+            WordPressHealthState::Healthy
+        );
         let installed_again = provisioner
             .install_wordpress("CoffeePOS Phase 3 E2E", &running_again)
             .unwrap();

@@ -35,7 +35,8 @@ Giữ nguyên số phase. Các mốc artifact/install/activation là checkpoint 
 | 2 — Runtime Manager | ✅ Hoàn thành Windows-first | PHP + MariaDB start/stop/restart/readiness/cleanup |
 | 3 — WordPress Provisioning | ✅ Hoàn thành Windows-first | Fresh WordPress install, retry/idempotency, runtime E2E |
 | 4.1 — Provisioning UI | ✅ Hoàn thành Windows-first | Fresh app → Install → Installing → Ready → restart vẫn Ready |
-| 4.2+ | ⏳ Chưa bắt đầu | Bắt đầu từ WordPress runtime UX |
+| 4.2 — WordPress runtime UX | ✅ Hoàn thành Windows-first | Runtime lifecycle + WordPress health + retry/process-death handling |
+| 4.3+ | ⏳ Chưa bắt đầu | Mốc tiếp theo: Open WordPress test |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -261,4 +262,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Không bắt đầu WooCommerce trước khi Phase 4.1–4.3 pass. Phase 4.1 đã hoàn thành; mốc tiếp theo là **Phase 4.2 — WordPress runtime UX** để hợp nhất lifecycle/readiness/retry của WordPress và runtime trước khi thêm action mở site ở Phase 4.3.
+Không bắt đầu WooCommerce trước khi Phase 4.1–4.3 pass. Phase 4.2 đã hoàn thành Windows-first; mốc tiếp theo là **Phase 4.3 — Open WordPress test** để mở đúng dynamic runtime URL chỉ sau khi WordPress health đạt.

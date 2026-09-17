@@ -903,7 +903,8 @@ Current Windows-first status:
 - Phase 2 — Runtime Manager: complete.
 - Phase 3 — WordPress Provisioning: complete.
 - Phase 4.1 — Provisioning UI: complete.
-- Next milestone: Phase 4.2 — WordPress runtime UX.
+- Phase 4.2 — WordPress runtime UX: complete.
+- Next milestone: Phase 4.3 — Open WordPress test.
 
 From Phase 4 onward, work is intentionally split into small independently verifiable milestones:
 

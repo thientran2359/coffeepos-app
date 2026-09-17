@@ -7,7 +7,7 @@
   </head>
   <body>
     <main>
-      <header><span class="mark" aria-hidden="true">C</span><div><h1>CoffeePOS</h1><p>Môi trường bán hàng tại cửa hàng</p></div><span class="phase">Phase 4.1</span></header>
+      <header><span class="mark" aria-hidden="true">C</span><div><h1>CoffeePOS</h1><p>Môi trường bán hàng tại cửa hàng</p></div><span class="phase">Phase 4.2</span></header>
       <section class="card" aria-labelledby="status-title">
         <span class="eyebrow">COFFEEPOS DESKTOP</span>
         <h2 id="status-title">Đang đọc cấu hình…</h2>
@@ -30,7 +30,7 @@
             <dt>WordPress</dt><dd id="provisioning-wordpress">—</dd>
             <dt>Tài khoản quản trị</dt><dd id="provisioning-admin">—</dd>
           </dl>
-          <p class="hint">Phase 4.1 chỉ cài WordPress và database cục bộ. WooCommerce và CoffeePOS sẽ được thêm ở các phase tiếp theo.</p>
+          <p class="hint">WordPress provisioning và runtime lifecycle là hai trạng thái riêng. WooCommerce và CoffeePOS sẽ được thêm ở các phase tiếp theo.</p>
         </div>
       </section>
       <section class="card" id="runtime" hidden aria-labelledby="runtime-title">
@@ -42,7 +42,8 @@
           <button id="runtime-stop" type="button">Dừng</button>
           <button id="runtime-restart" type="button">Khởi động lại</button>
         </div>
-        <dl><dt>Trạng thái</dt><dd id="runtime-state">—</dd><dt>PHP</dt><dd id="runtime-php">—</dd><dt>MariaDB</dt><dd id="runtime-mariadb">—</dd><dt>HTTP</dt><dd id="runtime-http">—</dd><dt>Database</dt><dd id="runtime-database">—</dd></dl>
+        <p id="wordpress-health-error" class="error" role="alert" hidden></p>
+        <dl><dt>Runtime</dt><dd id="runtime-state">—</dd><dt>WordPress health</dt><dd id="wordpress-health">—</dd><dt>PHP</dt><dd id="runtime-php">—</dd><dt>MariaDB</dt><dd id="runtime-mariadb">—</dd><dt>HTTP</dt><dd id="runtime-http">—</dd><dt>Database</dt><dd id="runtime-database">—</dd></dl>
       </section>
       <section class="card" id="settings" hidden aria-labelledby="settings-title">
         <h2 id="settings-title">Cấu hình ứng dụng</h2>

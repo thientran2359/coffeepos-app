@@ -15,15 +15,14 @@ use runtime::{RuntimeInfo, RuntimeManager};
 use serde::Serialize;
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
-use std::sync::Mutex;
-#[cfg(debug_assertions)]
-use std::sync::TryLockError;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use tauri::{Manager, State};
 
 #[derive(Default)]
 struct ShellState {
     store: Mutex<Option<Store>>,
     runtime: Mutex<Option<RuntimeManager>>,
+    lifecycle: Mutex<()>,
     #[cfg(debug_assertions)]
     provisioning: Mutex<()>,
 }
@@ -134,6 +133,19 @@ fn with_runtime(
     operation(manager).map_err(|error| error.to_string())
 }
 
+fn try_lifecycle<'a>(state: &'a ShellState, operation: &str) -> Result<MutexGuard<'a, ()>, String> {
+    match state.lifecycle.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(TryLockError::WouldBlock) => Err(format!(
+            "Runtime lifecycle is busy while trying to {operation}. Wait for the current install/start/stop/restart operation to finish, then retry."
+        )),
+        Err(TryLockError::Poisoned(_)) => Err(
+            "Runtime lifecycle state unavailable. Restart CoffeePOS Desktop before retrying."
+                .into(),
+        ),
+    }
+}
+
 #[tauri::command]
 fn get_shell_info(
     app: tauri::AppHandle,
@@ -164,6 +176,7 @@ fn start_runtime(
     app: tauri::AppHandle,
     state: State<'_, ShellState>,
 ) -> Result<RuntimeInfo, String> {
+    let _lifecycle_guard = try_lifecycle(&state, "start the runtime")?;
     with_runtime(&app, &state, RuntimeManager::start)
 }
 
@@ -172,6 +185,7 @@ fn stop_runtime(
     app: tauri::AppHandle,
     state: State<'_, ShellState>,
 ) -> Result<RuntimeInfo, String> {
+    let _lifecycle_guard = try_lifecycle(&state, "stop the runtime")?;
     with_runtime(&app, &state, RuntimeManager::stop)
 }
 
@@ -180,6 +194,7 @@ fn restart_runtime(
     app: tauri::AppHandle,
     state: State<'_, ShellState>,
 ) -> Result<RuntimeInfo, String> {
+    let _lifecycle_guard = try_lifecycle(&state, "restart the runtime")?;
     with_runtime(&app, &state, RuntimeManager::restart)
 }
 
@@ -227,9 +242,22 @@ fn provision_wordpress(
 ) -> Result<ProvisioningInfo, String> {
     #[cfg(debug_assertions)]
     {
-        let _provisioning_guard = state.provisioning.lock().map_err(|_| {
-            "Provisioning state unavailable. Restart CoffeePOS Desktop.".to_string()
-        })?;
+        let _lifecycle_guard = try_lifecycle(&state, "provision WordPress")?;
+        let _provisioning_guard = match state.provisioning.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => {
+                return Err(
+                    "WordPress provisioning is already running. Wait for it to finish before retrying."
+                        .into(),
+                );
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(
+                    "Provisioning state unavailable. Restart CoffeePOS Desktop before retrying."
+                        .into(),
+                );
+            }
+        };
         let root = data_root(&app, &state)?;
         let store_name = {
             let guard = state.store.lock().map_err(|_| {
@@ -260,9 +288,14 @@ fn provision_wordpress(
             Provisioner::from_development(&project_root, &manifest, resolved, runtime_root)
                 .map_err(|error| error.to_string())?;
         provisioner.prepare().map_err(|error| error.to_string())?;
-        let runtime_info = runtime.start().map_err(|error| error.to_string())?;
+        let runtime_info = runtime
+            .start_for_provisioning()
+            .map_err(|error| error.to_string())?;
         match provisioner.install_wordpress(&store_name, &runtime_info) {
-            Ok(info) => Ok(info),
+            Ok(info) => {
+                runtime.refresh_wordpress_health();
+                Ok(info)
+            }
             Err(error) => {
                 let _ = runtime.stop();
                 Err(error.to_string())

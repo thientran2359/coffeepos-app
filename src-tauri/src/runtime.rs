@@ -33,6 +33,15 @@ pub enum RuntimeState {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WordPressHealthState {
+    Unavailable,
+    Checking,
+    Healthy,
+    Unhealthy,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RuntimeErrorInfo {
     pub component: String,
     pub operation: String,
@@ -62,6 +71,8 @@ pub struct RuntimeInfo {
     pub http_port: Option<u16>,
     pub database_pid: Option<u32>,
     pub php_pid: Option<u32>,
+    pub wordpress_health: WordPressHealthState,
+    pub wordpress_error: Option<RuntimeErrorInfo>,
     pub last_error: Option<RuntimeErrorInfo>,
 }
 
@@ -199,6 +210,8 @@ pub struct RuntimeManager {
     database: Option<ManagedChild>,
     php: Option<ManagedChild>,
     php_probe: Option<PathBuf>,
+    wordpress_health: WordPressHealthState,
+    wordpress_error: Option<RuntimeErrorInfo>,
     log_lock: Arc<Mutex<()>>,
     last_error: Option<RuntimeErrorInfo>,
     timeouts: RuntimeTimeouts,
@@ -239,6 +252,8 @@ impl RuntimeManager {
             database: None,
             php: None,
             php_probe: None,
+            wordpress_health: WordPressHealthState::Unavailable,
+            wordpress_error: None,
             log_lock: Arc::new(Mutex::new(())),
             last_error: None,
             timeouts: RuntimeTimeouts::default(),
@@ -248,6 +263,19 @@ impl RuntimeManager {
     #[cfg(test)]
     pub fn set_timeouts(&mut self, timeouts: RuntimeTimeouts) {
         self.timeouts = timeouts;
+    }
+
+    #[cfg(test)]
+    pub fn kill_php_for_test(&mut self) {
+        if let Some(php) = self.php.as_mut() {
+            php.child.kill().unwrap();
+            php.child.wait().unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn replace_php_executable_for_test(&mut self, executable: PathBuf) -> PathBuf {
+        std::mem::replace(&mut self.runtime.php_executable, executable)
     }
 
     pub fn info(&self) -> RuntimeInfo {
@@ -260,6 +288,8 @@ impl RuntimeManager {
             http_port: self.http_port,
             database_pid: self.database.as_ref().map(ManagedChild::id),
             php_pid: self.php.as_ref().map(ManagedChild::id),
+            wordpress_health: self.wordpress_health.clone(),
+            wordpress_error: self.wordpress_error.clone(),
             last_error: self.last_error.clone(),
         }
     }
@@ -286,6 +316,8 @@ impl RuntimeManager {
                     self.http_port = None;
                 }
                 self.last_error = Some(cleanup_error.unwrap_or(error));
+                self.wordpress_health = WordPressHealthState::Unavailable;
+                self.wordpress_error = None;
                 self.log_event("runtime child exited unexpectedly");
             }
         } else if self.database.is_none() && self.php.is_none() {
@@ -294,11 +326,24 @@ impl RuntimeManager {
             } else {
                 RuntimeState::NotInstalled
             };
+            self.wordpress_health = WordPressHealthState::Unavailable;
+            self.wordpress_error = None;
         }
         self.info()
     }
 
     pub fn start(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        self.start_with_wordpress_health(true)
+    }
+
+    pub(crate) fn start_for_provisioning(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        self.start_with_wordpress_health(false)
+    }
+
+    fn start_with_wordpress_health(
+        &mut self,
+        check_wordpress_health: bool,
+    ) -> Result<RuntimeInfo, RuntimeErrorInfo> {
         self.refresh();
         match self.state {
             RuntimeState::Running => return Ok(self.info()),
@@ -332,6 +377,8 @@ impl RuntimeManager {
             }
         };
         self.state = RuntimeState::Starting;
+        self.wordpress_health = WordPressHealthState::Checking;
+        self.wordpress_error = None;
         self.last_error = None;
         self.log_event("runtime start requested");
 
@@ -378,6 +425,12 @@ impl RuntimeManager {
                     }
                     self.state = RuntimeState::Running;
                     self.last_error = None;
+                    if check_wordpress_health {
+                        self.refresh_wordpress_health();
+                    } else {
+                        self.wordpress_health = WordPressHealthState::Unavailable;
+                        self.wordpress_error = None;
+                    }
                     self.log_event("runtime ready");
                     return Ok(self.info());
                 }
@@ -417,8 +470,37 @@ impl RuntimeManager {
             )
         });
         self.last_error = Some(error.clone());
+        self.wordpress_health = WordPressHealthState::Unavailable;
+        self.wordpress_error = None;
         self.log_event("runtime start failed");
         Err(error)
+    }
+
+    pub(crate) fn refresh_wordpress_health(&mut self) -> RuntimeInfo {
+        if self.state != RuntimeState::Running || self.php.is_none() || self.database.is_none() {
+            self.wordpress_health = WordPressHealthState::Unavailable;
+            self.wordpress_error = None;
+            return self.info();
+        }
+        let Some(http_port) = self.http_port else {
+            self.wordpress_health = WordPressHealthState::Unavailable;
+            self.wordpress_error = None;
+            return self.info();
+        };
+        self.wordpress_health = WordPressHealthState::Checking;
+        self.wordpress_error = None;
+        match self.wait_wordpress_ready(http_port) {
+            Ok(()) => {
+                self.wordpress_health = WordPressHealthState::Healthy;
+                self.log_event("wordpress healthy");
+            }
+            Err(error) => {
+                self.wordpress_health = WordPressHealthState::Unhealthy;
+                self.wordpress_error = Some(error);
+                self.log_event("wordpress health check failed");
+            }
+        }
+        self.info()
     }
 
     pub fn stop(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
@@ -439,6 +521,8 @@ impl RuntimeManager {
         }
 
         self.state = RuntimeState::Stopping;
+        self.wordpress_health = WordPressHealthState::Unavailable;
+        self.wordpress_error = None;
         self.log_event("runtime stop requested");
         let mut failure = None;
 
@@ -486,6 +570,32 @@ impl RuntimeManager {
         self.last_error = None;
         self.log_event("runtime stopped");
         Ok(self.info())
+    }
+
+    fn wait_wordpress_ready(&mut self, port: u16) -> Result<(), RuntimeErrorInfo> {
+        let deadline = Instant::now() + self.timeouts.http_readiness;
+        loop {
+            if child_finished(&mut self.php, "php", "WordPress health")? {
+                return Err(error_info(
+                    "wordpress",
+                    "health",
+                    "PHP exited before WordPress health could be verified.",
+                    "Inspect logs/php.log, restart the runtime, and retry the WordPress health check.",
+                ));
+            }
+            if wordpress_http_probe(port) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(error_info(
+                    "wordpress",
+                    "health",
+                    "Runtime services are running, but WordPress did not return the expected login page before the timeout.",
+                    "Keep the installed store data, inspect logs/php.log and logs/database.log, then restart the runtime. Do not reinstall WordPress for this health failure.",
+                ));
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
     }
 
     pub fn restart(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
@@ -1480,6 +1590,28 @@ fn http_probe(port: u16, probe_name: &str, nonce: &str) -> bool {
     status_ok && body.trim() == nonce
 }
 
+fn wordpress_http_probe(port: u16) -> bool {
+    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(750)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let request = format!(
+        "GET /wp-login.php HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::new();
+    if stream.take(256 * 1024).read_to_end(&mut response).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&response);
+    (text.starts_with("HTTP/1.0 200 ") || text.starts_with("HTTP/1.1 200 "))
+        && text.contains("loginform")
+}
+
 fn probe_nonce() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2036,12 +2168,15 @@ mod tests {
             http_port: Some(8081),
             database_pid: None,
             php_pid: None,
+            wordpress_health: WordPressHealthState::Checking,
+            wordpress_error: None,
             last_error: None,
         };
         let value = serde_json::to_value(info).unwrap();
         assert_eq!(value["state"], "starting");
         assert_eq!(value["database_port"], 3307);
         assert_eq!(value["http_port"], 8081);
+        assert_eq!(value["wordpress_health"], "checking");
     }
 
     #[test]

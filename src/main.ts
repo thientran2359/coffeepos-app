@@ -23,6 +23,8 @@ interface RuntimeInfo {
   http_port: number | null;
   database_pid: number | null;
   php_pid: number | null;
+  wordpress_health: "unavailable" | "checking" | "healthy" | "unhealthy";
+  wordpress_error: RuntimeErrorInfo | null;
   last_error: RuntimeErrorInfo | null;
 }
 
@@ -61,6 +63,8 @@ const runtimeDescription = element("runtime-description");
 const runtimeStart = element<HTMLButtonElement>("runtime-start");
 const runtimeStop = element<HTMLButtonElement>("runtime-stop");
 const runtimeRestart = element<HTMLButtonElement>("runtime-restart");
+const wordpressHealth = element("wordpress-health");
+const wordpressHealthError = element("wordpress-health-error");
 
 let provisioningBusy = false;
 let runtimeBusy = false;
@@ -109,6 +113,9 @@ function renderRuntime(info: RuntimeInfo): void {
   element("runtime-mariadb").textContent = info.mariadb_version ?? "—";
   element("runtime-http").textContent = info.http_port ? `127.0.0.1:${info.http_port}` : "—";
   element("runtime-database").textContent = info.database_port ? `127.0.0.1:${info.database_port}` : "—";
+  wordpressHealth.textContent = info.wordpress_health;
+  wordpressHealthError.hidden = !info.wordpress_error;
+  wordpressHealthError.textContent = info.wordpress_error ? structuredErrorText(info.wordpress_error) : "";
   setRuntimeControls(info);
   if (provisioningBusy) {
     runtimeDescription.textContent = "Runtime controls tạm khóa trong khi WordPress đang được provision.";
@@ -119,7 +126,13 @@ function renderRuntime(info: RuntimeInfo): void {
   } else if (info.state === "not_installed") {
     runtimeDescription.textContent = "Runtime bundle đã sẵn sàng; WordPress/database chưa được provision.";
   } else if (info.state === "running") {
-    runtimeDescription.textContent = "MariaDB và PHP đã vượt qua readiness checks.";
+    if (info.wordpress_health === "healthy") {
+      runtimeDescription.textContent = "MariaDB, PHP và WordPress đã vượt qua readiness checks.";
+    } else if (info.wordpress_health === "unhealthy") {
+      runtimeDescription.textContent = "MariaDB và PHP đang chạy, nhưng WordPress chưa healthy. Có thể khởi động lại runtime để thử lại; không cần cài lại WordPress.";
+    } else {
+      runtimeDescription.textContent = "MariaDB và PHP đang chạy; đang xác minh WordPress.";
+    }
   } else {
     runtimeDescription.textContent = "Runtime manager đã sẵn sàng.";
   }
@@ -254,7 +267,12 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
   runtimeBusy = true;
   if (currentProvisioning) renderProvisioning(currentProvisioning);
   setRuntimeControls(null);
-  runtimeDescription.textContent = "Đang cập nhật runtime…";
+  const transition = command === "stop_runtime" ? "stopping" : "starting";
+  element("runtime-state").textContent = transition;
+  wordpressHealth.textContent = "unavailable";
+  wordpressHealthError.hidden = true;
+  wordpressHealthError.textContent = "";
+  runtimeDescription.textContent = command === "stop_runtime" ? "Đang dừng PHP và MariaDB…" : "Đang khởi động runtime và kiểm tra WordPress…";
   try {
     renderRuntime(await invoke<RuntimeInfo>(command));
   } catch (error) {
@@ -282,7 +300,7 @@ async function bootstrap(): Promise<void> {
     element("version").textContent = info.version;
     element("settings").hidden = false;
     title.textContent = "Desktop shell đã sẵn sàng";
-    description.textContent = "Phase 4.1 cho phép cài WordPress trực tiếp bằng native provisioning.";
+    description.textContent = "Phase 4.2 theo dõi riêng trạng thái cài đặt, runtime readiness và WordPress health.";
     await refreshProvisioning();
     await refreshRuntime();
   } catch (error) {
@@ -318,4 +336,7 @@ element<HTMLFormElement>("settings-form").addEventListener("submit", async (even
     save.disabled = false;
   }
 });
+window.setInterval(() => {
+  if (isTauri() && !provisioningBusy && !runtimeBusy) void refreshRuntime();
+}, 2000);
 void bootstrap();
