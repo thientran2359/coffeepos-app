@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-pc-windows-msvc",
+  "wordpress": {
+    "version": "7.1",
+    "archive": "wordpress-7.1.zip",
+    "source": "https://wordpress.org/wordpress-7.1.zip",
+    "release_source": "https://wordpress.org/download/releases/",
+    "official_sha1_source": "https://wordpress.org/wordpress-7.1.zip.sha1",
+    "official_sha1": "b2b81d9242a122a8c7104a92387794eb64fcde97",
+    "archive_sha256": "d1ae02b5ae18428031ffc3943659fa87ab361d827f4aa804adf9276e4dc75df6",
+    "archive_sha256_source": "independently computed from the pinned official archive on 2026-09-17",
+    "license": "GPL-2.0-or-later",
+    "core_root": "wordpress/wordpress",
+    "license_file": "wordpress/wordpress/license.txt",
+    "readme_file": "wordpress/wordpress/readme.html",
+    "version_file": "wordpress/wordpress/wp-includes/version.php"
+  },
+  "compatibility": {
+    "source": "https://wordpress.org/download/",
+    "recommended_php": "8.3 or greater",
+    "recommended_mariadb": "10.11 or greater",
+    "development_php": "8.4.25",
+    "development_mariadb": "11.4.13"
+  }
+}

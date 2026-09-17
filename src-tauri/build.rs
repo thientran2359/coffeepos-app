@@ -7,6 +7,8 @@ fn main() {
             "start_runtime",
             "stop_runtime",
             "restart_runtime",
+            "get_provisioning_info",
+            "provision_wordpress",
         ]),
     ))
     .expect("failed to build CoffeePOS Desktop resources");

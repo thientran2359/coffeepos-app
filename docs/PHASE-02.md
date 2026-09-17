@@ -2,7 +2,7 @@
 
 ## Phạm vi đã chốt
 
-Phase 2 chỉ quản lý runtime PHP + MariaDB trên Windows x64. WordPress provisioning, tạo database/account ứng dụng, WooCommerce và CoffeePOS thuộc Phase 3–4.
+Phase 2 chỉ quản lý runtime PHP + MariaDB trên Windows x64. WordPress provisioning và database/account ứng dụng đã được hoàn thành ở Phase 3; WooCommerce và CoffeePOS thuộc Phase 4.x.
 
 Runtime production không lấy executable từ `PATH`, LocalWP hoặc cài đặt hệ thống. Development runtime được stage vào `runtime/development/x86_64-pc-windows-msvc/` và bị Git ignore; manifest/template/script staging nằm ngoài thư mục ignored.
 
@@ -42,6 +42,6 @@ Trong smoke test, datadir MariaDB disposable nằm dưới `.tools/` và chỉ p
 
 Hai lỗi Windows được phát hiện bằng runtime thật và đã sửa: MariaDB client probe cần timeout có giới hạn riêng (`--connect-timeout=1`, bounded command timeout 3s), và Windows PHP không xử lý ổn đường dẫn verbatim `\\?\...`; resolver vẫn canonicalize để kiểm path containment nhưng chuyển executable/config path về dạng Windows command-compatible khi spawn.
 
-## Gate trước Phase 3
+## Gate sau Phase 2
 
-Phase 2 Windows-first được coi là hoàn tất cho development runtime. Release installer vẫn chưa nhúng runtime resources; `release` build hiện chỉ build shell, còn packaging runtime là công việc phân phối sau này. Phase 3 có thể bắt đầu bằng provisioning idempotent cho datadir/database/site và phải giữ nguyên dữ liệu store hiện có khi retry.
+Phase 2 Windows-first được coi là hoàn tất cho development runtime. Phase 3 sau đó đã hoàn thành provisioning idempotent cho datadir/database/site và giữ nguyên dữ liệu store hiện có khi retry. Release installer vẫn chưa nhúng runtime resources; runtime bundling/installer thuộc Phase 9.x.

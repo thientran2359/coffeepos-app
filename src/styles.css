@@ -16,6 +16,10 @@ button:disabled { background: #e4e9e5; color: #59685d; cursor: not-allowed; }
 input { display: block; width: 100%; border: 1px solid #b9c6bd; padding: 12px; border-radius: 8px; font: inherit; margin-top: 8px; }
 label { font-weight: 600; font-size: 14px; }
 .hint, footer { color: #607067; font-size: 13px; }
+.setup-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-top: 24px; }
+.setup-heading h2 { margin-bottom: 0; }
+.state-badge { flex: 0 0 auto; border: 1px solid #c5cfc9; border-radius: 20px; padding: 6px 10px; font-size: 12px; font-weight: 600; }
+.error { border: 1px solid #d7b8b0; background: #fff7f5; border-radius: 10px; padding: 12px 14px; color: #7a3427; white-space: pre-line; }
 dl { border-top: 1px solid #e2e7e3; padding-top: 20px; font-size: 13px; }
 dt { color: #607067; margin-top: 12px; } dd { margin: 4px 0 0; overflow-wrap: anywhere; }
 footer { text-align: center; margin-top: 26px; }

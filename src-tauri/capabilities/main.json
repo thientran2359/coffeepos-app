@@ -9,6 +9,8 @@
     "allow-get-runtime-info",
     "allow-start-runtime",
     "allow-stop-runtime",
-    "allow-restart-runtime"
+    "allow-restart-runtime",
+    "allow-get-provisioning-info",
+    "allow-provision-wordpress"
   ]
 }

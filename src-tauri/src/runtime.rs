@@ -1,3 +1,4 @@
+use crate::secret;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -14,7 +15,11 @@ const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_LOG_CHUNK_BYTES: usize = 8192;
 const PORT_ATTEMPTS: usize = 3;
-const DATABASE_CLIENT_CONFIG: &str = "runtime-client.cnf";
+pub(crate) const DATABASE_RUNTIME_USER: &str = "coffeepos_runtime";
+pub(crate) const DATABASE_WORDPRESS_USER: &str = "coffeepos_wp";
+pub(crate) const DATABASE_NAME: &str = "coffeepos";
+pub(crate) const DATABASE_RUNTIME_SECRET: &str = "config/database-runtime.secret";
+pub(crate) const DATABASE_WORDPRESS_SECRET: &str = "config/database-wordpress.secret";
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -110,14 +115,15 @@ struct HttpFixtureManifest {
 
 #[derive(Clone, Debug)]
 pub struct ResolvedRuntime {
-    runtime_version: String,
-    php_version: String,
-    php_executable: PathBuf,
-    php_ini: PathBuf,
-    mariadb_version: String,
-    mariadb_executable: PathBuf,
-    mariadb_client_executable: PathBuf,
-    mariadb_base_dir: PathBuf,
+    pub(crate) runtime_version: String,
+    pub(crate) php_version: String,
+    pub(crate) php_executable: PathBuf,
+    pub(crate) php_ini: PathBuf,
+    pub(crate) mariadb_version: String,
+    pub(crate) mariadb_executable: PathBuf,
+    pub(crate) mariadb_client_executable: PathBuf,
+    pub(crate) mariadb_install_db_executable: PathBuf,
+    pub(crate) mariadb_base_dir: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,6 +264,10 @@ impl RuntimeManager {
         }
     }
 
+    pub(crate) fn provisioning_context(&self) -> (ResolvedRuntime, PathBuf) {
+        (self.runtime.clone(), self.data_root.clone())
+    }
+
     pub fn refresh(&mut self) -> RuntimeInfo {
         if self.state == RuntimeState::Running {
             let database_exit = child_exit(&mut self.database, "database");
@@ -278,6 +288,12 @@ impl RuntimeManager {
                 self.last_error = Some(cleanup_error.unwrap_or(error));
                 self.log_event("runtime child exited unexpectedly");
             }
+        } else if self.database.is_none() && self.php.is_none() {
+            self.state = if installation_ready(&self.data_root) {
+                RuntimeState::Stopped
+            } else {
+                RuntimeState::NotInstalled
+            };
         }
         self.info()
     }
@@ -516,10 +532,14 @@ impl RuntimeManager {
                 "MariaDB data directory is not initialized. The runtime manager will not initialize or replace store data.",
             ));
         }
-        let client_config = database_dir.join(DATABASE_CLIENT_CONFIG);
-        if !client_config.is_file() {
+        if !self.data_root.join(DATABASE_RUNTIME_SECRET).is_file() {
             return Err(not_installed_error(
-                "MariaDB runtime client credentials are missing. The runtime manager will not invent database credentials.",
+                "MariaDB runtime credentials are missing. The runtime manager will not invent database credentials.",
+            ));
+        }
+        if !self.data_root.join(DATABASE_WORDPRESS_SECRET).is_file() {
+            return Err(not_installed_error(
+                "WordPress database credentials are missing. Run Phase 3 provisioning or repair before starting the runtime.",
             ));
         }
         if !self.data_root.join("site").is_dir() {
@@ -560,6 +580,23 @@ impl RuntimeManager {
 
     fn spawn_php(&self, port: u16) -> Result<ManagedChild, RuntimeErrorInfo> {
         let site = self.data_root.join("site");
+        let database_port = self.database_port.ok_or_else(|| {
+            error_info(
+                "php",
+                "spawn",
+                "Database port is unavailable while preparing the PHP process.",
+                "Restart the runtime so MariaDB can be started before PHP.",
+            )
+        })?;
+        let database_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+            .map_err(|error| {
+                error_info(
+                    "php",
+                    "load database credential",
+                    error,
+                    "Run provisioning repair with the same Windows user profile, then retry.",
+                )
+            })?;
         let mut command = Command::new(&self.runtime.php_executable);
         command
             .arg("-c")
@@ -571,7 +608,15 @@ impl RuntimeManager {
             .env_remove("PHPRC")
             .env("PHP_INI_SCAN_DIR", "")
             .env_remove("PHP_CLI_SERVER_WORKERS")
+            .env("COFFEEPOS_DB_PASSWORD", database_password)
+            .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
+            .env("COFFEEPOS_SITE_URL", format!("http://{LOOPBACK}:{port}"))
+            .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
             .current_dir(&site);
+        let router = self.data_root.join("config/wordpress-router.php");
+        if router.is_file() {
+            command.arg(router);
+        }
         self.spawn_logged(command, "php", "php.log")
     }
 
@@ -628,7 +673,7 @@ impl RuntimeManager {
                     "database",
                     "readiness",
                     "MariaDB did not pass authenticated readiness before the timeout.",
-                    "Inspect logs/database.log and the provisioning-created runtime-client.cnf, then retry. The datadir was not modified by the runtime manager.",
+                    "Inspect logs/database.log and the protected runtime credential, then retry. The datadir was not modified by the runtime manager.",
                 ));
             }
             thread::sleep(Duration::from_millis(100));
@@ -636,21 +681,27 @@ impl RuntimeManager {
     }
 
     fn database_probe(&self, port: u16) -> Result<bool, RuntimeErrorInfo> {
-        let client_config = self.data_root.join("database").join(DATABASE_CLIENT_CONFIG);
+        let password =
+            secret::load(&self.data_root.join(DATABASE_RUNTIME_SECRET)).map_err(|error| {
+                error_info(
+                    "database",
+                    "readiness probe",
+                    error,
+                    "Run provisioning repair with the same Windows user profile, then retry.",
+                )
+            })?;
         let mut command = Command::new(&self.runtime.mariadb_client_executable);
         command
-            .arg(format!(
-                "--defaults-file={}",
-                client_config.to_string_lossy()
-            ))
+            .arg("--no-defaults")
             .arg("--protocol=tcp")
             .arg(format!("--host={LOOPBACK}"))
             .arg(format!("--port={port}"))
+            .arg(format!("--user={DATABASE_RUNTIME_USER}"))
             .arg("--connect-timeout=1")
             .arg("--batch")
             .arg("--skip-column-names")
             .arg("--execute=SELECT 1")
-            .env_remove("MYSQL_PWD")
+            .env("MYSQL_PWD", password)
             .env_remove("MYSQL_HOME")
             .env_remove("MARIADB_HOME")
             .stdin(Stdio::null())
@@ -702,21 +753,27 @@ impl RuntimeManager {
         let Some(port) = self.database_port else {
             return Ok(());
         };
-        let client_config = self.data_root.join("database").join(DATABASE_CLIENT_CONFIG);
+        let password =
+            secret::load(&self.data_root.join(DATABASE_RUNTIME_SECRET)).map_err(|error| {
+                error_info(
+                    "database",
+                    "shutdown",
+                    error,
+                    "Run provisioning repair with the same Windows user profile, then retry.",
+                )
+            })?;
         let mut command = Command::new(&self.runtime.mariadb_client_executable);
         command
-            .arg(format!(
-                "--defaults-file={}",
-                client_config.to_string_lossy()
-            ))
+            .arg("--no-defaults")
             .arg("--protocol=tcp")
             .arg(format!("--host={LOOPBACK}"))
             .arg(format!("--port={port}"))
+            .arg(format!("--user={DATABASE_RUNTIME_USER}"))
             .arg("--connect-timeout=1")
             .arg("--batch")
             .arg("--skip-column-names")
             .arg("--execute=SHUTDOWN")
-            .env_remove("MYSQL_PWD")
+            .env("MYSQL_PWD", password)
             .env_remove("MYSQL_HOME")
             .env_remove("MARIADB_HOME")
             .stdin(Stdio::null())
@@ -1010,8 +1067,6 @@ pub fn resolve_development_manifest(
         "MariaDB install-db executable",
         Some(manifest_root),
     )?;
-    let _ = mariadb_install_db;
-
     Ok(ResolvedRuntime {
         runtime_version: manifest.runtime_version,
         php_version: manifest.php.version,
@@ -1040,6 +1095,7 @@ pub fn resolve_development_manifest(
             "MariaDB client executable",
             Some(manifest_root),
         )?),
+        mariadb_install_db_executable: command_compatible_path(mariadb_install_db),
         mariadb_base_dir: command_compatible_path(resolve_mariadb_base_dir(
             &development_root,
             &manifest.mariadb.server,
@@ -1111,10 +1167,8 @@ fn loopback_port_available(port: u16) -> bool {
 
 fn installation_ready(data_root: &Path) -> bool {
     data_root.join("database/mysql").is_dir()
-        && data_root
-            .join("database")
-            .join(DATABASE_CLIENT_CONFIG)
-            .is_file()
+        && data_root.join(DATABASE_RUNTIME_SECRET).is_file()
+        && data_root.join(DATABASE_WORDPRESS_SECRET).is_file()
         && data_root.join("site").is_dir()
 }
 
@@ -1318,7 +1372,7 @@ fn child_exit(child: &mut Option<ManagedChild>, component: &str) -> Option<Runti
     }
 }
 
-fn run_command_bounded(
+pub(crate) fn run_command_bounded(
     mut command: Command,
     timeout: Duration,
     component: &str,
@@ -1329,8 +1383,8 @@ fn run_command_bounded(
         error_info(
             component,
             operation,
-            format!("Cannot start the MariaDB client command: {error}."),
-            "Verify the manifest client executable path and runtime bundle, then retry.",
+            format!("Cannot start the managed command: {error}."),
+            "Verify the pinned runtime executable path and component state, then retry.",
         )
     })?;
     if let Err(error) = containment.assign(&child) {
@@ -1346,17 +1400,14 @@ fn run_command_bounded(
             Err(error_info(
                 component,
                 operation,
-                format!(
-                    "MariaDB client command exceeded its timeout: {}",
-                    error.message
-                ),
-                "Inspect the runtime bundle and database state, then retry.",
+                format!("Managed command exceeded its timeout: {}", error.message),
+                "Inspect the runtime bundle and component state, then retry.",
             ))
         }
     }
 }
 
-fn wait_for_child_exit(
+pub(crate) fn wait_for_child_exit(
     child: &mut Child,
     timeout: Duration,
 ) -> Result<ExitStatus, RuntimeErrorInfo> {
@@ -1580,13 +1631,13 @@ fn error_info(
 }
 
 #[cfg(windows)]
-struct ProcessContainment {
+pub(crate) struct ProcessContainment {
     job: usize,
 }
 
 #[cfg(windows)]
 impl ProcessContainment {
-    fn new() -> Result<Self, RuntimeErrorInfo> {
+    pub(crate) fn new() -> Result<Self, RuntimeErrorInfo> {
         let job = unsafe { windows_job::create_kill_on_close_job() }.map_err(|error| {
             error_info(
                 "runtime",
@@ -1598,7 +1649,7 @@ impl ProcessContainment {
         Ok(Self { job })
     }
 
-    fn assign(&self, child: &Child) -> Result<(), RuntimeErrorInfo> {
+    pub(crate) fn assign(&self, child: &Child) -> Result<(), RuntimeErrorInfo> {
         unsafe { windows_job::assign_process(self.job, child) }.map_err(|error| {
             error_info(
                 "runtime",
@@ -1618,15 +1669,15 @@ impl Drop for ProcessContainment {
 }
 
 #[cfg(not(windows))]
-struct ProcessContainment;
+pub(crate) struct ProcessContainment;
 
 #[cfg(not(windows))]
 impl ProcessContainment {
-    fn new() -> Result<Self, RuntimeErrorInfo> {
+    pub(crate) fn new() -> Result<Self, RuntimeErrorInfo> {
         Ok(Self)
     }
 
-    fn assign(&self, _child: &Child) -> Result<(), RuntimeErrorInfo> {
+    pub(crate) fn assign(&self, _child: &Child) -> Result<(), RuntimeErrorInfo> {
         Ok(())
     }
 }
@@ -1726,14 +1777,14 @@ mod windows_job {
 }
 
 #[cfg(windows)]
-fn configure_child_command(command: &mut Command) {
+pub(crate) fn configure_child_command(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]
-fn configure_child_command(_command: &mut Command) {}
+pub(crate) fn configure_child_command(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {
@@ -1904,6 +1955,7 @@ mod tests {
             mariadb_version: "test-db".into(),
             mariadb_executable: executable.clone(),
             mariadb_client_executable: executable.clone(),
+            mariadb_install_db_executable: executable.clone(),
             mariadb_base_dir: base,
         }
     }
@@ -1944,7 +1996,8 @@ mod tests {
         let data = temp.path().canonicalize().unwrap();
         fs::create_dir_all(data.join("database/mysql")).unwrap();
         fs::create_dir_all(data.join("site")).unwrap();
-        touch(&data.join("database").join(DATABASE_CLIENT_CONFIG));
+        crate::secret::create(&data.join(DATABASE_RUNTIME_SECRET)).unwrap();
+        crate::secret::create(&data.join(DATABASE_WORDPRESS_SECRET)).unwrap();
         let mut manager = RuntimeManager::new(fake_runtime(), data).unwrap();
         manager.set_timeouts(RuntimeTimeouts {
             database_readiness: Duration::from_millis(500),

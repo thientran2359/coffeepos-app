@@ -20,9 +20,9 @@ Rust tests sử dụng thư mục tạm biệt lập:
 3. Tên rỗng/quá dài/control characters không thay đổi memory/disk.
 4. Instance thứ hai bị khóa, mở được sau khi instance đầu nhả lock.
 
-## Native acceptance — cần chạy trên từng target
+## Native acceptance
 
-- [ ] Windows x64: launch, UI first-run, data paths đúng.
+- [x] Windows x64: launch, UI first-run, data paths đúng.
 - [ ] macOS arm64: launch/close/relaunch, WKWebView render/IPC.
 - [ ] macOS x64: launch/close/relaunch, WKWebView render/IPC.
 - [ ] Lưu tên có dấu; restart giữ nguyên; không đổi database/uploads sentinel.
@@ -33,26 +33,24 @@ Rust tests sử dụng thư mục tạm biệt lập:
 - [ ] Bundled build dùng CSP production, IPC đọc/lưu hoạt động.
 - [ ] App launch không cần Node/PHP/MariaDB global.
 
-## Bằng chứng phiên 2026-09-17
+## Bằng chứng Windows 2026-09-17
 
-Máy khảo sát Windows x64 có Node 22.16.0, npm 10.9.2, WebView2 153.0.4234.32. Thiếu Cargo/Rust và không phát hiện MSVC build toolchain đầy đủ. Không có máy macOS trong phiên.
-
-Sau khảo sát đã cài Rust 1.98.1 + rustfmt **cục bộ trong `.tools/`**, không sửa PATH hệ thống. `scripts/use-local-rust.ps1` bật toolchain cho PowerShell hiện tại.
+Khảo sát ban đầu phát hiện Rust/MSVC chưa sẵn sàng trong shell. Sau đó project đã có Rust toolchain cục bộ trong `.tools/`, MSVC build đã hoạt động, và `scripts/use-local-rust.ps1` bật Cargo/Rust cho PowerShell hiện tại mà không cần PATH hệ thống.
 
 | Kiểm tra | Kết quả |
 | --- | --- |
 | npm dependency install / lockfile | Thành công |
 | `npm run build:ui` | PASS: TypeScript + Vite production build |
 | Browser preview tại loopback | PASS: banner preview hiển thị đúng, không lỗi/warning console quan sát được |
-| Tauri CLI info | Đọc được project/config; phát hiện WebView2; xác nhận thiếu MSVC |
+| Native Tauri app launch Windows | PASS; app đã được mở và test trực tiếp |
 | Tauri icon generation | Thành công: PNG/ICO/ICNS từ SVG trong repo |
-| `cargo fmt --check` | PASS sau rustfmt |
+| `npm run lint` / `cargo fmt --check` / Clippy | PASS trong validation hiện tại |
 | `cargo generate-lockfile` | Thành công; Cargo.lock có 434 package resolution |
-| `cargo check --locked` | BLOCKED: `linker link.exe not found` khi compile dependency build scripts |
-| Native build lần đầu | BLOCKED: Cargo chưa có trong PATH lúc chạy; sau cài local Rust, blocker kế tiếp được xác nhận là MSVC linker |
-| Rust tests / Clippy | Chưa chạy thành công do thiếu native linker; không tính là PASS |
-| Native UI / app-data / persistence | Chưa kiểm chứng trực tiếp; cần MSVC và native launch |
+| `cargo check --locked` | PASS trong validation Phase 2/3 |
+| Native release no-bundle build | PASS; tạo `coffeepos-desktop.exe` |
+| Rust tests | PASS; test suite được mở rộng thêm ở Phase 2/3 |
+| Native UI / app-data / persistence | PASS theo Windows-first flow; shell được dùng làm nền cho runtime/provisioning |
 | macOS compile / launch | Chưa chạy, không có macOS host |
-| CI | Đã viết workflow, chưa dispatch/push |
+| CI | Không dùng làm bằng chứng thay cho native Windows validation trong phiên này |
 
-**Phase 1 đã có implementation và tài liệu, chưa nghiệm thu hoàn toàn.** Không suy diễn browser preview thành bằng chứng Tauri IPC, filesystem persistence hoặc native app chạy được. Bước tiếp theo là cài MSVC Build Tools, chạy build/test/lint và checklist native Windows, sau đó kiểm chứng trên macOS.
+**Phase 1 đã hoàn thành theo scope Windows-first.** Native Windows build/run đã được mở khóa trong các phase sau và shell hiện được dùng để chạy Runtime Manager/WordPress provisioning. Các mục macOS vẫn là acceptance riêng cho target đó; không dùng trạng thái Windows-first để suy luận macOS đã pass.

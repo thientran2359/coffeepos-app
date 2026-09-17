@@ -895,127 +895,55 @@ Do not create unnecessary abstractions before the first working vertical slice e
 
 Build vertically, not horizontally.
 
-## Phase 1 — Desktop Shell
+`docs/ROADMAP.md` is the source of truth for phase numbering, scope, status and Definition of Done. Do not use an older broad Phase 4/5/6/7/8 breakdown when planning new work.
 
-Create:
+Current Windows-first status:
 
-- Tauri application
-- Basic UI
-- Rust command layer
-- Application-data directory
-- Configuration
+- Phase 1 — Desktop Shell: complete.
+- Phase 2 — Runtime Manager: complete.
+- Phase 3 — WordPress Provisioning: complete.
+- Phase 4.1 — Provisioning UI: complete.
+- Next milestone: Phase 4.2 — WordPress runtime UX.
 
-Goal:
+From Phase 4 onward, work is intentionally split into small independently verifiable milestones:
 
-```text
-CoffeePOS Desktop
-    ↓
-launches successfully
-    ↓
-Windows + macOS
-```
+| Phase | Deliverable |
+| --- | --- |
+| 4.1 | Provisioning UI |
+| 4.2 | WordPress runtime UX |
+| 4.3 | Open WordPress test |
+| 4.4 | WooCommerce artifact |
+| 4.5 | WooCommerce provisioning |
+| 4.6 | WooCommerce activation |
+| 4.7 | CoffeePOS artifact |
+| 4.8 | CoffeePOS provisioning |
+| 4.9 | CoffeePOS activation |
+| 4.10 | CoffeePOS health endpoint |
+| 4.11 | Full install idempotency |
+| 4.12 | First-run recovery |
+| 5.1 | POS URL |
+| 5.2 | Desktop POS WebView |
+| 5.3 | Navigation shell |
+| 5.4 | Startup automation |
+| 5.5 | Shutdown lifecycle |
+| 6.1 | Health diagnostics |
+| 6.2 | Repair flow |
+| 6.3 | Log viewer/export |
+| 7.1 | Backup format |
+| 7.2 | Database backup |
+| 7.3 | Uploads/config backup |
+| 7.4 | Restore |
+| 8.1 | LAN bind |
+| 8.2 | LAN address UI |
+| 8.3 | LAN security |
+| 9.1 | Runtime bundle |
+| 9.2 | Windows installer |
+| 9.3 | Fresh-machine test |
+| 9.4 | Upgrade safety |
 
-## Phase 2 — Runtime Manager
+Every phase/subphase must finish with implementation, appropriate tests/lint/build, a real runnable flow on the target platform, failure/retry/cleanup validation where applicable, and documentation of what remains outside scope. Code compiling by itself is not enough to mark a phase complete.
 
-Implement:
-
-- Process spawning
-- PHP process
-- MariaDB process
-- Process monitoring
-- Start
-- Stop
-- Logs
-- Health checks
-
-Goal:
-
-```text
-Start
- ↓
-MariaDB
- ↓
-PHP
- ↓
-HTTP
-```
-
-## Phase 3 — WordPress Provisioning
-
-Implement:
-
-- WordPress template
-- Database creation
-- wp-config generation
-- Installation
-- Admin creation
-
-Goal:
-
-```text
-localhost
- ↓
-WordPress
-```
-
-## Phase 4 — WooCommerce + CoffeePOS
-
-Install and activate:
-
-```text
-WooCommerce
-CoffeePOS
-```
-
-Run CoffeePOS health check.
-
-Goal:
-
-```text
-localhost/pos
- ↓
-working CoffeePOS
-```
-
-## Phase 5 — Desktop WebView
-
-Load:
-
-```text
-/pos
-```
-
-inside Tauri.
-
-Goal:
-
-```text
-CoffeePOS Desktop
- ↓
-POS
-```
-
-## Phase 6 — Backup / Restore
-
-Implement reliable store backup and restore.
-
-## Phase 7 — LAN Mode
-
-Implement:
-
-- LAN binding
-- local URL display
-- access control
-- device connection
-
-## Phase 8 — Packaging
-
-Build:
-
-- Windows installer
-- macOS application/package
-
-Only optimize packaging after the complete runtime works.
+Do not start a later plugin/distribution slice merely because its code can be written independently. Preserve the vertical ordering and gates in `docs/ROADMAP.md`; for example, Phase 4.1–4.3 must make WordPress setup testable from the app before WooCommerce work starts.
 
 ---
 

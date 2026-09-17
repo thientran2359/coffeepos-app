@@ -33,9 +33,8 @@ fn protect(bytes: &[u8]) -> Result<Vec<u8>, String> {
             std::io::Error::last_os_error()
         ));
     }
-    let protected = unsafe {
-        std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec()
-    };
+    let protected =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
     unsafe {
         let _ = LocalFree(output.pbData.cast());
     }
@@ -72,9 +71,8 @@ fn unprotect(bytes: &[u8]) -> Result<Vec<u8>, String> {
             std::io::Error::last_os_error()
         ));
     }
-    let plaintext = unsafe {
-        std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec()
-    };
+    let plaintext =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
     unsafe {
         let _ = LocalFree(output.pbData.cast());
     }
@@ -163,6 +161,8 @@ mod tests {
         assert_eq!(load(&path).unwrap(), first);
         assert_eq!(create(&path).unwrap(), first);
         let protected = fs::read(path).unwrap();
-        assert!(!protected.windows(first.len()).any(|w| w == first.as_bytes()));
+        assert!(!protected
+            .windows(first.len())
+            .any(|w| w == first.as_bytes()));
     }
 }

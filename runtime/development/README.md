@@ -38,3 +38,28 @@ Nguồn download trong manifest dùng archive URL chính thức theo exact versi
 Manifest cũng giữ nguồn checksum và license metadata. File license gốc (`php/license.txt`, `mariadb/COPYING`) đi cùng bundle sau extract.
 
 `fixture/router.php` chỉ phục vụ readiness của Phase 2 tại `/__coffeepos_runtime_health`; nó không provision hoặc mô phỏng WordPress.
+
+## WordPress core cho Phase 3
+
+WordPress core được stage riêng, không trộn vào PHP/MariaDB và không lấy từ site LocalWP đang chạy:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\stage-wordpress-development.ps1
+```
+
+Script đọc `scripts/wordpress-development/wordpress-7.1.manifest.json`, xác minh cả SHA256 đã pin và SHA1 do WordPress.org công bố trước khi extract. Core thật nằm trong target ignored:
+
+```text
+runtime/development/x86_64-pc-windows-msvc/
+├── wordpress-manifest.json
+└── wordpress/
+    └── wordpress/
+        ├── index.php
+        ├── license.txt
+        ├── readme.html
+        ├── wp-admin/
+        ├── wp-content/
+        └── wp-includes/
+```
+
+WordPress 7.1 archive: `https://wordpress.org/wordpress-7.1.zip`; SHA256 `d1ae02b5ae18428031ffc3943659fa87ab361d827f4aa804adf9276e4dc75df6`; official SHA1 `b2b81d9242a122a8c7104a92387794eb64fcde97`. `wordpress-manifest.json` resolves `core_root` as `wordpress/wordpress` relative to the development target root. Actual core and staged manifest remain ignored; the checked-in manifest template/script are the reproducible source of truth.

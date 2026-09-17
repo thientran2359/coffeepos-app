@@ -1,6 +1,6 @@
 # CoffeePOS Desktop — Kiến trúc
 
-Ngày khảo sát: 2026-09-17. Trạng thái: Phase 1 Windows hoàn tất; Phase 2 runtime manager Windows-first đã triển khai và smoke-test với PHP/MariaDB thật; Phase 3–8 chưa triển khai.
+Ngày khảo sát: 2026-09-17. Trạng thái hiện tại: Phase 1–3 và Phase 4.1 Windows-first hoàn tất; native WordPress 7.1 provisioning và flow UI Install → Ready → restart Ready đã pass trên app thật. Mốc tiếp theo là Phase 4.2 — WordPress runtime UX. Roadmap chi tiết nằm tại [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## 1. Mục tiêu và ranh giới
 
@@ -54,7 +54,7 @@ Không suy luận rằng app native chạy được chỉ vì WebView2 có mặt
 
 Các mốc OS trên là lựa chọn sản phẩm ban đầu, chưa phải ma trận đã chứng nhận. Chỉ mở rộng Windows ARM hoặc OS cũ khi mọi runtime dependency được kiểm định. Tauri dùng WebView hệ thống; xem [prerequisites](https://v2.tauri.app/start/prerequisites/) và [WebView versions](https://v2.tauri.app/reference/webview-versions/). Đường dẫn thực tế lấy từ [app_local_data_dir](https://docs.rs/tauri/latest/tauri/path/struct.PathResolver.html), không ghép HOME/AppData bằng tay.
 
-PHP Windows có [binary và dependency riêng](https://www.php.net/manual/en/install.windows.manual.php); [PHP trên macOS](https://www.php.net/manual/en/install.macosx.php) cần được cung cấp riêng cho app. MariaDB có [Windows ZIP](https://mariadb.com/docs/server/server-management/install-and-upgrade-mariadb/installing-mariadb/binary-packages/installing-mariadb-windows-zip-packages). Hướng dẫn [macOS Homebrew](https://mariadb.com/docs/server/server-management/install-and-upgrade-mariadb/installing-mariadb/binary-packages/installing-mariadb-on-macos-using-homebrew) và [macOS PKG](https://mariadb.com/docs/server/server-management/install-and-upgrade-mariadb/installing-mariadb/binary-packages/installing-mariadb-server-pkg-packages-on-macos) không chứng minh có bundle portable phù hợp với app. Vì vậy nguồn artifact macOS vẫn là việc phải kiểm chứng ở Phase 2; không lấy binary Linux tarball dùng cho macOS.
+PHP Windows có [binary và dependency riêng](https://www.php.net/manual/en/install.windows.manual.php); [PHP trên macOS](https://www.php.net/manual/en/install.macosx.php) cần được cung cấp riêng cho app. MariaDB có [Windows ZIP](https://mariadb.com/docs/server/server-management/install-and-upgrade-mariadb/installing-mariadb/binary-packages/installing-mariadb-windows-zip-packages). Hướng dẫn [macOS Homebrew](https://mariadb.com/docs/server/server-management/install-and-upgrade-mariadb/installing-mariadb/binary-packages/installing-mariadb-on-macos-using-homebrew) và [macOS PKG](https://mariadb.com/docs/server/server-management/install-and-upgrade-mariadb/installing-mariadb/binary-packages/installing-mariadb-server-pkg-packages-on-macos) không chứng minh có bundle portable phù hợp với app. Vì vậy nguồn artifact macOS vẫn phải được kiểm chứng riêng trước khi mở rộng acceptance sang macOS; không lấy binary Linux tarball dùng cho macOS.
 
 ## 3. Các quyết định
 
@@ -62,7 +62,7 @@ PHP Windows có [binary và dependency riêng](https://www.php.net/manual/en/ins
 2. Node/npm chỉ dùng phát triển/build frontend. App thành phẩm không gọi Node, Composer, PHP hoặc MariaDB trên PATH.
 3. Phase 1 chỉ có `main.rs` (IPC/app wiring) và `config.rs` (data paths, validation, persistence). Không tạo hàng loạt module rỗng. Thêm runtime, health, provisioning khi vertical slice cần.
 4. Bundle immutable đặt trong resources của app. Dữ liệu mutable luôn ở app-local-data. Development runtime nằm riêng `runtime/development/`, không trở thành dependency sản phẩm.
-5. Default loopback; LAN chỉ mở ở Phase 7. Không mở database ra LAN, không port-forward/cloud tunnel.
+5. Default loopback; LAN chỉ mở ở Phase 8.x. Không mở database ra LAN, không port-forward/cloud tunnel.
 6. Tiến trình dùng `std::process::Command` với đường dẫn tuyệt đối và từng argument; Rust giữ quyền spawn, không đưa shell API cho WebView.
 
 ### PHP built-in server: quyết định có điều kiện
@@ -71,7 +71,7 @@ Giữ `php -S` cho vertical slice theo AGENTS.md. [PHP manual](https://www.php.n
 
 Hệ quả cần đo: WordPress loopback/self-request có thể bị kẹt khi cùng worker đang chờ; cron, plugin HTTP call vào chính site, nhiều màn KDS/customer display và request dài có thể chặn POS. Đây là rủi ro kiến trúc thực tế, không chỉ vấn đề đóng gói.
 
-Trước LAN/release: đo concurrency, timeout, loopback, checkout và polling trên Windows/macOS. Nếu không đạt, trình bày bằng chứng và cập nhật quyết định kiến trúc trước khi thêm web server/worker model khác. Chưa đổi sang Nginx/Apache trong Phase 1. Chưa tuyên bố runtime production-ready.
+Kiểm loopback/background jobs ngay khi tích hợp WooCommerce ở 4.6, rồi concurrency, timeout, checkout và polling khi có POS ở 5.2. Trước Phase 8 LAN hoặc Phase 9 release phải có quyết định web server được ghi rõ, bao gồm hạn chế production từ PHP manual; benchmark pass không tự loại bỏ hạn chế đó. Nếu không đạt, trình bày bằng chứng và cập nhật quyết định kiến trúc trước khi thêm web server/worker model khác. Hiện vẫn dùng PHP built-in server cho vertical slice; chưa tuyên bố runtime production-ready cho tải LAN nhiều client.
 
 ## 4. File và cấu hình
 
@@ -110,7 +110,7 @@ Log Phase 1 chỉ ghi timestamp và sự kiện cố định; không ghi tên c�
 
 ## 5. Lifecycle, ports và readiness — Phase 2+
 
-State machine dự kiến: `not_installed → installing → stopped → starting → running → stopping → stopped`; lỗi kèm component, operation, recovery. `running` chỉ sau tất cả readiness đạt, không sau spawn.
+Phân biệt installation state (`not_installed / installing / ready / needs_repair`), runtime lifecycle (`stopped / starting / running / stopping` cùng trạng thái lỗi native) và application health. Đây là các trục trạng thái liên quan, không phải một enum tuyến tính chung. `provisioning.ready` có thể đi cùng runtime stopped. Runtime `running` chỉ xác nhận readiness DB/PHP hiện có; WordPress/plugin health phải được kiểm riêng trước khi báo ứng dụng sẵn sàng. Phase 4.2 hợp nhất cách trình bày các trạng thái này, không tự đổi ý nghĩa native contract đã có.
 
 Startup giữ installation lock, kiểm manifest, mở database hiện có, spawn MariaDB, authenticated SQL readiness, spawn PHP, HTTP readiness rồi plugin health. Mỗi bước có timeout/cancellation. Bước sau lỗi phải dọn tiến trình đã tạo trong lần start đó. Crash dùng bounded retry/backoff, không restart loop vô hạn và không tự init lại database.
 
@@ -118,21 +118,21 @@ Shutdown chặn start mới, đóng request mới, dừng PHP rồi graceful dat
 
 Phase 1 không chọn HTTP/database port vì chưa có service. Phase 2 thử port đã lưu, kiểm tra availability; nếu bận, chọn loopback ephemeral port, spawn có bounded retry cho race giữa probe và bind. Persist selected port sau readiness. Không chỉ kiểm TCP để xác nhận đúng service.
 
-URL WordPress phải cập nhật có kiểm soát theo actual host/port trước health. Không search-replace tùy tiện serialized database. Lưu DB port riêng, luôn loopback. LAN canonical host, cookie scope và URL changes là hợp đồng Phase 7. Browser CORS không phải cơ chế xác thực.
+URL WordPress phải cập nhật có kiểm soát theo actual host/port trước health. Không search-replace tùy tiện serialized database. Lưu DB port riêng, luôn loopback. LAN canonical host, cookie scope và URL changes là hợp đồng Phase 8.x. Browser CORS không phải cơ chế xác thực.
 
 ## 6. Provisioning và phiên bản
 
 Xem [PROVISIONING.md](docs/PROVISIONING.md). Bundle manifest phải có exact Desktop/runtime/PHP/MariaDB/WordPress/WooCommerce/CoffeePOS/schema versions, target triple, artifact hash, nguồn và license notices. Không dùng tên archive để suy luận compatibility; không tải “latest” khi mở app.
 
-Ứng viên khảo sát: PHP 8.4 và MariaDB 11.4; đây là hướng thử nghiệm, chưa pin hoặc cam kết compatibility. Exact WordPress/WooCommerce/CoffeePOS phải chọn từ bộ đã chạy acceptance thực tế; không giả định plugin hiện có tương thích chỉ dựa header. Đối chiếu [WordPress requirements](https://wordpress.org/about/requirements/), [WooCommerce requirements](https://woocommerce.com/document/server-requirements/) và [PHP support](https://www.php.net/supported-versions.php) khi khóa release.
+Development runtime Windows hiện pin PHP 8.4.25, MariaDB 11.4.13 và WordPress 7.1; bộ này đã chạy Phase 3 real-runtime E2E. WooCommerce/CoffeePOS vẫn phải pin exact version và chạy acceptance thực tế trong Phase 4.x; không giả định compatibility chỉ dựa header. Đối chiếu [WordPress requirements](https://wordpress.org/about/requirements/), [WooCommerce requirements](https://woocommerce.com/document/server-requirements/) và [PHP support](https://www.php.net/supported-versions.php) khi khóa từng artifact/release.
 
 Frontend có npm lockfile. Rust Cargo.toml dùng major constraints và Cargo.lock được tạo bằng Rust 1.98.1 trong toolchain cục bộ `.tools/`. Build/test dùng `--locked`; lockfile phải được đưa vào Git và qua native CI trước milestone acceptance.
 
 ## 7. Security và WebView
 
-Shell bundled `main` có đúng hai command: đọc shell info và đổi store label. Commands đưa vào `AppManifest::commands`, capability chỉ cấp cho `main`; không có remote origins, filesystem/shell plugins hoặc arbitrary path inputs. CSP hạn chế script và IPC; dev CSP cho Vite/HMR tại loopback. Theo [Tauri capabilities](https://v2.tauri.app/security/capabilities/), app commands cần explicit manifest nếu muốn capability kiểm soát.
+Shell bundled `main` hiện expose các typed commands cho shell/config, runtime lifecycle và WordPress provisioning: `get_shell_info`, `save_store_name`, `get_runtime_info`, `start_runtime`, `stop_runtime`, `restart_runtime`, `get_provisioning_info`, `provision_wordpress`. Commands đưa vào `AppManifest::commands`, capability chỉ cấp cho `main`; không có remote origins, filesystem/shell plugins hoặc arbitrary shell command input. CSP hạn chế script và IPC; dev CSP cho Vite/HMR tại loopback. Theo [Tauri capabilities](https://v2.tauri.app/security/capabilities/), app commands cần explicit manifest nếu muốn capability kiểm soát.
 
-Phase 5 tạo POS WebView riêng, không cấp native management capability cho HTTP WordPress. Rust chỉ cho navigation tới đúng local origin đã được xác minh; external links phải có handling riêng. Không nạp WP content vào shell có quyền quản lý. Cookie staff/member do plugin sở hữu.
+Phase 5.2 tạo POS WebView riêng, không cấp native management capability cho HTTP WordPress. Rust chỉ cho navigation tới đúng local origin đã được xác minh; external links phải có handling riêng. Không nạp WP content vào shell có quyền quản lý. Cookie staff/member do plugin sở hữu.
 
 Provisioning tạo admin credential từ user input hoặc secure randomness, không log, không đưa password vào command line. Bí mật cần persist dùng Windows credential protection/macOS Keychain; wp-config/db client file cần quyền OS hạn chế. Health token không xuất hiện trên UI hoặc URL.
 
@@ -140,19 +140,22 @@ Provisioning tạo admin credential từ user input hoặc secure randomness, kh
 
 Database logical dump + uploads + cấu hình + version metadata; xem [BACKUP.md](docs/BACKUP.md). Không coi copy live datadir là backup portable. Desktop/runtime update và plugin/schema update riêng, có preflight/backup/migration/health và rollback phù hợp schema. Tuyệt đối không ghi đè user data từ template mới.
 
-Phase 8 mới tối ưu installer. Windows phải hỗ trợ cài WebView2 offline nếu mục tiêu là fresh-machine offline; macOS phải ký cả executables/dylibs bên trong trước app và notarization. Theo [Windows installer](https://v2.tauri.app/distribute/windows-installer/) và [macOS bundle](https://v2.tauri.app/distribute/macos-application-bundle/). Skeleton package hiện chỉ chứa shell; chưa chứa runtime, signing hoặc offline prerequisite payload.
+Phase 9.x mới hoàn thiện runtime bundle/installer/distribution. Windows phải hỗ trợ cài WebView2 offline nếu mục tiêu là fresh-machine offline; macOS phải ký cả executables/dylibs bên trong trước app và notarization. Theo [Windows installer](https://v2.tauri.app/distribute/windows-installer/) và [macOS bundle](https://v2.tauri.app/distribute/macos-application-bundle/). Skeleton package hiện chỉ chứa shell; chưa chứa runtime, signing hoặc offline prerequisite payload.
 
 ## 9. Roadmap và release gates
 
+Roadmap chi tiết và Definition of Done nằm tại [docs/ROADMAP.md](docs/ROADMAP.md). Tóm tắt các nhóm milestone:
+
 | Phase | Slice chạy được | Gate chính |
 | --- | --- | --- |
-| 1 | Desktop + config + app data | Launch/close/relaunch Windows và macOS, config giữ nguyên, lỗi đọc/ghi rõ ràng |
-| 2 | MariaDB → PHP → HTTP | Start/stop/restart/failure, không orphan, binary portable từng platform |
-| 3 | WordPress cục bộ | Fresh install, retry, giữ dữ liệu cũ |
-| 4 | WooCommerce + CoffeePOS | Activation, health contract, POS route thật |
-| 5 | POS trong WebView | Login/navigation/cookie, remote content không có IPC quản lý |
-| 6 | Backup/restore | Validate trước replace, phục hồi khi restore lỗi |
-| 7 | LAN opt-in | Reachability, firewall, auth, concurrency + loopback |
-| 8 | Installer/app | Fresh OS không dev tools, signing, upgrade giữ store |
+| 1 ✅ | Desktop + config + app data | Native Windows shell/config chạy được |
+| 2 ✅ | MariaDB → PHP → HTTP | Start/stop/restart/failure, không orphan |
+| 3 ✅ | WordPress cục bộ | Fresh install, retry/idempotency, giữ dữ liệu cũ |
+| 4.1 ✅ / 4.2–4.12 | Setup UI → WooCommerce → CoffeePOS | 4.1 Install UI đã pass; tiếp theo runtime UX, activation, health, full-stack retry/recovery |
+| 5.1–5.5 | POS trong Desktop | POS URL/WebView, startup/shutdown automation |
+| 6.1–6.3 | Diagnostics/repair | Component health, safe repair, support logs |
+| 7.1–7.4 | Backup/restore | Portable validated backup và restore E2E |
+| 8.1–8.3 | LAN opt-in | Reachability, auth, DB/native control vẫn private |
+| 9.1–9.4 | Distribution | Bundled runtime, installer, fresh-machine và upgrade safety |
 
-Không gộp “code xong”, “build được”, “chạy được” và “đủ điều kiện release” thành một trạng thái. Bằng chứng Phase 1 theo [PHASE-01.md](docs/PHASE-01.md).
+Không gộp “code xong”, “build được”, “chạy được” và “đủ điều kiện release” thành một trạng thái. Mỗi subphase phải có runnable evidence phù hợp với scope trước khi đánh dấu hoàn thành. Bằng chứng hiện tại theo [PHASE-01.md](docs/PHASE-01.md), [PHASE-02.md](docs/PHASE-02.md) và [PHASE-03.md](docs/PHASE-03.md).

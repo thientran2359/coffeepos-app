@@ -16,4 +16,6 @@ Nguồn sự thật kiến trúc: [ARCHITECTURE.md](../ARCHITECTURE.md).
 - Windows runtime manager hiện dùng Job Object `KILL_ON_JOB_CLOSE`, `CREATE_NO_WINDOW`, dynamic loopback ports và authenticated SQL probe. PHP readiness dùng file nonce riêng cho từng start attempt; `fs::canonicalize` chỉ phục vụ kiểm tra containment, còn đường dẫn truyền sang Windows PHP/MariaDB được chuyển về dạng command-compatible thay vì `\\?\...`.
 - Smoke test 2026-09-17 với datadir disposable đã PASS chuỗi `start → stop → restart-from-stopped → restart-while-running → stop`, dùng đúng PHP/MariaDB staged; sau test không còn process staged chạy nền.
 
-Trước khi sang provisioning phải chứng minh bundle chạy trên máy không có LocalWP/PHP/MariaDB dev tools. Trên macOS kiểm tra `otool -L`, rpath và dependencies để loại đường dẫn `/opt/homebrew` hoặc build-machine paths.
+Gate development trước provisioning là chạy bằng artifact đã pin với executable/config tường minh, không lấy PHP/MariaDB từ PATH hoặc LocalWP; Phase 2–3 đã có bằng chứng Windows cho phạm vi này. Kiểm chứng trên máy sạch không dev tools thuộc Phase 9.3, chưa được coi là đã pass. Trên macOS kiểm tra `otool -L`, rpath và dependencies để loại đường dẫn `/opt/homebrew` hoặc build-machine paths.
+
+Phase 4.2 phải phân biệt runtime readiness với WordPress health sau mỗi start/restart; `provisioning.ready` chỉ nói installation đã hoàn tất. Kiểm WordPress self-request/background jobs từ 4.6 và tải POS từ 5.2, trước gate LAN/release trong [ROADMAP.md](ROADMAP.md).

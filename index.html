@@ -7,13 +7,31 @@
   </head>
   <body>
     <main>
-      <header><span class="mark" aria-hidden="true">C</span><div><h1>CoffeePOS</h1><p>Môi trường bán hàng tại cửa hàng</p></div><span class="phase">Phase 2</span></header>
+      <header><span class="mark" aria-hidden="true">C</span><div><h1>CoffeePOS</h1><p>Môi trường bán hàng tại cửa hàng</p></div><span class="phase">Phase 4.1</span></header>
       <section class="card" aria-labelledby="status-title">
         <span class="eyebrow">COFFEEPOS DESKTOP</span>
         <h2 id="status-title">Đang đọc cấu hình…</h2>
         <p id="status-description" role="status" aria-live="polite">Vui lòng chờ.</p>
         <button id="retry" type="button" hidden>Thử lại</button>
-        <div id="setup" hidden><button type="button" disabled>Cài đặt CoffeePOS</button><p class="hint">Provisioning WordPress/database sẽ được thực hiện ở Phase 3–4.</p></div>
+        <div id="setup" hidden aria-busy="false">
+          <div class="setup-heading">
+            <div>
+              <span class="eyebrow">WORDPRESS SETUP</span>
+              <h2>Thiết lập WordPress</h2>
+            </div>
+            <span id="provisioning-state" class="state-badge">—</span>
+          </div>
+          <p id="provisioning-status" role="status" aria-live="polite">Đang kiểm tra trạng thái cài đặt…</p>
+          <p id="provisioning-error" class="error" role="alert" hidden></p>
+          <div class="actions">
+            <button id="provision-wordpress" type="button" disabled>Cài đặt WordPress</button>
+          </div>
+          <dl id="provisioning-details" hidden>
+            <dt>WordPress</dt><dd id="provisioning-wordpress">—</dd>
+            <dt>Tài khoản quản trị</dt><dd id="provisioning-admin">—</dd>
+          </dl>
+          <p class="hint">Phase 4.1 chỉ cài WordPress và database cục bộ. WooCommerce và CoffeePOS sẽ được thêm ở các phase tiếp theo.</p>
+        </div>
       </section>
       <section class="card" id="runtime" hidden aria-labelledby="runtime-title">
         <span class="eyebrow">LOCAL RUNTIME</span>
