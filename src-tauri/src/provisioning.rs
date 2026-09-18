@@ -229,6 +229,36 @@ enum ProvisioningStage {
     MachineHealthBootstrapped,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProvisioningRecoveryBlocker {
+    PartialWordPressInstall,
+}
+
+impl ProvisioningRecoveryBlocker {
+    fn error(&self) -> RuntimeErrorInfo {
+        match self {
+            Self::PartialWordPressInstall => provisioning_error(
+                "recover partial WordPress install",
+                "WordPress has partial database tables from an interrupted install, so automatic provisioning cannot safely decide which data is authoritative.",
+                "Preserve the database and site. Repair or restore the partial WordPress schema explicitly, then recheck provisioning state; CoffeePOS Desktop will not delete or reinstall over these tables automatically.",
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProvisioningBoundary {
+    DatabaseReady,
+    SiteReady,
+    WordPressInstalled,
+    WooCommerceProvisioned,
+    WooCommerceActivated,
+    CoffeePosProvisioned,
+    CoffeePosActivated,
+    MachineHealthBootstrapped,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProvisioningJournal {
@@ -240,6 +270,8 @@ struct ProvisioningJournal {
     coffeepos_version: Option<String>,
     stage: ProvisioningStage,
     admin_username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_blocker: Option<ProvisioningRecoveryBlocker>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,6 +290,8 @@ pub struct Provisioner {
     coffeepos: ResolvedCoffeePos,
     data_root: PathBuf,
     containment: ProcessContainment,
+    #[cfg(test)]
+    failure_after: Option<ProvisioningBoundary>,
 }
 
 enum DatabaseEndpoint {
@@ -307,7 +341,43 @@ impl Provisioner {
             coffeepos,
             data_root,
             containment: ProcessContainment::new()?,
+            #[cfg(test)]
+            failure_after: None,
         })
+    }
+
+    #[cfg(test)]
+    fn fail_after_for_test(&mut self, boundary: ProvisioningBoundary) {
+        self.failure_after = Some(boundary);
+    }
+
+    fn interruption_checkpoint(
+        &mut self,
+        boundary: ProvisioningBoundary,
+    ) -> Result<(), RuntimeErrorInfo> {
+        #[cfg(test)]
+        {
+            if self.failure_after == Some(boundary) {
+                self.failure_after = None;
+                return Err(provisioning_error(
+                    "simulate provisioning interruption",
+                    format!(
+                        "Injected interruption after {boundary:?} completed and before its journal commit."
+                    ),
+                    "Recreate the provisioning/runtime state and retry from the persisted journal.",
+                ));
+            }
+        }
+        #[cfg(not(test))]
+        let _ = boundary;
+        Ok(())
+    }
+
+    fn recovery_blocker(&self) -> Result<Option<RuntimeErrorInfo>, RuntimeErrorInfo> {
+        Ok(self
+            .load_journal()?
+            .and_then(|journal| journal.recovery_blocker)
+            .map(|blocker| blocker.error()))
     }
 
     #[cfg(test)]
@@ -332,9 +402,21 @@ impl Provisioner {
                 };
             }
         };
+        let runtime_database_credential_ready =
+            secret::load(&self.data_root.join(DATABASE_RUNTIME_SECRET))
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+        let wordpress_database_credential_ready =
+            secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+        let wordpress_admin_credential_ready =
+            secret::load(&self.data_root.join(WORDPRESS_ADMIN_SECRET))
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
         let database_ready = self.data_root.join("database/mysql").is_dir()
-            && self.data_root.join(DATABASE_RUNTIME_SECRET).is_file()
-            && self.data_root.join(DATABASE_WORDPRESS_SECRET).is_file();
+            && runtime_database_credential_ready
+            && wordpress_database_credential_ready;
         let site_ready = self.data_root.join("site/wp-settings.php").is_file()
             && self.data_root.join("site/wp-config.php").is_file()
             && self.data_root.join("config/wordpress-router.php").is_file();
@@ -349,6 +431,10 @@ impl Provisioner {
                             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
                 })
                 .unwrap_or(false);
+        let recovery_blocker = journal
+            .as_ref()
+            .and_then(|value| value.recovery_blocker.as_ref())
+            .map(ProvisioningRecoveryBlocker::error);
         let woocommerce_activated = journal
             .as_ref()
             .map(|value| value.stage >= ProvisioningStage::WooCommerceActivated)
@@ -368,8 +454,10 @@ impl Provisioner {
                     && value.stage >= ProvisioningStage::MachineHealthBootstrapped
             })
             .unwrap_or(false)
+            && recovery_blocker.is_none()
             && database_ready
             && site_ready
+            && wordpress_admin_credential_ready
             && woocommerce_ready
             && coffeepos_ready
             && machine_token_ready;
@@ -395,6 +483,16 @@ impl Provisioner {
         } else {
             ProvisioningState::NeedsRepair
         };
+        let database_credential_broken = journal
+            .as_ref()
+            .map(|value| value.stage >= ProvisioningStage::DatabaseReady)
+            .unwrap_or(false)
+            && (!runtime_database_credential_ready || !wordpress_database_credential_ready);
+        let wordpress_admin_credential_broken = journal
+            .as_ref()
+            .map(|value| value.stage >= ProvisioningStage::WordPressInstalled)
+            .unwrap_or(false)
+            && !wordpress_admin_credential_ready;
         let machine_credential_broken = journal
             .as_ref()
             .map(|value| value.stage >= ProvisioningStage::MachineHealthBootstrapped)
@@ -402,6 +500,20 @@ impl Provisioner {
             && !machine_token_ready;
         let last_error = if pristine {
             None
+        } else if let Some(error) = recovery_blocker.clone() {
+            Some(error)
+        } else if database_credential_broken {
+            Some(provisioning_error(
+                "inspect database credentials",
+                "Provisioning journal says the database is ready, but one or more protected database credentials are missing or unreadable.",
+                "Preserve the database and restore the matching protected runtime/WordPress database credentials. Normal provisioning will not create replacement credentials for an installed store.",
+            ))
+        } else if wordpress_admin_credential_broken {
+            Some(provisioning_error(
+                "inspect WordPress administrator credential",
+                "Provisioning journal says WordPress is installed, but the protected administrator credential is missing or unreadable.",
+                "Preserve the store and restore the matching protected administrator credential. Normal provisioning will not generate a replacement that could diverge from the existing WordPress password.",
+            ))
         } else if machine_credential_broken {
             Some(provisioning_error(
                 "inspect machine credential",
@@ -423,7 +535,10 @@ impl Provisioner {
             coffeepos_version: self.coffeepos.version.clone(),
             coffeepos_active: coffeepos_activated,
             admin_username: journal.map(|value| value.admin_username),
-            can_retry: !machine_credential_broken,
+            can_retry: recovery_blocker.is_none()
+                && !(database_credential_broken
+                    || wordpress_admin_credential_broken
+                    || machine_credential_broken),
             last_error,
         }
     }
@@ -445,10 +560,15 @@ impl Provisioner {
     pub fn prepare(&mut self) -> Result<ProvisioningInfo, RuntimeErrorInfo> {
         self.prepare_logs()?;
         self.log_event("provisioning prepare requested");
+        if let Some(error) = self.recovery_blocker()? {
+            return Err(error);
+        }
         self.ensure_database_initialized()?;
         self.ensure_database_accounts()?;
+        self.interruption_checkpoint(ProvisioningBoundary::DatabaseReady)?;
         self.persist_stage(ProvisioningStage::DatabaseReady)?;
         self.ensure_wordpress_site()?;
+        self.interruption_checkpoint(ProvisioningBoundary::SiteReady)?;
         self.persist_stage(ProvisioningStage::SiteReady)?;
         self.log_event("provisioning site prepared");
         Ok(ProvisioningInfo {
@@ -491,14 +611,29 @@ impl Provisioner {
                     "Retry with the same Windows user profile. Existing store data has been preserved.",
                 )
             })?;
-        let admin_password =
-            secret::create(&self.data_root.join(WORDPRESS_ADMIN_SECRET)).map_err(|error| {
-                provisioning_error(
-                    "create WordPress administrator credential",
-                    error,
-                    "Check application-data permissions and Windows DPAPI, then retry.",
-                )
-            })?;
+        let wordpress_already_installed = self
+            .load_journal()?
+            .map(|journal| journal.stage >= ProvisioningStage::WordPressInstalled)
+            .unwrap_or(false);
+        let admin_password = load_or_create_wordpress_admin_secret(
+            &self.data_root.join(WORDPRESS_ADMIN_SECRET),
+            wordpress_already_installed,
+        )
+        .map_err(|error| {
+            provisioning_error(
+                if wordpress_already_installed {
+                    "load WordPress administrator credential"
+                } else {
+                    "create WordPress administrator credential"
+                },
+                error,
+                if wordpress_already_installed {
+                    "Restore the matching protected administrator credential for this installed WordPress store. Provisioning will not generate a replacement password implicitly."
+                } else {
+                    "Check application-data permissions and Windows DPAPI, then retry."
+                },
+            )
+        })?;
         let script = self.write_wordpress_bootstrap_script()?;
         let site_url = format!("http://{LOOPBACK}:{http_port}");
         let mut command = Command::new(&self.runtime.php_executable);
@@ -532,6 +667,11 @@ impl Provisioner {
         let _ = fs::remove_file(&script);
         let status = status?;
         if !status.success() {
+            if matches!(status.code(), Some(6 | 7)) {
+                let blocker = ProvisioningRecoveryBlocker::PartialWordPressInstall;
+                self.persist_recovery_blocker(blocker.clone())?;
+                return Err(blocker.error());
+            }
             return Err(provisioning_error(
                 "install WordPress",
                 format!("WordPress bootstrap exited with status {status}."),
@@ -545,20 +685,26 @@ impl Provisioner {
                 "Inspect logs/php.log and retry provisioning. The existing installation is preserved.",
             ));
         }
+        self.interruption_checkpoint(ProvisioningBoundary::WordPressInstalled)?;
         self.persist_stage(ProvisioningStage::WordPressInstalled)?;
         ensure_woocommerce_plugin(&self.data_root, &self.woocommerce)?;
+        self.interruption_checkpoint(ProvisioningBoundary::WooCommerceProvisioned)?;
         self.persist_stage(ProvisioningStage::WooCommerceProvisioned)?;
         self.log_event("woocommerce plugin provisioned");
         self.activate_woocommerce(runtime_info)?;
+        self.interruption_checkpoint(ProvisioningBoundary::WooCommerceActivated)?;
         self.persist_stage(ProvisioningStage::WooCommerceActivated)?;
         self.log_event("woocommerce plugin activated and verified");
         ensure_coffeepos_plugin(&self.data_root, &self.coffeepos, &self.woocommerce)?;
+        self.interruption_checkpoint(ProvisioningBoundary::CoffeePosProvisioned)?;
         self.persist_stage(ProvisioningStage::CoffeePosProvisioned)?;
         self.log_event("coffeepos plugin provisioned");
         self.activate_coffeepos(runtime_info)?;
+        self.interruption_checkpoint(ProvisioningBoundary::CoffeePosActivated)?;
         self.persist_stage(ProvisioningStage::CoffeePosActivated)?;
         self.log_event("coffeepos plugin activated and verified");
         self.bootstrap_machine_health(runtime_info)?;
+        self.interruption_checkpoint(ProvisioningBoundary::MachineHealthBootstrapped)?;
         self.persist_stage(ProvisioningStage::MachineHealthBootstrapped)?;
         self.log_event("coffeepos machine health credential bootstrapped and verified");
         self.log_event("wordpress + woocommerce + coffeepos provisioning ready");
@@ -2172,7 +2318,8 @@ require_once ABSPATH . 'wp-settings.php';\n",
     }
 
     fn persist_stage(&self, stage: ProvisioningStage) -> Result<(), RuntimeErrorInfo> {
-        if let Some(existing) = self.load_journal()? {
+        let existing = self.load_journal()?;
+        if let Some(existing) = existing.as_ref() {
             if existing.wordpress_version != self.wordpress.version {
                 return Err(provisioning_error(
                     "save journal",
@@ -2196,7 +2343,27 @@ require_once ABSPATH . 'wp-settings.php';\n",
                 .then(|| self.coffeepos.version.clone()),
             stage,
             admin_username: WORDPRESS_ADMIN_USER.into(),
+            recovery_blocker: existing.and_then(|value| value.recovery_blocker),
         };
+        self.persist_journal(&journal)
+    }
+
+    fn persist_recovery_blocker(
+        &self,
+        blocker: ProvisioningRecoveryBlocker,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let mut journal = self.load_journal()?.ok_or_else(|| {
+            provisioning_error(
+                "save recovery state",
+                "Cannot record a provisioning recovery blocker because the provisioning journal is missing.",
+                "Preserve the database/site and inspect config/provisioning.json before retrying.",
+            )
+        })?;
+        journal.recovery_blocker = Some(blocker);
+        self.persist_journal(&journal)
+    }
+
+    fn persist_journal(&self, journal: &ProvisioningJournal) -> Result<(), RuntimeErrorInfo> {
         let mut bytes = serde_json::to_vec_pretty(&journal).map_err(|error| {
             provisioning_error(
                 "save journal",
@@ -2988,6 +3155,17 @@ fn provisioning_error(
         operation: operation.into(),
         message: message.into(),
         recovery: recovery.into(),
+    }
+}
+
+fn load_or_create_wordpress_admin_secret(
+    path: &Path,
+    wordpress_already_installed: bool,
+) -> Result<String, String> {
+    if wordpress_already_installed {
+        secret::load(path)
+    } else {
+        secret::create(path)
     }
 }
 
@@ -4392,6 +4570,20 @@ mod tests {
         assert_eq!(sql_literal("a'b\\c"), "a''b\\\\c");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn installed_wordpress_admin_secret_is_never_regenerated() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wordpress-admin.secret");
+        let original = load_or_create_wordpress_admin_secret(&path, false).unwrap();
+        assert_eq!(secret::load(&path).unwrap(), original);
+
+        fs::remove_file(&path).unwrap();
+        let error = load_or_create_wordpress_admin_secret(&path, true).unwrap_err();
+        assert!(error.contains("Cannot read protected database credential"));
+        assert!(!path.exists());
+    }
+
     #[test]
     fn staging_reset_refuses_unowned_path() {
         let temp = tempfile::tempdir().unwrap();
@@ -4474,6 +4666,29 @@ mod tests {
         assert!(
             output.status.success(),
             "database option query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[cfg(windows)]
+    fn query_database_scalar(provisioner: &Provisioner, database_port: u16, sql: &str) -> String {
+        let password =
+            secret::load(&provisioner.data_root.join(DATABASE_WORDPRESS_SECRET)).unwrap();
+        let endpoint = DatabaseEndpoint::Tcp(database_port);
+        let mut command =
+            provisioner.database_client_command(&endpoint, DATABASE_WORDPRESS_USER, &password);
+        command
+            .arg(format!("--database={DATABASE_NAME}"))
+            .arg(format!("--execute={sql}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_child_command(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "database scalar query failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -5380,6 +5595,73 @@ mod tests {
         let unrelated_sentinel = unrelated_plugin.join("keep.txt");
         fs::write(&unrelated_sentinel, b"keep unrelated plugin").unwrap();
 
+        let uploads_sentinel = data_root.join("uploads/phase-4-11/keep.txt");
+        fs::create_dir_all(uploads_sentinel.parent().unwrap()).unwrap();
+        fs::write(&uploads_sentinel, b"preserve uploaded media").unwrap();
+
+        let phase_4_11_database_port = moved_runtime.database_port.unwrap();
+        let phase_4_11_database_password =
+            secret::load(&data_root.join(DATABASE_WORDPRESS_SECRET)).unwrap();
+        provisioner
+            .run_database_sql(
+                &DatabaseEndpoint::Tcp(phase_4_11_database_port),
+                DATABASE_WORDPRESS_USER,
+                &phase_4_11_database_password,
+                "UPDATE coffeepos.wp_options SET option_value = 'Phase 4.11 preserved store' WHERE option_name = 'coffeepos_store_name';\n",
+            )
+            .expect("failed to seed Phase 4.11 CoffeePOS store option sentinel");
+        provisioner
+            .run_database_sql(
+                &DatabaseEndpoint::Tcp(phase_4_11_database_port),
+                DATABASE_WORDPRESS_USER,
+                &phase_4_11_database_password,
+                "INSERT INTO coffeepos.wp_coffeepos_suspended_carts (user_id, label, cart_payload, created_at, updated_at) VALUES (1, 'phase-4-11-sentinel', '{\"phase\":\"4.11\",\"items\":[{\"sku\":\"sentinel\",\"quantity\":2}]}', NOW(), NOW());\n",
+            )
+            .expect("failed to seed Phase 4.11 CoffeePOS suspended-cart sentinel");
+        assert_eq!(
+            query_wordpress_option(
+                &provisioner,
+                phase_4_11_database_port,
+                "coffeepos_store_name",
+            ),
+            "Phase 4.11 preserved store"
+        );
+        assert_eq!(
+            query_database_scalar(
+                &provisioner,
+                phase_4_11_database_port,
+                "SELECT cart_payload FROM wp_coffeepos_suspended_carts WHERE label = 'phase-4-11-sentinel' ORDER BY id DESC LIMIT 1",
+            ),
+            r#"{"phase":"4.11","items":[{"sku":"sentinel","quantity":2}]}"#
+        );
+
+        let credential_snapshots = [
+            data_root.join(DATABASE_RUNTIME_SECRET),
+            data_root.join(DATABASE_WORDPRESS_SECRET),
+            data_root.join(WORDPRESS_ADMIN_SECRET),
+            data_root.join(MACHINE_TOKEN_SECRET),
+        ]
+        .into_iter()
+        .map(|path| {
+            let value = secret::load(&path).unwrap();
+            (path, value)
+        })
+        .collect::<Vec<_>>();
+        let journal_before_second_provisioning = fs::read(provisioner.journal_path()).unwrap();
+        let woocommerce_ownership_before_second_provisioning =
+            fs::read(woocommerce.join(MANAGED_PLUGIN_OWNERSHIP_FILE)).unwrap();
+        let coffeepos_ownership_before_second_provisioning =
+            fs::read(coffeepos.join(MANAGED_PLUGIN_OWNERSHIP_FILE)).unwrap();
+        let wp_config_before_second_provisioning =
+            fs::read(data_root.join("site/wp-config.php")).unwrap();
+        let active_plugins_before_second_provisioning =
+            query_wordpress_option(&provisioner, phase_4_11_database_port, "active_plugins");
+        let admin_password_hash_before_second_provisioning = query_database_scalar(
+            &provisioner,
+            phase_4_11_database_port,
+            "SELECT user_pass FROM wp_users WHERE user_login = 'coffeepos_admin' LIMIT 1",
+        );
+
         let stopped = manager.stop().unwrap();
         assert_eq!(stopped.state, RuntimeState::Stopped);
         assert_eq!(stopped.wordpress_health, WordPressHealthState::Unavailable);
@@ -5411,6 +5693,10 @@ mod tests {
         assert_eq!(secret::load(&machine_token_path).unwrap(), machine_token);
         assert!(sentinel.is_file());
         assert_eq!(
+            fs::read(&uploads_sentinel).unwrap(),
+            b"preserve uploaded media"
+        );
+        assert_eq!(
             fs::read(&woocommerce_sentinel).unwrap(),
             b"preserve plugin data"
         );
@@ -5421,6 +5707,70 @@ mod tests {
         assert_eq!(
             fs::read(&unrelated_sentinel).unwrap(),
             b"keep unrelated plugin"
+        );
+        for (path, expected) in &credential_snapshots {
+            assert_eq!(
+                secret::load(path).unwrap(),
+                *expected,
+                "credential changed during second provisioning: {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            fs::read(provisioner.journal_path()).unwrap(),
+            journal_before_second_provisioning
+        );
+        assert_eq!(
+            fs::read(woocommerce.join(MANAGED_PLUGIN_OWNERSHIP_FILE)).unwrap(),
+            woocommerce_ownership_before_second_provisioning
+        );
+        assert_eq!(
+            fs::read(coffeepos.join(MANAGED_PLUGIN_OWNERSHIP_FILE)).unwrap(),
+            coffeepos_ownership_before_second_provisioning
+        );
+        assert_eq!(
+            fs::read(data_root.join("site/wp-config.php")).unwrap(),
+            wp_config_before_second_provisioning
+        );
+        assert_eq!(
+            query_wordpress_option(
+                &provisioner,
+                running_again.database_port.unwrap(),
+                "active_plugins",
+            ),
+            active_plugins_before_second_provisioning
+        );
+        assert_eq!(
+            query_database_scalar(
+                &provisioner,
+                running_again.database_port.unwrap(),
+                "SELECT user_pass FROM wp_users WHERE user_login = 'coffeepos_admin' LIMIT 1",
+            ),
+            admin_password_hash_before_second_provisioning
+        );
+        assert_eq!(
+            query_wordpress_option(
+                &provisioner,
+                running_again.database_port.unwrap(),
+                "coffeepos_store_name",
+            ),
+            "Phase 4.11 preserved store"
+        );
+        assert_eq!(
+            query_database_scalar(
+                &provisioner,
+                running_again.database_port.unwrap(),
+                "SELECT CONCAT(label, '|', cart_payload) FROM wp_coffeepos_suspended_carts WHERE label = 'phase-4-11-sentinel' ORDER BY id DESC LIMIT 1",
+            ),
+            r#"phase-4-11-sentinel|{"phase":"4.11","items":[{"sku":"sentinel","quantity":2}]}"#
+        );
+        assert_eq!(
+            query_database_scalar(
+                &provisioner,
+                running_again.database_port.unwrap(),
+                "SELECT COUNT(*) FROM wp_coffeepos_suspended_carts WHERE label = 'phase-4-11-sentinel'",
+            ),
+            "1"
         );
         let inspected_again = provisioner.inspect();
         assert_eq!(inspected_again.state, ProvisioningState::Ready);
@@ -5443,6 +5793,263 @@ mod tests {
 
         drop(manager);
         drop(provisioner);
+        temp.close().unwrap();
+        if fs::read_dir(&e2e_root).unwrap().next().is_none() {
+            fs::remove_dir(&e2e_root).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "uses the staged real PHP/MariaDB/WordPress development runtime"]
+    fn staged_runtime_recovers_across_first_run_journal_boundaries() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let project_root = manifest_dir.parent().unwrap().to_path_buf();
+        let runtime_manifest =
+            project_root.join("runtime/development/x86_64-pc-windows-msvc/manifest.json");
+        let runtime = resolve_development_manifest(&project_root, &runtime_manifest).unwrap();
+
+        let e2e_root = manifest_dir.join("target/phase4-12-e2e");
+        fs::create_dir_all(&e2e_root).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("recovery-")
+            .tempdir_in(&e2e_root)
+            .unwrap();
+        let data_root = temp.path().join("store");
+        fs::create_dir_all(&data_root).unwrap();
+
+        let make_provisioner = || {
+            Provisioner::from_development(
+                &project_root,
+                &runtime_manifest,
+                runtime.clone(),
+                data_root.clone(),
+            )
+            .unwrap()
+        };
+
+        let mut provisioner = make_provisioner();
+        provisioner.fail_after_for_test(ProvisioningBoundary::DatabaseReady);
+        let error = provisioner.prepare().unwrap_err();
+        assert_eq!(error.operation, "simulate provisioning interruption");
+        assert!(provisioner.load_journal().unwrap().is_none());
+        let inspect = provisioner.inspect();
+        assert_eq!(inspect.state, ProvisioningState::NeedsRepair);
+        assert!(inspect.can_retry);
+        let database_runtime_secret =
+            secret::load(&data_root.join(DATABASE_RUNTIME_SECRET)).unwrap();
+        let database_wordpress_secret =
+            secret::load(&data_root.join(DATABASE_WORDPRESS_SECRET)).unwrap();
+        drop(provisioner);
+
+        let mut provisioner = make_provisioner();
+        provisioner.fail_after_for_test(ProvisioningBoundary::SiteReady);
+        let error = provisioner.prepare().unwrap_err();
+        assert_eq!(error.operation, "simulate provisioning interruption");
+        assert_eq!(
+            provisioner.load_journal().unwrap().unwrap().stage,
+            ProvisioningStage::DatabaseReady
+        );
+        assert!(provisioner.inspect().can_retry);
+        drop(provisioner);
+
+        let install_boundaries = [
+            (
+                ProvisioningBoundary::WordPressInstalled,
+                ProvisioningStage::SiteReady,
+            ),
+            (
+                ProvisioningBoundary::WooCommerceProvisioned,
+                ProvisioningStage::WordPressInstalled,
+            ),
+            (
+                ProvisioningBoundary::WooCommerceActivated,
+                ProvisioningStage::WooCommerceProvisioned,
+            ),
+            (
+                ProvisioningBoundary::CoffeePosProvisioned,
+                ProvisioningStage::WooCommerceActivated,
+            ),
+            (
+                ProvisioningBoundary::CoffeePosActivated,
+                ProvisioningStage::CoffeePosProvisioned,
+            ),
+            (
+                ProvisioningBoundary::MachineHealthBootstrapped,
+                ProvisioningStage::CoffeePosActivated,
+            ),
+        ];
+
+        let mut wordpress_admin_secret = None;
+        let mut machine_token = None;
+        for (boundary, expected_stage) in install_boundaries {
+            let mut provisioner = make_provisioner();
+            provisioner.prepare().unwrap();
+            let mut manager = RuntimeManager::new(runtime.clone(), data_root.clone()).unwrap();
+            let running = manager.start().unwrap();
+            provisioner.fail_after_for_test(boundary);
+            let error = provisioner
+                .install_wordpress("CoffeePOS Phase 4.12 Recovery", &running)
+                .unwrap_err();
+            assert_eq!(error.operation, "simulate provisioning interruption");
+            assert_eq!(
+                provisioner.load_journal().unwrap().unwrap().stage,
+                expected_stage
+            );
+            let inspect = provisioner.inspect();
+            assert_eq!(inspect.state, ProvisioningState::NeedsRepair);
+            assert!(inspect.can_retry);
+
+            if data_root.join(WORDPRESS_ADMIN_SECRET).is_file() {
+                let current = secret::load(&data_root.join(WORDPRESS_ADMIN_SECRET)).unwrap();
+                if let Some(expected) = wordpress_admin_secret.as_ref() {
+                    assert_eq!(&current, expected);
+                } else {
+                    wordpress_admin_secret = Some(current);
+                }
+            }
+            if data_root.join(MACHINE_TOKEN_SECRET).is_file() {
+                let current = secret::load(&data_root.join(MACHINE_TOKEN_SECRET)).unwrap();
+                if let Some(expected) = machine_token.as_ref() {
+                    assert_eq!(&current, expected);
+                } else {
+                    machine_token = Some(current);
+                }
+            }
+
+            let stopped = manager.stop().unwrap();
+            assert_eq!(stopped.state, RuntimeState::Stopped);
+            drop(manager);
+            drop(provisioner);
+        }
+
+        let mut provisioner = make_provisioner();
+        provisioner.prepare().unwrap();
+        let mut manager = RuntimeManager::new(runtime, data_root.clone()).unwrap();
+        let running = manager.start().unwrap();
+        let ready = provisioner
+            .install_wordpress("CoffeePOS Phase 4.12 Recovery", &running)
+            .unwrap();
+        assert_eq!(ready.state, ProvisioningState::Ready);
+        assert!(ready.woocommerce_active);
+        assert!(ready.coffeepos_active);
+        assert_eq!(
+            provisioner.load_journal().unwrap().unwrap().stage,
+            ProvisioningStage::MachineHealthBootstrapped
+        );
+        assert_eq!(
+            secret::load(&data_root.join(DATABASE_RUNTIME_SECRET)).unwrap(),
+            database_runtime_secret
+        );
+        assert_eq!(
+            secret::load(&data_root.join(DATABASE_WORDPRESS_SECRET)).unwrap(),
+            database_wordpress_secret
+        );
+        assert_eq!(
+            secret::load(&data_root.join(WORDPRESS_ADMIN_SECRET)).unwrap(),
+            wordpress_admin_secret.unwrap()
+        );
+        assert_eq!(
+            secret::load(&data_root.join(MACHINE_TOKEN_SECRET)).unwrap(),
+            machine_token.unwrap()
+        );
+        assert_eq!(provisioner.inspect().state, ProvisioningState::Ready);
+
+        manager.stop().unwrap();
+        drop(manager);
+        drop(provisioner);
+        temp.close().unwrap();
+        if fs::read_dir(&e2e_root).unwrap().next().is_none() {
+            fs::remove_dir(&e2e_root).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "uses the staged real PHP/MariaDB/WordPress development runtime"]
+    fn staged_runtime_blocks_retry_for_partial_wordpress_tables() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let project_root = manifest_dir.parent().unwrap().to_path_buf();
+        let runtime_manifest =
+            project_root.join("runtime/development/x86_64-pc-windows-msvc/manifest.json");
+        let runtime = resolve_development_manifest(&project_root, &runtime_manifest).unwrap();
+
+        let e2e_root = manifest_dir.join("target/phase4-12-e2e");
+        fs::create_dir_all(&e2e_root).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("partial-wordpress-")
+            .tempdir_in(&e2e_root)
+            .unwrap();
+        let data_root = temp.path().join("store");
+        fs::create_dir_all(&data_root).unwrap();
+
+        let mut provisioner = Provisioner::from_development(
+            &project_root,
+            &runtime_manifest,
+            runtime.clone(),
+            data_root.clone(),
+        )
+        .unwrap();
+        provisioner.prepare().unwrap();
+        let mut manager = RuntimeManager::new(runtime, data_root.clone()).unwrap();
+        let running = manager.start().unwrap();
+        let database_port = running.database_port.unwrap();
+        let database_password = secret::load(&data_root.join(DATABASE_WORDPRESS_SECRET)).unwrap();
+        provisioner
+            .run_database_sql(
+                &DatabaseEndpoint::Tcp(database_port),
+                DATABASE_WORDPRESS_USER,
+                &database_password,
+                "CREATE TABLE coffeepos.wp_phase_4_12_partial (id BIGINT UNSIGNED NOT NULL PRIMARY KEY);\n",
+            )
+            .unwrap();
+
+        let error = provisioner
+            .install_wordpress("CoffeePOS Phase 4.12 Partial", &running)
+            .unwrap_err();
+        assert_eq!(error.operation, "recover partial WordPress install");
+        assert_eq!(
+            query_database_scalar(
+                &provisioner,
+                database_port,
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'coffeepos' AND table_name = 'wp_phase_4_12_partial'",
+            ),
+            "1"
+        );
+        let journal = provisioner.load_journal().unwrap().unwrap();
+        assert_eq!(journal.stage, ProvisioningStage::SiteReady);
+        assert_eq!(
+            journal.recovery_blocker,
+            Some(ProvisioningRecoveryBlocker::PartialWordPressInstall)
+        );
+
+        manager.stop().unwrap();
+        drop(manager);
+        drop(provisioner);
+
+        let mut relaunched = Provisioner::from_development(
+            &project_root,
+            &runtime_manifest,
+            resolve_development_manifest(&project_root, &runtime_manifest).unwrap(),
+            data_root.clone(),
+        )
+        .unwrap();
+        let inspect = relaunched.inspect();
+        assert_eq!(inspect.state, ProvisioningState::NeedsRepair);
+        assert!(!inspect.can_retry);
+        assert_eq!(
+            inspect
+                .last_error
+                .as_ref()
+                .map(|error| error.operation.as_str()),
+            Some("recover partial WordPress install")
+        );
+        let retry_error = relaunched.prepare().unwrap_err();
+        assert_eq!(retry_error.operation, "recover partial WordPress install");
+        assert!(data_root.join("database/mysql").is_dir());
+        assert!(data_root.join("site/wp-settings.php").is_file());
+
+        drop(relaunched);
         temp.close().unwrap();
         if fs::read_dir(&e2e_root).unwrap().next().is_none() {
             fs::remove_dir(&e2e_root).unwrap();

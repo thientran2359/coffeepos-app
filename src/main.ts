@@ -222,7 +222,7 @@ function renderProvisioning(info: ProvisioningInfo, commandError?: string): void
 
   if (provisioningBusy || info.state === "installing") {
     provisioningState.textContent = "installing";
-    provisioningStatus.textContent = "Đang đảm bảo database, WordPress, WooCommerce và activate exact CoffeePOS artifact. Không đóng app hoặc điều khiển runtime trong lúc này.";
+    provisioningStatus.textContent = "Đang đảm bảo database, WordPress, WooCommerce và activate exact CoffeePOS artifact. Nếu app bị đóng ngoài ý muốn, lần mở lại sẽ đọc provisioning journal và tiếp tục từ mốc an toàn.";
     provisionWordPress.textContent = "Đang cài đặt…";
     provisionWordPress.hidden = false;
     provisionWordPress.disabled = true;
@@ -386,7 +386,7 @@ async function bootstrap(): Promise<void> {
     element("version").textContent = info.version;
     element("settings").hidden = false;
     title.textContent = "Desktop shell đã sẵn sàng";
-    description.textContent = "Phase 4.10 dùng authenticated CoffeePOS machine-health endpoint để phân biệt application healthy, degraded và transport/auth/contract failure.";
+    description.textContent = "Phase 4.12 bổ sung first-run recovery: app đọc provisioning journal sau khi mở lại, Retry tiếp tục từ mốc an toàn và chặn tự động ghi đè partial WordPress install.";
     await refreshProvisioning();
     await refreshRuntime();
   } catch (error) {

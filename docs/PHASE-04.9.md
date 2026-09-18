@@ -89,7 +89,7 @@ Acceptance chứng minh fresh WordPress + WooCommerce + CoffeePOS activation; ex
 ## Ngoài phạm vi Phase 4.9
 
 - `/wp-json/coffeepos/v1/system/status` machine-health endpoint, machine token bootstrap và native consumption: Phase 4.10.
-- POS application URL/usability và Desktop POS WebView: Phase 5.1–5.2.
+- Mở POS/login và lựa chọn browser/WebView: Phase 5.4 theo roadmap UI/UX cập nhật.
 - Full-stack install interruption/recovery acceptance: Phase 4.11–4.12.
 - CoffeePOS upgrade/adoption flow cho existing unmanaged/different version plugin.
 

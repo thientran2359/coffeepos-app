@@ -125,7 +125,7 @@ Test dùng store tạm dưới `src-tauri/target/phase3-e2e`, không dùng store
 - Mở WordPress bằng browser/system URL: Phase 4.3.
 - WooCommerce: Phase 4.4–4.6.
 - CoffeePOS plugin/health endpoint: Phase 4.7–4.10.
-- Auto-start khi mở app: Phase 5.4.
+- Auto-start khi mở app: Phase 5.5 (roadmap UI/UX cập nhật).
 - Diagnostics/log viewer đầy đủ: Phase 6.1/6.3.
 - Repair engine: Phase 6.2.
 

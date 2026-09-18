@@ -133,8 +133,8 @@ Các mục sau đã pass trên Windows:
 - đăng nhập wp-admin: chưa bắt buộc ở Phase 4.3;
 - WooCommerce: Phase 4.4–4.6;
 - CoffeePOS plugin: Phase 4.7–4.10;
-- POS WebView riêng: Phase 5.2;
-- auto-start runtime khi mở app: Phase 5.4;
+- POS host/browser hoặc WebView: Phase 5.4 theo roadmap UI/UX cập nhật;
+- auto-start runtime khi mở app: Phase 5.5;
 - packaged production runtime/browser flow: Phase 9.
 
 ## Gate sang Phase 4.4

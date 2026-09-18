@@ -16,13 +16,13 @@ Windows x64 là target được triển khai và nghiệm thu trước. macOS đ
 
 ## Ranh giới và dependency gates
 
-Giữ nguyên số phase. Các mốc artifact/install/activation là checkpoint kỹ thuật nhỏ của cùng một flow setup; không yêu cầu người vận hành bấm từng bước. Mỗi mốc phải có cách chạy/kiểm chứng rõ ràng, và Phase 4.12 phải nối toàn bộ flow từ UI.
+Giữ nguyên số và bằng chứng của Phase 1–4.11 đã hoàn thành. Ngày 2026-09-18 điều chỉnh Phase 5 chưa triển khai thành các milestone UI/UX dưới đây; số 5.x cũ không còn dùng để lên kế hoạch. Đặc tả trải nghiệm nằm tại [UI-UX.md](UI-UX.md). Các mốc artifact/install/activation là checkpoint kỹ thuật của cùng một setup flow; không yêu cầu người vận hành bấm từng bước.
 
 - `provisioning.ready` nghĩa là phần cài đặt đã hoàn tất, không chứng minh service đang chạy. Runtime readiness và application health là các kết quả riêng; chỉ hiển thị POS sẵn sàng sau health tương ứng.
 - Idempotency, retry an toàn, cleanup, lỗi có hướng phục hồi và bảo vệ secrets là yêu cầu ngay tại phase tạo hành vi đó. Phase 4.11–4.12 kiểm chứng tích hợp toàn stack; Phase 6 bổ sung diagnostics/repair UI, không trì hoãn xử lý lỗi cơ bản tới đó.
 - Phase 4.1–4.3 phải pass trước WooCommerce. Trước khi pin CoffeePOS ở 4.7, chốt contract health/POS URL/machine authentication với plugin; implementation và nghiệm thu endpoint vẫn ở 4.10.
-- Phase 5.2 phải có đăng nhập thực tế; Phase 5.5 mở rộng shutdown đã có từ Phase 2 cho POS đang hoạt động. Phase 5.3 sở hữu điều hướng; 5.4 sở hữu tự khởi động runtime.
-- Kiểm chứng PHP self-request/background jobs từ 4.6; concurrency với POS từ 5.2. Chốt quyết định web server trước LAN hoặc release, theo [ARCHITECTURE.md](../ARCHITECTURE.md#php-built-in-server-quyết-định-có-điều-kiện). Không coi benchmark pass là chứng nhận production cho `php -S`.
+- UI/UX là deliverable của từng phase: màn hình, hành động chính, loading/error/retry và nghiệm thu thao tác thật. 5.1 sở hữu khung điều hướng; 5.2 setup/tài khoản; 5.3 trang chính/cài đặt; 5.4 mở POS/login; 5.5 auto-start; 5.6 shutdown. Không trì hoãn toàn bộ UI đến khi backend hoàn tất.
+- Kiểm chứng PHP self-request/background jobs từ 4.6; concurrency với POS từ 5.4. Chốt quyết định web server trước LAN hoặc release, theo [ARCHITECTURE.md](../ARCHITECTURE.md#php-built-in-server-quyết-định-có-điều-kiện). Không coi benchmark pass là chứng nhận production cho `php -S`.
 - Chốt thiết kế bảo mật LAN trước bind 8.1; 8.3 là nghiệm thu/hardening toàn flow. Phase 8.1–8.2 chỉ thử nghiệm có kiểm soát cho đến khi 8.3 pass.
 - Phase 7 dùng development artifact đã pin cho dump/restore; không phụ thuộc production bundling 9.1. Phase 9 chịu trách nhiệm bundle chính các công cụ đã nghiệm thu.
 - Development và acceptance dùng store/profile riêng trước khi thử dữ liệu vận hành. Không kiểm thử failure/restore/upgrade trên store thật.
@@ -44,7 +44,9 @@ Giữ nguyên số phase. Các mốc artifact/install/activation là checkpoint 
 | 4.8 — CoffeePOS provisioning | ✅ Hoàn thành Windows-first | Ownership-safe install 1.0.0, dependency preflight, journal stage, retry/data preservation |
 | 4.9 — CoffeePOS activation | ✅ Hoàn thành Windows-first | Exact 1.0.0 active, Woo 11.1.0 preflight, fresh-process plugin baseline verification, restart/retry persistence |
 | 4.10 — CoffeePOS health endpoint | ✅ Hoàn thành Windows-first | CoffeePOS 1.0.1 machine-health schema 1, DPAPI token auth, native classification, rotation/recovery, real E2E |
-| 4.11+ | ⏳ Chưa bắt đầu | Mốc tiếp theo: full install idempotency |
+| 4.11 — Full install idempotency | ✅ Hoàn thành Windows-first | Second full DB → WordPress → WooCommerce → CoffeePOS provisioning preserves credentials, uploads, business data, plugin ownership/state and machine token |
+| 4.12 — First-run recovery | ✅ Hoàn thành Windows-first | Journal-boundary interruption recovery, credential preservation, persistent partial-WordPress repair blocker, real staged E2E |
+| 5.1+ | ⏳ Chưa bắt đầu | Mốc tiếp theo: khung giao diện và điều hướng |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -62,7 +64,7 @@ Giữ nguyên số phase. Các mốc artifact/install/activation là checkpoint 
 
 **Scope:** đồng bộ provisioning state với runtime state, hiển thị database/PHP/WordPress readiness, retry sau lỗi.
 
-Phân biệt rõ `đã cài + stopped`, `starting`, `runtime running + WordPress chưa healthy`, và `WordPress healthy`. Probe PHP hiện tại không thay WordPress health; kiểm WordPress sau mỗi start/restart với timeout và lỗi có component. Chặn action xung đột ở native layer, không chỉ disable nút. Refresh/reload UI chỉ đọc trạng thái; không tự reinstall hoặc spawn thêm process. Auto-start khi mở app thuộc 5.4; progress từng bước chỉ bổ sung nếu cần cho UX này.
+Phân biệt rõ `đã cài + stopped`, `starting`, `runtime running + WordPress chưa healthy`, và `WordPress healthy`. Probe PHP hiện tại không thay WordPress health; kiểm WordPress sau mỗi start/restart với timeout và lỗi có component. Chặn action xung đột ở native layer, không chỉ disable nút. Refresh/reload UI chỉ đọc trạng thái; không tự reinstall hoặc spawn thêm process. Auto-start khi mở app thuộc 5.5; progress từng bước chỉ bổ sung nếu cần cho UX này.
 
 **Definition of Done:** app restart trên store đã cài nhận đúng trạng thái, không yêu cầu cài lại; start/stop/retry cập nhật UI đúng với native state.
 
@@ -74,7 +76,7 @@ Acceptance phải có stopped → start → healthy → stop → restart, lỗi 
 
 **Scope:** dùng `http://127.0.0.1:<dynamic-port>` từ runtime info; không hard-code port.
 
-Action development mở trang WordPress bằng trình duyệt hệ thống, chỉ enabled sau WordPress health. Native chỉ mở URL của runtime đang quản lý, không nhận URL tùy ý từ frontend. Không nạp WordPress vào shell có management IPC; POS WebView riêng thuộc 5.2. Chưa yêu cầu đăng nhập admin ở mốc này.
+Action development mở trang WordPress bằng trình duyệt hệ thống, chỉ enabled sau WordPress health. Native chỉ mở URL của runtime đang quản lý, không nhận URL tùy ý từ frontend. Không nạp WordPress vào shell có management IPC; POS host được chốt riêng ở 5.4. Chưa yêu cầu đăng nhập admin ở mốc này.
 
 **Definition of Done:** sau provisioning có action mở WordPress local thành công và reload/restart vẫn dùng đúng port hiện tại.
 
@@ -164,6 +166,8 @@ Chốt schema/auth/POS route trước artifact 4.7; 4.10 triển khai và nghi�
 
 **Definition of Done:** provisioning lần hai giữ nguyên sentinel và dữ liệu nghiệp vụ test; không reset credential, database, uploads hoặc plugin state.
 
+**Hoàn thành Windows-first 2026-09-18:** full staged E2E chạy lại toàn bộ `prepare → runtime start → WordPress/WooCommerce/CoffeePOS install/activation → machine health` trên cùng completed store và giữ nguyên DB runtime/WordPress/admin/machine credentials, WordPress admin password hash, managed wp-config/salts, external uploads, real CoffeePOS suspended-cart row + store option, plugin ownership metadata, activation state, journal và unrelated files. Native readiness cũng yêu cầu protected DB/admin credentials đọc được; installed WordPress không tự sinh replacement admin secret khi credential bị mất mà chuyển sang `needs_repair`. Xem `docs/PHASE-04.11.md`.
+
 ### Phase 4.12 — First-run recovery
 
 **Mục tiêu:** retry được khi setup thất bại giữa chừng.
@@ -172,33 +176,49 @@ Chốt schema/auth/POS route trước artifact 4.7; 4.10 triển khai và nghi�
 
 Nghiệm thu trực tiếp từ app: fresh store → setup toàn stack → application healthy; đóng/mở giữa setup → đọc journal → tiếp tục an toàn. Một flow UI điều phối các bước, không yêu cầu người dùng chạy staging/CLI hoặc vào wp-admin. Artifact development được chuẩn bị trước; production/offline payload thuộc Phase 9. Lỗi không retryable phải chỉ rõ hướng xử lý, không hiện nút Repair như thể engine 6.2 đã tồn tại.
 
-## Phase 5 — POS trong Desktop
+**Hoàn thành Windows-first 2026-09-18:** native provisioning có deterministic test-only interruption checkpoint sau từng side effect và trước journal commit. Real staged E2E recreate `Provisioner` + `RuntimeManager` trên cùng `data_root` qua các boundary database/site/WordPress/WooCommerce/CoffeePOS/machine health rồi Retry tới `ready`, giữ nguyên protected DB/admin/machine credentials. Interruption giữa `wp_install()` được bảo vệ riêng: bootstrap exit 6/7 persist optional `recovery_blocker=partial_wordpress_install`; relaunch trả `needs_repair`, `can_retry=false`, giữ nguyên tables/site và normal provisioning không bypass blocker. UI dùng cùng một Install/Retry flow và khi non-retryable chỉ cho kiểm tra lại trạng thái. Xem `docs/PHASE-04.12.md`.
 
-### Phase 5.1 — POS URL
+## Phase 5 — Trải nghiệm ứng dụng và mở bán hàng
 
-Xác định route POS thật từ CoffeePOS/plugin health contract và kiểm readiness. **Done khi** runtime trả một URL POS hợp lệ và request thật thành công.
+Tất cả 5.x dưới đây **chưa triển khai**. Trước code mỗi milestone, bổ sung spec phase với wireframe success/loading/error, contract native cần dùng và acceptance theo [UI-UX.md](UI-UX.md). Tái sử dụng runtime/provisioning hiện có; không viết lại backend chỉ để đổi giao diện.
 
-Route lấy từ plugin router, resolve trong origin runtime được xác minh; chặn URL ngoài origin. Redirect tới login có thể đúng với người chưa đăng nhập, nhưng không được báo là authenticated POS đã sẵn sàng.
+### Phase 5.1 — Khung giao diện và điều hướng
 
-### Phase 5.2 — Desktop POS WebView
+**Scope:** tách setup khỏi khu vực cửa hàng đã cài; navigation Trang chính / Cài đặt / Chẩn đoán; thống nhất layout, typography, form/button/error states. Chuyển technical controls đang có vào Chẩn đoán; giữ flow 4.12 hoạt động.
 
-Load POS local trong WebView riêng với origin đã xác minh và không cấp management IPC cho WordPress content. **Done khi** POS render và thao tác cơ bản chạy trong app.
+**Done khi:** điều hướng app thật bằng chuột/bàn phím, reload/relaunch chọn đúng màn hình theo installation; runtime không bị spawn lại do đổi trang. Resize/DPI không che action; không có trang chức năng tương lai rỗng. Native success/error hiện có vẫn hiển thị và thao tác được. Chưa cần auto-start, POS host hoặc repair engine.
 
-Trước implementation, chốt cách người dùng nhận/đặt credential ban đầu và đăng nhập bằng auth WordPress/CoffeePOS hiện có; credential được bảo vệ trong native storage chưa tự tạo thành luồng đăng nhập dùng được. Không dùng health token làm staff session. Acceptance gồm login → POS → tạo đơn test → logout → login lại, session hết hạn/relaunch, external navigation và kiểm POS không gọi được management IPC. Kiểm self-request, jobs và request đồng thời thực tế; lưu số đo/giới hạn của baseline.
+### Phase 5.2 — Thiết lập cửa hàng và tài khoản
 
-### Phase 5.3 — Navigation shell
+**Scope:** Chào mừng → thông tin cửa hàng/tài khoản → tiến trình → hoàn tất, reuse recovery 4.12. Chốt input/persistence/credential contract trước code; WordPress/plugin giữ nguồn sự thật cho store/account. Cách đặt/nhận credential phải dùng được với cả fresh store và store cũ có generated secret, không reset tài khoản khi retry.
 
-Xây flow Setup → Starting → Login/POS → Error và đường quay lại shell. **Done khi** điều hướng theo native state đúng, có thể rời POS để xem lỗi/start lại và quay về POS mà không tạo WebView/runtime trùng. Mốc này vẫn cho phép Start thủ công; auto-start thuộc 5.4. Repair engine thuộc 6.2, trước đó chỉ hiện recovery action thực sự hỗ trợ.
+**Done khi:** fresh setup từ form thật tạo đúng store/account; validation, quay lại sửa, double-submit và interruption/relaunch được nghiệm thu; tài khoản đăng nhập được qua auth hiện có của WordPress/CoffeePOS trên trình duyệt test. Store đã cài bỏ qua fresh wizard, dữ liệu cũ được giữ; secret không lọt vào logs/URL/draft storage. Tích hợp nút mở bán hàng thuộc 5.4.
 
-### Phase 5.4 — Startup automation
+### Phase 5.3 — Trang chính và cài đặt ứng dụng
 
-Store đã provision thì app tự detect, start runtime và điều hướng tới trạng thái phù hợp. **Done khi** relaunch trên store có sẵn mở đúng flow mà không reinstall.
+**Scope:** tên cửa hàng, trạng thái dễ hiểu, hành động theo native state; cài đặt thuộc Desktop với save/error feedback. Tách thông tin kỹ thuật khỏi trang chính. Khi chưa có opener 5.4, chỉ hiển thị hệ thống sẵn sàng và chức năng thực sự có.
 
-### Phase 5.5 — Shutdown lifecycle
+**Done khi:** nghiệm thu installed/stopped/starting/healthy/error/stopping; health stale bị loại sau failure; Start/Retry có kết quả thật và không reinstall. Người dùng tìm được cài đặt/chẩn đoán mà không phải hiểu PHP/database. Không nhân bản dashboard hoặc settings nghiệp vụ POS.
 
-Đóng app phải stop PHP và MariaDB sạch. **Done khi** close/crash test không để process runtime mồ côi và dữ liệu store vẫn nhất quán.
+### Phase 5.4 — Mở POS và đăng nhập
 
-Mở rộng lifecycle Phase 2 cho request/checkout đang chạy, multiple windows và pending setup. Chốt bounded drain/timeout khi đóng bình thường; không hứa graceful shutdown khi process bị kill hoặc mất điện. Crash acceptance phải relaunch và kiểm database recovery, trạng thái đơn test và không tạo đơn trùng; trạng thái thanh toán vẫn do plugin/WooCommerce quyết định.
+**Scope:** nút **Mở bán hàng**, URL từ plugin router/health và native origin đã kiểm chứng, login/session bằng auth hiện có. Chốt host trong spec trước code: browser là hướng đề xuất MVP; POS WebView là lựa chọn riêng, không phải prerequisite của shell và không bắt buộc triển khai cả hai.
+
+**Done khi:** app → Mở bán hàng → login → POS → đơn test → logout/login lại; session hết hạn, runtime restart/đổi port và open failure có đường phục hồi. Redirect login không được coi là authenticated POS. Browser không cung cấp tín hiệu tab/login cho shell; WebView nếu chọn phải cách ly management IPC và kiểm external navigation. Kiểm jobs/self-request/concurrency bằng POS thật. Không thêm nghiệp vụ bán hàng vào Desktop.
+
+### Phase 5.5 — Khởi động hằng ngày
+
+**Scope:** mở app trên store đã cài tự start runtime, báo tiến trình/lỗi trên trang chính; healthy thì cho Mở bán hàng. Không tự bật app cùng OS trong milestone này.
+
+**Done khi:** relaunch đi đúng luồng không reinstall, không sinh process hoặc tab trùng do polling/reload; failure có Retry; setup dở được dẫn về recovery. Không làm mất session/data bằng startup automation.
+
+### Phase 5.6 — Thu nhỏ, thoát và shutdown
+
+**Scope:** thu nhỏ giữ runtime; thoát dừng runtime với thông báo ảnh hưởng POS/thiết bị và lựa chọn ở lại. Đóng tab trình duyệt không dừng server. Tray/background mode ngoài scope trừ khi có contract riêng.
+
+**Done khi:** close/cancel/minimize/relaunch và crash không để process mồ côi; bounded drain/timeout được kiểm với request/đơn test đang chạy; kiểm recovery không tạo đơn trùng. Không hứa graceful shutdown khi mất điện/kill; không coi đóng app là chốt ca hoặc tự thay payment state.
+
+**Gate cuối Phase 5:** người thử hoàn tất setup → login/bán hàng → đóng/mở → dùng store cũ → xử lý lỗi thông thường mà không dùng terminal/wp-admin. Ghi rõ người thử, mức hỗ trợ, bằng chứng và giới hạn; developer acceptance không tự thay user usability test.
 
 ## Phase 6 — Diagnostics và Repair
 
@@ -286,4 +306,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.10 đã pass Windows-first. Mốc tiếp theo là **Phase 4.11 — Full install idempotency**; phải chứng minh full DB → WordPress → WooCommerce → CoffeePOS rerun giữ nguyên credential, uploads, plugin ownership, machine token và dữ liệu/sentinel đã có.
+Phase 4.1–4.12 đã pass Windows-first. Mốc tiếp theo là **Phase 5.1 — Khung giao diện và điều hướng**; giữ recovery flow 4.12 hoạt động trong khi tách setup khỏi khu vực cửa hàng đã cài và chuyển technical controls sang Chẩn đoán.

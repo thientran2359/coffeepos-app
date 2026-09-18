@@ -15,7 +15,7 @@ Rust: cấu hình → runtime lifecycle → provisioning → health → backup
         ├── MariaDB (loopback only)
         └── PHP HTTP server → WordPress → WooCommerce → CoffeePOS
                                                     │
-                                       POS WebView / thiết bị LAN
+                                       POS browser hoặc WebView / thiết bị LAN
 ```
 
 CoffeePOS/WooCommerce sở hữu sản phẩm, giỏ hàng, thanh toán, đơn, khách hàng, báo cáo, ca và REST API. Desktop chỉ quản lý tiến trình, file, cấu hình môi trường, sức khỏe, backup và cập nhật. Không sửa WordPress core. Không sao chép nghiệp vụ sang Rust.
@@ -71,7 +71,7 @@ Giữ `php -S` cho vertical slice theo AGENTS.md. [PHP manual](https://www.php.n
 
 Hệ quả cần đo: WordPress loopback/self-request có thể bị kẹt khi cùng worker đang chờ; cron, plugin HTTP call vào chính site, nhiều màn KDS/customer display và request dài có thể chặn POS. Đây là rủi ro kiến trúc thực tế, không chỉ vấn đề đóng gói.
 
-Kiểm loopback/background jobs ngay khi tích hợp WooCommerce ở 4.6, rồi concurrency, timeout, checkout và polling khi có POS ở 5.2. Trước Phase 8 LAN hoặc Phase 9 release phải có quyết định web server được ghi rõ, bao gồm hạn chế production từ PHP manual; benchmark pass không tự loại bỏ hạn chế đó. Nếu không đạt, trình bày bằng chứng và cập nhật quyết định kiến trúc trước khi thêm web server/worker model khác. Hiện vẫn dùng PHP built-in server cho vertical slice; chưa tuyên bố runtime production-ready cho tải LAN nhiều client.
+Kiểm loopback/background jobs ngay khi tích hợp WooCommerce ở 4.6, rồi concurrency, timeout, checkout và polling khi có POS ở 5.4. Trước Phase 8 LAN hoặc Phase 9 release phải có quyết định web server được ghi rõ, bao gồm hạn chế production từ PHP manual; benchmark pass không tự loại bỏ hạn chế đó. Nếu không đạt, trình bày bằng chứng và cập nhật quyết định kiến trúc trước khi thêm web server/worker model khác. Hiện vẫn dùng PHP built-in server cho vertical slice; chưa tuyên bố runtime production-ready cho tải LAN nhiều client.
 
 ## 4. File và cấu hình
 
@@ -132,7 +132,7 @@ Frontend có npm lockfile. Rust Cargo.toml dùng major constraints và Cargo.loc
 
 Shell bundled `main` hiện expose các typed commands cho shell/config, runtime lifecycle và WordPress provisioning: `get_shell_info`, `save_store_name`, `get_runtime_info`, `start_runtime`, `stop_runtime`, `restart_runtime`, `get_provisioning_info`, `provision_wordpress`. Commands đưa vào `AppManifest::commands`, capability chỉ cấp cho `main`; không có remote origins, filesystem/shell plugins hoặc arbitrary shell command input. CSP hạn chế script và IPC; dev CSP cho Vite/HMR tại loopback. Theo [Tauri capabilities](https://v2.tauri.app/security/capabilities/), app commands cần explicit manifest nếu muốn capability kiểm soát.
 
-Phase 5.2 tạo POS WebView riêng, không cấp native management capability cho HTTP WordPress. Rust chỉ cho navigation tới đúng local origin đã được xác minh; external links phải có handling riêng. Không nạp WP content vào shell có quyền quản lý. Cookie staff/member do plugin sở hữu.
+Phase 5.1–5.3 xây shell, setup và trang chính theo [UI-UX.md](docs/UI-UX.md). Phase 5.4 chốt host POS trước code: browser là hướng đề xuất MVP; WebView là lựa chọn riêng. Nếu dùng POS WebView thì phải tách riêng, không cấp native management capability cho HTTP WordPress. Rust chỉ cho navigation tới đúng local origin đã được xác minh; external links phải có handling riêng. Không nạp WP content vào shell có quyền quản lý. Cookie staff/member do plugin sở hữu.
 
 Provisioning tạo admin credential từ user input hoặc secure randomness, không log, không đưa password vào command line. Bí mật cần persist dùng Windows credential protection/macOS Keychain; wp-config/db client file cần quyền OS hạn chế. Health token không xuất hiện trên UI hoặc URL.
 
@@ -151,8 +151,8 @@ Roadmap chi tiết và Definition of Done nằm tại [docs/ROADMAP.md](docs/ROA
 | 1 ✅ | Desktop + config + app data | Native Windows shell/config chạy được |
 | 2 ✅ | MariaDB → PHP → HTTP | Start/stop/restart/failure, không orphan |
 | 3 ✅ | WordPress cục bộ | Fresh install, retry/idempotency, giữ dữ liệu cũ |
-| 4.1 ✅ / 4.2–4.12 | Setup UI → WooCommerce → CoffeePOS | 4.1 Install UI đã pass; tiếp theo runtime UX, activation, health, full-stack retry/recovery |
-| 5.1–5.5 | POS trong Desktop | POS URL/WebView, startup/shutdown automation |
+| 4.1–4.11 ✅ / 4.12 | Setup → WooCommerce → CoffeePOS | Installation/health/idempotency đã pass Windows-first; còn interruption recovery |
+| 5.1–5.6 | UI/UX và mở bán hàng | Điều hướng, setup/tài khoản, trang chính, POS/login, startup và shutdown |
 | 6.1–6.3 | Diagnostics/repair | Component health, safe repair, support logs |
 | 7.1–7.4 | Backup/restore | Portable validated backup và restore E2E |
 | 8.1–8.3 | LAN opt-in | Reachability, auth, DB/native control vẫn private |

@@ -912,7 +912,9 @@ Current Windows-first status:
 - Phase 4.8 — CoffeePOS provisioning: complete Windows-first.
 - Phase 4.9 — CoffeePOS activation: complete Windows-first.
 - Phase 4.10 — CoffeePOS health endpoint: complete Windows-first.
-- Next milestone: Phase 4.11 — Full install idempotency.
+- Phase 4.11 — Full install idempotency: complete Windows-first.
+- Phase 4.12 — First-run recovery: complete Windows-first.
+- Next milestone: Phase 5.1 — UI shell and navigation.
 
 From Phase 4 onward, work is intentionally split into small independently verifiable milestones:
 
@@ -930,11 +932,12 @@ From Phase 4 onward, work is intentionally split into small independently verifi
 | 4.10 | CoffeePOS health endpoint |
 | 4.11 | Full install idempotency |
 | 4.12 | First-run recovery |
-| 5.1 | POS URL |
-| 5.2 | Desktop POS WebView |
-| 5.3 | Navigation shell |
-| 5.4 | Startup automation |
-| 5.5 | Shutdown lifecycle |
+| 5.1 | UI shell and navigation |
+| 5.2 | Store and account onboarding |
+| 5.3 | Home and app settings |
+| 5.4 | Open POS and login |
+| 5.5 | Daily startup |
+| 5.6 | Minimize, exit and shutdown |
 | 6.1 | Health diagnostics |
 | 6.2 | Repair flow |
 | 6.3 | Log viewer/export |
