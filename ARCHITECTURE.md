@@ -65,13 +65,13 @@ PHP Windows có [binary và dependency riêng](https://www.php.net/manual/en/ins
 5. Default loopback; LAN chỉ mở ở Phase 8.x. Không mở database ra LAN, không port-forward/cloud tunnel.
 6. Tiến trình dùng `std::process::Command` với đường dẫn tuyệt đối và từng argument; Rust giữ quyền spawn, không đưa shell API cho WebView.
 
-### PHP built-in server: quyết định có điều kiện
+### PHP built-in server: requirement thay thế đã được chứng minh
 
-Giữ `php -S` cho vertical slice theo AGENTS.md. [PHP manual](https://www.php.net/manual/en/features.commandline.webserver.php) xác nhận server mặc định một luồng xử lý request, workers không được hỗ trợ trên Windows, và server không dành cho production.
+`php -S` đã phù hợp để đưa vertical slice ban đầu lên chạy theo AGENTS.md. [PHP manual](https://www.php.net/manual/en/features.commandline.webserver.php) xác nhận server mặc định một luồng xử lý request, workers không được hỗ trợ trên Windows, và server không dành cho production.
 
 Hệ quả cần đo: WordPress loopback/self-request có thể bị kẹt khi cùng worker đang chờ; cron, plugin HTTP call vào chính site, nhiều màn KDS/customer display và request dài có thể chặn POS. Đây là rủi ro kiến trúc thực tế, không chỉ vấn đề đóng gói.
 
-Kiểm loopback/background jobs ngay khi tích hợp WooCommerce ở 4.6, rồi concurrency, timeout, checkout và polling khi có POS ở 5.4. Trước Phase 8 LAN hoặc Phase 9 release phải có quyết định web server được ghi rõ, bao gồm hạn chế production từ PHP manual; benchmark pass không tự loại bỏ hạn chế đó. Nếu không đạt, trình bày bằng chứng và cập nhật quyết định kiến trúc trước khi thêm web server/worker model khác. Hiện vẫn dùng PHP built-in server cho vertical slice; chưa tuyên bố runtime production-ready cho tải LAN nhiều client.
+Sau khi POS thật, auto-start và health polling cùng hoạt động, requirement thay thế đã xuất hiện: benchmark 2026-09-18 trên development runtime cho `/wp-login.php` khoảng `0.88–0.90s` với mẫu gần `1.96s`, trong khi static JS cùng origin chỉ khoảng `2–7ms`; runtime Windows vẫn có một PHP request worker. Phase 6.2 vì vậy phải chốt và triển khai local web-serving/FastCGI worker model có concurrency, đồng thời bật OPcache và tách health/status scheduling. `php -S` có thể tiếp tục phục vụ fixture/test nhỏ nhưng không còn là serving architecture mục tiêu cho POS trước Phase 8 LAN hoặc Phase 9 release. Xem [PHASE-06.2.md](docs/PHASE-06.2.md).
 
 ## 4. File và cấu hình
 

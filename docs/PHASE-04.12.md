@@ -29,7 +29,7 @@ Khi bootstrap trả exit code partial-install (`6` hoặc `7`):
 - journal không advance khỏi `site_ready`;
 - `inspect()` trả `needs_repair`, `can_retry=false` và recovery text rõ ràng;
 - normal `prepare()` từ chối bypass blocker;
-- UI chỉ cho kiểm tra lại trạng thái, không hiện một nút Repair giả khi Phase 6.2 chưa tồn tại.
+- UI chỉ cho kiểm tra lại trạng thái, không hiện một nút Repair giả khi Phase 6.3 chưa tồn tại.
 
 Field blocker là optional + serde default nên journal Phase 4.6–4.11 vẫn đọc được mà không cần tăng schema version.
 

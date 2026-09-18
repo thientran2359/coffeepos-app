@@ -118,6 +118,8 @@ CoffeePOS
 
 Avoid adding Nginx or Apache unless there is a demonstrated requirement.
 
+The Phase 6.2 performance investigation demonstrated that requirement for the POS serving path on Windows: the single-process built-in server serializes dynamic requests, while measured WordPress dynamic requests were orders of magnitude slower than static assets. Keep `php -S` only where a lightweight development/fixture server is appropriate; the managed POS runtime must move to the concurrent serving model specified by the roadmap before LAN/release.
+
 For the first implementation, prefer PHP's built-in web server:
 
 ```text
@@ -919,7 +921,10 @@ Current Windows-first status:
 - Phase 5.3 — Home and app settings: implemented; lightweight validation passed, manual Windows acceptance pending.
 - Phase 5.4 — Open POS and login: implemented; lightweight validation passed, manual Windows acceptance pending.
 - Phase 5.5 — Daily startup: implemented; lightweight validation passed, manual Windows acceptance pending.
-- Next implementation milestone after Phase 5.5 acceptance: Phase 5.6 — Minimize, exit and shutdown.
+- Phase 5.6 — Minimize, exit and shutdown: implemented; lightweight validation passed, manual Windows acceptance pending.
+- Phase 6.1 — Health diagnostics: implemented; lightweight validation passed, manual Windows acceptance pending.
+- Phase 6.2 — Runtime performance and responsiveness: planned; see `docs/PHASE-06.2.md`.
+- Next implementation milestone: Phase 6.2 — Runtime performance and responsiveness.
 
 From Phase 4 onward, work is intentionally split into small independently verifiable milestones:
 
@@ -944,8 +949,9 @@ From Phase 4 onward, work is intentionally split into small independently verifi
 | 5.5 | Daily startup |
 | 5.6 | Minimize, exit and shutdown |
 | 6.1 | Health diagnostics |
-| 6.2 | Repair flow |
-| 6.3 | Log viewer/export |
+| 6.2 | Runtime performance and responsiveness |
+| 6.3 | Repair flow |
+| 6.4 | Log viewer/export |
 | 7.1 | Backup format |
 | 7.2 | Database backup |
 | 7.3 | Uploads/config backup |
@@ -1260,29 +1266,24 @@ For CoffeePOS integration:
 
 CoffeePOS Desktop should eventually provide:
 
+For the installed-store shell, the current product information architecture is **Tổng quan / Cấu hình / Hệ thống**. Treat these as the only top-level navigation areas unless a later product decision explicitly changes the IA. **Chẩn đoán**, repair, logs and other technical administration belong under **Hệ thống**; do not add Diagnostics back as a peer top-level tab. Preserve the existing internal `home/settings/diagnostics` keys for backward compatibility unless a migration is separately specified. Follow `docs/UI-UX.md` for the shell/layout contract.
+
 ```text
 ┌───────────────────────────────────────┐
 │ CoffeePOS                             │
-│                                       │
+│ Tổng quan | Cấu hình | Hệ thống      │
+│───────────────────────────────────────│
+│ Tổng quan                             │
 │ ● POS Running                         │
-│                                       │
 │ [ Open POS ]                          │
 │                                       │
-│ Store                                 │
-│ My Coffee                             │
+│ Store        My Coffee                │
+│ Devices      1 POS · 1 KDS · 2 Tablet │
 │                                       │
-│ Devices                               │
-│ 1 POS                                 │
-│ 1 KDS                                 │
-│ 2 Tablets                             │
-│                                       │
-│ System                                │
-│ ✓ WordPress                           │
-│ ✓ WooCommerce                         │
-│ ✓ CoffeePOS                           │
-│ ✓ Database                            │
-│                                       │
-│ [ Backup ] [ Settings ]               │
+│ Hệ thống                              │
+│ ✓ WordPress  ✓ WooCommerce            │
+│ ✓ CoffeePOS  ✓ Database               │
+│ Chẩn đoán >                           │
 └───────────────────────────────────────┘
 ```
 

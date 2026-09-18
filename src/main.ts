@@ -68,6 +68,24 @@ interface RuntimeInfo {
   last_error: RuntimeErrorInfo | null;
 }
 
+type ComponentHealthState = "unavailable" | "healthy" | "unhealthy" | "unknown";
+
+interface ComponentHealthInfo {
+  state: ComponentHealthState;
+  error: RuntimeErrorInfo | null;
+}
+
+interface HealthDiagnosticsInfo {
+  runtime_state: RuntimeInfo["state"];
+  database: ComponentHealthInfo;
+  php: ComponentHealthInfo;
+  wordpress: ComponentHealthInfo;
+  woocommerce: ComponentHealthInfo;
+  coffeepos: ComponentHealthInfo;
+}
+
+type HealthComponent = "database" | "php" | "wordpress" | "woocommerce" | "coffeepos";
+
 type ProvisioningState = "not_installed" | "installing" | "ready" | "needs_repair";
 
 interface ProvisioningInfo {
@@ -118,7 +136,6 @@ const homeStatus = element("home-status");
 const homeDetail = element("home-detail");
 const homeAction = element<HTMLButtonElement>("home-action");
 const homeOpenStatus = element("home-open-status");
-const homeSettings = element<HTMLButtonElement>("home-settings");
 const homeDiagnostics = element<HTMLButtonElement>("home-diagnostics");
 
 const name = element<HTMLInputElement>("store-name");
@@ -158,6 +175,10 @@ const wordpressHealthError = element("wordpress-health-error");
 const coffeeposHealth = element("coffeepos-health");
 const coffeeposHealthError = element("coffeepos-health-error");
 const coffeeposHealthDetails = element("coffeepos-health-details");
+const healthSummaryState = element("health-summary-state");
+const healthSummary = element("health-summary");
+const healthRecheck = element<HTMLButtonElement>("health-recheck");
+const healthCheckStatus = element("health-check-status");
 
 let provisioningBusy = false;
 let runtimeBusy = false;
@@ -176,6 +197,8 @@ let runtimeLoadError: string | null = null;
 let homeActionKind: "start" | "retry_health" | "refresh" | "open_pos" | null = null;
 let posOpenBusy = false;
 let bootstrapBusy = false;
+let diagnosticsBusy = false;
+let currentDiagnostics: HealthDiagnosticsInfo | null = null;
 
 function nativeErrorText(error: unknown): string {
   if (typeof error === "string") return error;
@@ -197,6 +220,145 @@ function setTextIfChanged(node: HTMLElement, value: string): void {
 
 function setHiddenIfChanged(node: HTMLElement, hidden: boolean): void {
   if (node.hidden !== hidden) node.hidden = hidden;
+}
+
+const healthComponents: HealthComponent[] = ["database", "php", "wordpress", "woocommerce", "coffeepos"];
+
+function healthComponentName(component: HealthComponent): string {
+  if (component === "database") return "Database";
+  if (component === "php") return "PHP";
+  if (component === "wordpress") return "WordPress";
+  if (component === "woocommerce") return "WooCommerce";
+  return "CoffeePOS";
+}
+
+function healthStateLabel(state: ComponentHealthState): string {
+  if (state === "healthy") return "Khỏe";
+  if (state === "unhealthy") return "Có lỗi";
+  if (state === "unknown") return "Chưa xác minh";
+  return "Không hoạt động";
+}
+
+function defaultHealthSummary(component: HealthComponent, state: ComponentHealthState, runtimeState: RuntimeInfo["state"]): string {
+  const displayName = healthComponentName(component);
+  if (state === "healthy") {
+    if (component === "database") return "MariaDB trả lời truy vấn chẩn đoán đã xác thực.";
+    if (component === "php") return "PHP thực thi đúng nonce probe trên HTTP runtime hiện tại.";
+    if (component === "wordpress") return "WordPress trả readiness response hợp lệ.";
+    return `Machine-health đã xác nhận ${displayName} sẵn sàng.`;
+  }
+  if (state === "unavailable") {
+    return runtimeState === "running"
+      ? `${displayName} chưa thể được kiểm tra ở trạng thái hiện tại.`
+      : `${displayName} chưa được kiểm tra vì runtime không chạy.`;
+  }
+  if (state === "unknown") return `Chưa đủ bằng chứng để kết luận sức khỏe ${displayName}.`;
+  return `${displayName} chưa vượt qua health check.`;
+}
+
+function defaultHealthRecovery(component: HealthComponent, state: ComponentHealthState, runtimeState: RuntimeInfo["state"]): string {
+  if (state === "healthy") return "";
+  if (state === "unavailable" && runtimeState !== "running") return "Khởi động hệ thống rồi kiểm tra lại.";
+  if (state === "unknown") {
+    if (component === "woocommerce") return "Xử lý lỗi WordPress/CoffeePOS phía trên rồi chọn Kiểm tra lại.";
+    return "Xử lý dependency đang lỗi rồi chọn Kiểm tra lại.";
+  }
+  return "Chọn Kiểm tra lại. Nếu lỗi lặp lại, dùng Khởi động lại trong Runtime trước khi chuyển sang repair.";
+}
+
+function renderHealthComponent(component: HealthComponent, info: ComponentHealthInfo, runtimeState: RuntimeInfo["state"]): void {
+  const stateNode = element(`health-${component}-state`);
+  const summaryNode = element(`health-${component}-summary`);
+  const recoveryNode = element(`health-${component}-recovery`);
+  setTextIfChanged(stateNode, healthStateLabel(info.state));
+  stateNode.dataset.healthState = info.state;
+  setTextIfChanged(summaryNode, info.error?.message ?? defaultHealthSummary(component, info.state, runtimeState));
+  const recovery = info.error?.recovery ?? defaultHealthRecovery(component, info.state, runtimeState);
+  setTextIfChanged(recoveryNode, recovery ? `Hướng xử lý: ${recovery}` : "");
+}
+
+function setHealthControls(): void {
+  healthRecheck.disabled = diagnosticsBusy
+    || bootstrapBusy
+    || runtimeBusy
+    || provisioningBusy
+    || currentProvisioning?.state !== "ready"
+    || currentRuntime?.state !== "running";
+}
+
+function renderHealthDiagnostics(info: HealthDiagnosticsInfo): void {
+  currentDiagnostics = info;
+  for (const component of healthComponents) renderHealthComponent(component, info[component], info.runtime_state);
+  const states = healthComponents.map((component) => info[component].state);
+  if (states.includes("unhealthy")) {
+    setTextIfChanged(healthSummaryState, "Cần xử lý");
+    setTextIfChanged(healthSummary, "Ít nhất một thành phần đã được xác minh là chưa sẵn sàng. Xem đúng dòng lỗi và hướng xử lý bên dưới.");
+  } else if (states.includes("unknown")) {
+    setTextIfChanged(healthSummaryState, "Chưa xác minh");
+    setTextIfChanged(healthSummary, "Một số thành phần chưa thể được xác minh; CoffeePOS không suy đoán dependency lỗi khi chưa có bằng chứng.");
+  } else if (states.every((state) => state === "healthy")) {
+    setTextIfChanged(healthSummaryState, "Sẵn sàng");
+    setTextIfChanged(healthSummary, "Database, PHP, WordPress, WooCommerce và CoffeePOS đều vượt qua health check hiện tại.");
+  } else if (info.runtime_state !== "running") {
+    setTextIfChanged(healthSummaryState, "Đang dừng");
+    setTextIfChanged(healthSummary, "Runtime chưa chạy. Khởi động hệ thống để kiểm tra health đầy đủ.");
+  } else {
+    setTextIfChanged(healthSummaryState, "Chưa xác minh");
+    setTextIfChanged(healthSummary, "Health snapshot hiện tại chưa đủ để kết luận tất cả thành phần.");
+  }
+  setHealthControls();
+}
+
+function renderHealthChecking(
+  summaryState = "Đang kiểm tra",
+  summaryText = "Đang kiểm tra lần lượt Database, PHP, WordPress và machine-health của CoffeePOS…",
+): void {
+  currentDiagnostics = null;
+  setTextIfChanged(healthSummaryState, summaryState);
+  setTextIfChanged(healthSummary, summaryText);
+  for (const component of healthComponents) {
+    const stateNode = element(`health-${component}-state`);
+    stateNode.dataset.healthState = "checking";
+    setTextIfChanged(stateNode, "Đang kiểm tra");
+    setTextIfChanged(element(`health-${component}-summary`), "Đang chờ kết quả health hiện tại.");
+    setTextIfChanged(element(`health-${component}-recovery`), "");
+  }
+  setHealthControls();
+}
+
+function renderHealthCommandError(error: unknown): void {
+  currentDiagnostics = null;
+  setTextIfChanged(healthSummaryState, "Không thể kiểm tra");
+  setTextIfChanged(healthSummary, nativeErrorText(error));
+  for (const component of healthComponents) {
+    const stateNode = element(`health-${component}-state`);
+    stateNode.dataset.healthState = "unknown";
+    setTextIfChanged(stateNode, "Chưa xác minh");
+    setTextIfChanged(element(`health-${component}-summary`), "Snapshot chẩn đoán chưa hoàn tất nên không gán lỗi cho component này.");
+    setTextIfChanged(element(`health-${component}-recovery`), "");
+  }
+  setHealthControls();
+}
+
+async function refreshHealthDiagnostics(): Promise<void> {
+  if (!isTauri() || diagnosticsBusy || bootstrapBusy || runtimeBusy || provisioningBusy || currentProvisioning?.state !== "ready") return;
+  diagnosticsBusy = true;
+  setRuntimeControls(currentRuntime);
+  renderHealthChecking();
+  setTextIfChanged(healthCheckStatus, "Đang chạy health diagnostics…");
+  try {
+    const info = await invoke<HealthDiagnosticsInfo>("get_health_diagnostics");
+    renderHealthDiagnostics(info);
+    setTextIfChanged(healthCheckStatus, "Đã kiểm tra sức khỏe các thành phần.");
+    await refreshRuntime();
+  } catch (error) {
+    renderHealthCommandError(error);
+    setTextIfChanged(healthCheckStatus, nativeErrorText(error));
+  } finally {
+    diagnosticsBusy = false;
+    setHealthControls();
+    setRuntimeControls(currentRuntime);
+  }
 }
 
 function setHomeAction(
@@ -337,6 +499,7 @@ function selectInstalledView(view: InstalledView, moveFocus = true): void {
     panel.hidden = panel.dataset.viewPanel !== view;
   }
   if (moveFocus) viewHeading(view).focus();
+  if (view === "diagnostics" && moveFocus) void refreshHealthDiagnostics();
 }
 
 function showBootstrapError(error: unknown): void {
@@ -415,7 +578,7 @@ function renderHome(): void {
     if (runtimeLoadError) {
       setTextIfChanged(homeState, "Có lỗi");
       setTextIfChanged(homeStatus, "Không thể đọc trạng thái cửa hàng");
-      setTextIfChanged(homeDetail, "Thử đọc lại trạng thái hoặc mở Chẩn đoán để xem chi tiết.");
+      setTextIfChanged(homeDetail, "Thử đọc lại trạng thái hoặc mở Hệ thống để xem chi tiết.");
       setHomeAction("refresh", "Thử lại");
     } else {
       setTextIfChanged(homeState, "Đang kiểm tra");
@@ -430,7 +593,7 @@ function renderHome(): void {
     if (currentRuntime.last_error) {
       setTextIfChanged(homeState, "Có lỗi");
       setTextIfChanged(homeStatus, "Không thể khởi động hệ thống");
-      setTextIfChanged(homeDetail, "Lần khởi động gần nhất chưa hoàn tất. Bạn có thể thử lại hoặc xem chi tiết trong Chẩn đoán.");
+      setTextIfChanged(homeDetail, "Lần khởi động gần nhất chưa hoàn tất. Bạn có thể thử lại hoặc xem chi tiết trong Hệ thống.");
       setHomeAction("start", "Thử lại");
     } else {
       setTextIfChanged(homeState, "Đã cài đặt");
@@ -460,7 +623,7 @@ function renderHome(): void {
   if (currentRuntime.state !== "running") {
     setTextIfChanged(homeState, "Có lỗi");
     setTextIfChanged(homeStatus, "Hệ thống chưa sẵn sàng");
-    setTextIfChanged(homeDetail, "Mở Chẩn đoán để xem chi tiết trạng thái hiện tại.");
+    setTextIfChanged(homeDetail, "Mở Hệ thống để xem chi tiết trạng thái hiện tại.");
     setHomeAction(null);
     return;
   }
@@ -492,7 +655,7 @@ function renderHome(): void {
   if (currentRuntime.coffeepos_health.state === "degraded") {
     setTextIfChanged(homeState, "Cần kiểm tra");
     setTextIfChanged(homeStatus, "Cửa hàng chưa sẵn sàng");
-    setTextIfChanged(homeDetail, "Một thành phần của cửa hàng chưa sẵn sàng. Thử kiểm tra lại hoặc xem chi tiết trong Chẩn đoán.");
+    setTextIfChanged(homeDetail, "Một thành phần của cửa hàng chưa sẵn sàng. Thử kiểm tra lại hoặc xem chi tiết trong Hệ thống.");
     setHomeAction("retry_health", "Thử lại");
     return;
   }
@@ -512,7 +675,7 @@ function renderHome(): void {
 }
 
 function setRuntimeControls(info: RuntimeInfo | null): void {
-  if (provisioningBusy || runtimeBusy || !info) {
+  if (provisioningBusy || runtimeBusy || diagnosticsBusy || !info) {
     runtimeStart.disabled = true;
     runtimeStop.disabled = true;
     runtimeRestart.disabled = true;
@@ -558,6 +721,7 @@ function renderRuntime(info: RuntimeInfo): void {
     ? `${appHealth.store.name} · WP ${appHealth.versions.wordpress} [${appHealth.wordpress ? "ready" : "not ready"}] · Woo ${appHealth.versions.woocommerce} [${appHealth.woocommerce ? "ready" : "not ready"}] · CoffeePOS ${appHealth.versions.coffeepos} [${appHealth.coffeepos ? "ready" : "not ready"}] · schema ${appHealth.versions.coffeepos_schema} · DB ${appHealth.database ? "ready" : "not ready"} · POS ${appHealth.pos_path}`
     : "";
   setRuntimeControls(info);
+  setHealthControls();
 
   if (provisioningBusy) {
     setTextIfChanged(runtimeDescription, "Runtime controls tạm khóa trong khi CoffeePOS đang được provision.");
@@ -584,12 +748,20 @@ function renderRuntime(info: RuntimeInfo): void {
       setTextIfChanged(runtimeDescription, "MariaDB và PHP đang chạy; đang xác minh WordPress.");
     }
   } else if (info.state === "stopped") {
-    setTextIfChanged(runtimeDescription, "Runtime đang dừng. Có thể khởi động lại từ Chẩn đoán khi cần.");
+      setTextIfChanged(runtimeDescription, "Runtime đang dừng. Có thể khởi động lại từ Hệ thống khi cần.");
   } else {
     setTextIfChanged(runtimeDescription, "Runtime manager đã sẵn sàng.");
   }
 
   renderHome();
+  if (
+    currentView === "diagnostics"
+    && currentDiagnostics?.runtime_state === "running"
+    && info.state !== "running"
+    && !diagnosticsBusy
+  ) {
+    void refreshHealthDiagnostics();
+  }
 }
 
 function renderProvisioning(info: ProvisioningInfo, commandError?: string): void {
@@ -729,7 +901,7 @@ async function copyAdminPassword(status: HTMLElement, button: HTMLButtonElement)
 }
 
 async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restart_runtime" | "retry_runtime_health"): Promise<void> {
-  if (provisioningBusy || runtimeBusy || currentProvisioning?.state !== "ready") return;
+  if (provisioningBusy || runtimeBusy || diagnosticsBusy || currentProvisioning?.state !== "ready") return;
   runtimeBusy = true;
   runtimeTransition = command === "stop_runtime" ? "stopping" : command === "retry_runtime_health" ? "checking" : "starting";
   if (currentProvisioning) renderProvisioning(currentProvisioning);
@@ -744,6 +916,15 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
   coffeeposHealthDetails.textContent = "";
   openWordPressStatus.textContent = "";
   homeOpenStatus.textContent = "";
+  if (currentView === "diagnostics") {
+    if (command === "stop_runtime") {
+      renderHealthChecking("Đang dừng", "Runtime đang dừng; kết quả health cũ đã được loại khỏi màn hình.");
+    } else if (command === "restart_runtime") {
+      renderHealthChecking("Đang khởi động lại", "Runtime đang khởi động lại; health sẽ được kiểm tra trên process mới.");
+    } else {
+      renderHealthChecking();
+    }
+  }
   runtimeDescription.textContent = command === "stop_runtime"
     ? "Đang dừng PHP và MariaDB…"
     : command === "retry_runtime_health"
@@ -762,10 +943,11 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
     if (currentProvisioning) renderProvisioning(currentProvisioning);
     if (currentRuntime) renderRuntime(currentRuntime);
   }
+  if (currentView === "diagnostics") await refreshHealthDiagnostics();
 }
 
 async function runHomeAction(): Promise<void> {
-  if (homeAction.disabled || provisioningBusy || runtimeBusy || posOpenBusy) return;
+  if (homeAction.disabled || provisioningBusy || runtimeBusy || diagnosticsBusy || posOpenBusy) return;
   if (homeActionKind === "start") {
     await runtimeAction("start_runtime");
   } else if (homeActionKind === "retry_health") {
@@ -787,7 +969,7 @@ async function saveAppSettings(): Promise<void> {
   try {
     const info = await invoke<ShellInfo>("save_app_settings", { startupView: settingsStartupView.value });
     applyShellInfo(info);
-    setTextIfChanged(settingsSaveStatus, "Đã lưu cài đặt Desktop.");
+    setTextIfChanged(settingsSaveStatus, "Đã lưu cấu hình Desktop.");
   } catch (error) {
     setTextIfChanged(settingsSaveStatus, nativeErrorText(error));
   } finally {
@@ -870,6 +1052,7 @@ async function bootstrap(): Promise<void> {
   } finally {
     bootstrapBusy = false;
     if (!retry.hidden) retry.disabled = false;
+    if (currentView === "diagnostics") void refreshHealthDiagnostics();
   }
 }
 
@@ -901,11 +1084,11 @@ for (const button of navButtons) {
 }
 
 homeAction.addEventListener("click", () => void runHomeAction());
-homeSettings.addEventListener("click", () => selectInstalledView("settings", true));
 homeDiagnostics.addEventListener("click", () => selectInstalledView("diagnostics", true));
 runtimeStart.addEventListener("click", () => void runtimeAction("start_runtime"));
 runtimeStop.addEventListener("click", () => void runtimeAction("stop_runtime"));
 runtimeRestart.addEventListener("click", () => void runtimeAction("restart_runtime"));
+healthRecheck.addEventListener("click", () => void refreshHealthDiagnostics());
 openWordPress.addEventListener("click", () => void openManagedWordPress());
 
 setupForm.addEventListener("submit", async (event) => {
@@ -937,7 +1120,7 @@ setupForm.addEventListener("submit", async (event) => {
 });
 
 window.setInterval(() => {
-  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !provisioningBusy && !runtimeBusy) {
+  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !provisioningBusy && !runtimeBusy && !diagnosticsBusy) {
     void refreshRuntime();
   }
 }, 2000);

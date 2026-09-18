@@ -2,6 +2,8 @@
 
 Phase 5.1 chuyển CoffeePOS Desktop từ trang công cụ development của Phase 4.x sang shell ứng dụng có cấu trúc rõ ràng, nhưng giữ nguyên toàn bộ provisioning/recovery contract của Phase 4.12. Milestone này chỉ tổ chức lại UI quanh các native command đã có; không thêm onboarding tài khoản, POS host, auto-start hay repair engine.
 
+> **Product IA revision (2026-09-18, sau Phase 6.1):** phần dưới ghi lại đúng shell đã được nghiệm thu ở Phase 5.1 với **Trang chính / Cài đặt / Chẩn đoán**. Target UI hiện tại đã được đổi thành **Tổng quan / Cấu hình / Hệ thống**, trong đó **Chẩn đoán** là chức năng cấp hai trong **Hệ thống**. Các invariant đã nghiệm thu ở phase này — navigation không gọi lifecycle, focus bàn phím, responsive/zoom và không respawn runtime — tiếp tục bắt buộc. Xem [UI-UX.md](UI-UX.md).
+
 ## Phạm vi
 
 - Store chưa cài hoặc provisioning chưa hoàn tất ở trong luồng **Thiết lập cửa hàng** riêng, không thấy navigation của store đã cài.

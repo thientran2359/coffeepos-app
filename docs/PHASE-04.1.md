@@ -105,7 +105,7 @@ Nếu `get_provisioning_info` trả `needs_repair`, hoặc `provision_wordpress`
 - Chỉ cho phép retry provisioning khi native trả `can_retry = true`; lỗi trạng thái/manifest không retryable chỉ cho phép kiểm tra lại state.
 - Không tự xóa `site/`, `database/`, credentials hoặc provisioning journal để thử lại.
 
-Phase 4.1 chưa triển khai repair engine; repair đầy đủ thuộc Phase 6.2.
+Phase 4.1 chưa triển khai repair engine; repair đầy đủ thuộc Phase 6.3.
 
 ## Hành vi khi app khởi động
 
@@ -228,7 +228,7 @@ Không thêm WooCommerce, CoffeePOS, POS route/WebView hoặc release runtime pa
 - CoffeePOS artifact/provision/activation/health: Phase 4.7–4.10.
 - Full-stack idempotency/recovery: Phase 4.11–4.12.
 - POS WebView: Phase 5.x.
-- Repair engine: Phase 6.2.
+- Repair engine: Phase 6.3.
 
 ## Gate sang Phase 4.2
 

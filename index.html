@@ -13,7 +13,6 @@
           <h1>CoffeePOS</h1>
           <p>Môi trường bán hàng tại cửa hàng</p>
         </div>
-        <span class="phase">Phase 5.5</span>
       </header>
 
       <main id="main-content">
@@ -119,7 +118,7 @@
             <dl><dt>Tài khoản quản trị</dt><dd id="complete-admin-username">—</dd></dl>
             <div class="actions">
               <button id="complete-copy-password" class="secondary" type="button">Sao chép mật khẩu quản trị ban đầu</button>
-              <button id="complete-continue" type="button">Vào Trang chính</button>
+              <button id="complete-continue" type="button">Vào Tổng quan</button>
             </div>
             <p id="complete-copy-status" class="hint" role="status" aria-live="polite"></p>
           </div>
@@ -127,25 +126,29 @@
 
         <div id="installed-shell" hidden>
           <nav class="app-nav" aria-label="Điều hướng ứng dụng">
-            <button type="button" class="nav-item" data-view="home" aria-controls="view-home" aria-current="page">Trang chính</button>
-            <button type="button" class="nav-item" data-view="settings" aria-controls="view-settings">Cài đặt</button>
-            <button type="button" class="nav-item" data-view="diagnostics" aria-controls="view-diagnostics">Chẩn đoán</button>
+            <button type="button" class="nav-item" data-view="home" aria-controls="view-home" aria-current="page">Tổng quan</button>
+            <button type="button" class="nav-item" data-view="settings" aria-controls="view-settings">Cấu hình</button>
+            <button type="button" class="nav-item" data-view="diagnostics" aria-controls="view-diagnostics">Hệ thống</button>
           </nav>
 
           <section id="view-home" class="view-panel" data-view-panel="home" aria-labelledby="home-title">
             <div class="page-heading">
-              <span class="eyebrow">CỬA HÀNG</span>
-              <h2 id="home-title" tabindex="-1">Trang chính</h2>
-              <p id="home-store-name" class="page-subtitle">CoffeePOS</p>
+              <h2 id="home-title" tabindex="-1">Tổng quan</h2>
+              <p class="page-subtitle">Theo dõi và vận hành CoffeePOS tại cửa hàng này.</p>
             </div>
             <div class="card home-status-card">
-              <span id="home-state" class="status-kicker">Đang đọc trạng thái</span>
+              <div class="home-card-heading">
+                <div>
+                  <span class="section-label">CỬA HÀNG</span>
+                  <p id="home-store-name" class="store-name">CoffeePOS</p>
+                </div>
+                <span id="home-state" class="state-badge">Đang đọc trạng thái</span>
+              </div>
               <p id="home-status" class="home-status" role="status" aria-live="polite">Đang kiểm tra hệ thống…</p>
               <p id="home-detail" class="muted">Trạng thái này lấy trực tiếp từ runtime và CoffeePOS health hiện có.</p>
               <div class="actions">
                 <button id="home-action" type="button" hidden></button>
-                <button id="home-settings" class="secondary" type="button">Cài đặt</button>
-                <button id="home-diagnostics" class="secondary" type="button">Xem chẩn đoán</button>
+                <button id="home-diagnostics" class="secondary" type="button">Mở Hệ thống</button>
               </div>
               <p id="home-open-status" class="hint" role="status" aria-live="polite"></p>
             </div>
@@ -153,53 +156,96 @@
 
           <section id="view-settings" class="view-panel" data-view-panel="settings" aria-labelledby="settings-title" hidden>
             <div class="page-heading">
-              <span class="eyebrow">ỨNG DỤNG</span>
-              <h2 id="settings-title" tabindex="-1">Cài đặt</h2>
-              <p class="page-subtitle">Các tùy chọn thuộc CoffeePOS Desktop.</p>
+              <h2 id="settings-title" tabindex="-1">Cấu hình</h2>
+              <p class="page-subtitle">Thiết lập cách CoffeePOS Desktop hoạt động trên máy này.</p>
             </div>
-            <section class="card" id="settings">
-              <h3>Cài đặt Desktop</h3>
-              <p class="lead">Các tùy chọn ở đây chỉ thay đổi cách CoffeePOS Desktop hoạt động. Thông tin cửa hàng và nghiệp vụ vẫn do CoffeePOS quản lý.</p>
-              <form id="app-settings-form" class="app-settings-form">
-                <div class="field-group">
-                  <label for="startup-view">Trang mở đầu</label>
-                  <select id="startup-view" name="startup-view">
-                    <option value="home">Trang chính</option>
-                    <option value="settings">Cài đặt</option>
-                    <option value="diagnostics">Chẩn đoán</option>
-                  </select>
-                  <p class="hint">Áp dụng khi mở hoặc tải lại giao diện. Tùy chọn này không tự khởi động hay dừng cửa hàng.</p>
-                </div>
-                <div class="actions">
-                  <button id="settings-save" type="submit">Lưu cài đặt</button>
-                </div>
-                <p id="settings-save-status" class="hint" role="status" aria-live="polite"></p>
-              </form>
-              <dl>
-                <dt>Kết nối mặc định</dt><dd>Chỉ trên máy này · 127.0.0.1</dd>
-                <dt>Phiên bản ứng dụng</dt><dd id="version"></dd>
-              </dl>
-            </section>
-            <section class="card" aria-labelledby="admin-access-title">
-              <h3 id="admin-access-title">Tài khoản quản trị ban đầu</h3>
-              <p class="hint">Dùng tài khoản này khi cần đăng nhập WordPress/CoffeePOS. Đây là mật khẩu ban đầu do Desktop giữ; nếu bạn đổi mật khẩu trong WordPress sau này, bản protected này không tự cập nhật.</p>
-              <dl><dt>Tên đăng nhập</dt><dd id="settings-admin-username">—</dd></dl>
-              <button id="settings-copy-password" class="secondary" type="button">Sao chép mật khẩu quản trị ban đầu</button>
-              <p id="settings-copy-status" class="hint" role="status" aria-live="polite"></p>
-            </section>
+            <div class="settings-grid">
+              <section class="card" id="settings" aria-labelledby="desktop-behavior-title">
+                <span class="section-label">ỨNG DỤNG</span>
+                <h3 id="desktop-behavior-title">Khởi động</h3>
+                <p class="lead">Chọn khu vực hiển thị khi mở hoặc tải lại giao diện Desktop.</p>
+                <form id="app-settings-form" class="app-settings-form">
+                  <div class="field-group">
+                    <label for="startup-view">Màn hình mở đầu</label>
+                    <select id="startup-view" name="startup-view">
+                      <option value="home">Tổng quan</option>
+                      <option value="settings">Cấu hình</option>
+                      <option value="diagnostics">Hệ thống</option>
+                    </select>
+                    <p class="hint">Tùy chọn này chỉ chọn màn hình hiển thị; không tự khởi động hay dừng cửa hàng.</p>
+                  </div>
+                  <div class="actions">
+                    <button id="settings-save" type="submit">Lưu cấu hình</button>
+                  </div>
+                  <p id="settings-save-status" class="hint" role="status" aria-live="polite"></p>
+                </form>
+                <dl class="info-grid">
+                  <div><dt>Kết nối mặc định</dt><dd>Chỉ trên máy này · 127.0.0.1</dd></div>
+                  <div><dt>Phiên bản ứng dụng</dt><dd id="version"></dd></div>
+                </dl>
+              </section>
+              <section class="card" aria-labelledby="admin-access-title">
+                <span class="section-label">TRUY CẬP</span>
+                <h3 id="admin-access-title">Tài khoản quản trị ban đầu</h3>
+                <p class="lead">Dùng khi cần đăng nhập WordPress/CoffeePOS. Nếu mật khẩu được đổi trong WordPress, bản ban đầu do Desktop giữ sẽ không tự cập nhật.</p>
+                <dl class="compact-list"><dt>Tên đăng nhập</dt><dd id="settings-admin-username">—</dd></dl>
+                <button id="settings-copy-password" class="secondary" type="button">Sao chép mật khẩu ban đầu</button>
+                <p id="settings-copy-status" class="hint" role="status" aria-live="polite"></p>
+              </section>
+            </div>
           </section>
 
           <section id="view-diagnostics" class="view-panel" data-view-panel="diagnostics" aria-labelledby="diagnostics-title" hidden>
             <div class="page-heading">
-              <span class="eyebrow">HỆ THỐNG</span>
-              <h2 id="diagnostics-title" tabindex="-1">Chẩn đoán</h2>
-              <p class="page-subtitle">Trạng thái kỹ thuật và thao tác runtime hiện có.</p>
+              <h2 id="diagnostics-title" tabindex="-1">Hệ thống</h2>
+              <p class="page-subtitle">Theo dõi sức khỏe dịch vụ, chẩn đoán lỗi và điều khiển runtime cục bộ.</p>
             </div>
+            <section class="card" id="health-diagnostics" aria-labelledby="health-diagnostics-title">
+              <div class="section-heading compact-heading">
+                <div>
+                  <span class="section-label">CHẨN ĐOÁN</span>
+                  <h3 id="health-diagnostics-title">Tình trạng hệ thống</h3>
+                </div>
+                <span id="health-summary-state" class="state-badge">—</span>
+              </div>
+              <p id="health-summary" role="status" aria-live="polite">Mở Hệ thống để kiểm tra các thành phần.</p>
+              <div class="health-list">
+                <article class="health-row">
+                  <div class="health-row-heading"><strong>Database</strong><span id="health-database-state" class="state-badge">—</span></div>
+                  <p id="health-database-summary" class="health-summary-text">Chưa kiểm tra.</p>
+                  <p id="health-database-recovery" class="hint"></p>
+                </article>
+                <article class="health-row">
+                  <div class="health-row-heading"><strong>PHP</strong><span id="health-php-state" class="state-badge">—</span></div>
+                  <p id="health-php-summary" class="health-summary-text">Chưa kiểm tra.</p>
+                  <p id="health-php-recovery" class="hint"></p>
+                </article>
+                <article class="health-row">
+                  <div class="health-row-heading"><strong>WordPress</strong><span id="health-wordpress-state" class="state-badge">—</span></div>
+                  <p id="health-wordpress-summary" class="health-summary-text">Chưa kiểm tra.</p>
+                  <p id="health-wordpress-recovery" class="hint"></p>
+                </article>
+                <article class="health-row">
+                  <div class="health-row-heading"><strong>WooCommerce</strong><span id="health-woocommerce-state" class="state-badge">—</span></div>
+                  <p id="health-woocommerce-summary" class="health-summary-text">Chưa kiểm tra.</p>
+                  <p id="health-woocommerce-recovery" class="hint"></p>
+                </article>
+                <article class="health-row">
+                  <div class="health-row-heading"><strong>CoffeePOS</strong><span id="health-coffeepos-state" class="state-badge">—</span></div>
+                  <p id="health-coffeepos-summary" class="health-summary-text">Chưa kiểm tra.</p>
+                  <p id="health-coffeepos-recovery" class="hint"></p>
+                </article>
+              </div>
+              <div class="actions">
+                <button id="health-recheck" class="secondary" type="button">Kiểm tra lại</button>
+              </div>
+              <p id="health-check-status" class="hint" role="status" aria-live="polite"></p>
+            </section>
             <section class="card" id="runtime" aria-labelledby="runtime-title">
               <div class="section-heading compact-heading">
                 <div>
-                  <span class="eyebrow">LOCAL RUNTIME</span>
-                  <h3 id="runtime-title">Runtime</h3>
+                  <span class="section-label">VẬN HÀNH</span>
+                  <h3 id="runtime-title">Runtime cục bộ</h3>
                 </div>
                 <span id="runtime-state" class="state-badge">—</span>
               </div>
@@ -211,18 +257,21 @@
                 <button id="open-wordpress" class="secondary" type="button" disabled>Mở WordPress kiểm thử</button>
               </div>
               <p id="open-wordpress-status" class="hint" role="status" aria-live="polite"></p>
-              <p id="wordpress-health-error" class="error" role="alert" hidden></p>
-              <p id="coffeepos-health-error" class="error" role="alert" hidden></p>
-              <p id="coffeepos-health-details" class="hint"></p>
-              <dl>
-                <dt>WordPress health</dt><dd id="wordpress-health">—</dd>
-                <dt>CoffeePOS health</dt><dd id="coffeepos-health">—</dd>
-                <dt>PHP</dt><dd id="runtime-php">—</dd>
-                <dt>MariaDB</dt><dd id="runtime-mariadb">—</dd>
-                <dt>HTTP</dt><dd id="runtime-http">—</dd>
-                <dt>Database</dt><dd id="runtime-database">—</dd>
-                <dt>Thư mục dữ liệu</dt><dd id="data-dir"></dd>
-              </dl>
+              <details class="technical-details">
+                <summary>Chi tiết kỹ thuật</summary>
+                <p id="wordpress-health-error" class="error" role="alert" hidden></p>
+                <p id="coffeepos-health-error" class="error" role="alert" hidden></p>
+                <p id="coffeepos-health-details" class="hint"></p>
+                <dl>
+                  <dt>WordPress health</dt><dd id="wordpress-health">—</dd>
+                  <dt>CoffeePOS health</dt><dd id="coffeepos-health">—</dd>
+                  <dt>PHP</dt><dd id="runtime-php">—</dd>
+                  <dt>MariaDB</dt><dd id="runtime-mariadb">—</dd>
+                  <dt>HTTP</dt><dd id="runtime-http">—</dd>
+                  <dt>Database</dt><dd id="runtime-database">—</dd>
+                  <dt>Thư mục dữ liệu</dt><dd id="data-dir"></dd>
+                </dl>
+              </details>
             </section>
           </section>
         </div>

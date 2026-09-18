@@ -1,6 +1,6 @@
 # CoffeePOS Desktop — Đặc tả UI/UX
 
-Ngày cập nhật: 2026-09-18. Đây là đặc tả trải nghiệm; bằng chứng triển khai nằm trong tài liệu từng phase. Phase 1–4.12 giữ nguyên kết quả kỹ thuật đã nghiệm thu; Phase 5.1 shell/navigation và Phase 5.2 store/account onboarding đã hoàn thành Windows-first. Phase 5.3 Home/app settings, Phase 5.4 Open POS/login và Phase 5.5 daily startup đã triển khai và pass lightweight automated checks, còn manual acceptance do người dùng thực hiện. Scope, thứ tự và trạng thái phase do [ROADMAP.md](ROADMAP.md) quản lý.
+Ngày cập nhật: 2026-09-18. Đây là đặc tả trải nghiệm; bằng chứng triển khai nằm trong tài liệu từng phase. Phase 1–4.12 giữ nguyên kết quả kỹ thuật đã nghiệm thu; Phase 5.1 shell/navigation và Phase 5.2 store/account onboarding đã hoàn thành Windows-first. Phase 5.3–5.6 và Phase 6.1 health diagnostics đã triển khai và pass lightweight automated checks; manual Windows acceptance còn chờ người dùng thực hiện. Sau snapshot Phase 6.1, installed-store shell đã được refactor theo kiến trúc thông tin **Tổng quan / Cấu hình / Hệ thống**, thay thế cách trình bày ba mục ngang **Trang chính / Cài đặt / Chẩn đoán**. Scope, thứ tự và trạng thái phase do [ROADMAP.md](ROADMAP.md) quản lý.
 
 ## 1. Mục tiêu
 
@@ -15,12 +15,36 @@ Giao diện hiện tại là công cụ development. Việc gom setup, runtime c
 | Chào mừng | Giải thích ngắn: cài một lần, dữ liệu nằm trên máy; nút **Thiết lập cửa hàng** | 4.12: bắt đầu setup tối thiểu; 5.1–5.2: hoàn thiện |
 | Thiết lập cửa hàng | Tên cửa hàng, tài khoản ban đầu, validation; nút **Cài đặt** | 5.2 |
 | Tiến trình thiết lập | Các bước thật đã xong/đang chạy; lỗi và tiếp tục khi an toàn | 4.12, tích hợp form ở 5.2 |
-| Trang chính | Tên cửa hàng, trạng thái sử dụng, một hành động chính phù hợp trạng thái | 5.3 |
-| Cài đặt ứng dụng | Cấu hình thuộc Desktop, trạng thái lưu và lỗi; không nhân bản settings nghiệp vụ | 5.3; LAN bổ sung ở 8.x |
-| Chẩn đoán | Component health, thông tin kỹ thuật, thao tác runtime; log/repair mở rộng sau | Khung cơ bản 5.1; đầy đủ 6.x |
-| Sao lưu và khôi phục | Tạo backup, thời điểm/kết quả, chọn và kiểm bản phục hồi | 7.x |
+| Tổng quan | Tên cửa hàng, trạng thái sử dụng, cảnh báo ngắn và một hành động chính phù hợp trạng thái | 5.3; shell IA refactor sau 6.1 |
+| Cấu hình | Cấu hình thuộc Desktop, trạng thái lưu và lỗi; không nhân bản settings nghiệp vụ | 5.3; LAN bổ sung ở 8.x |
+| Hệ thống | Sức khỏe runtime và các chức năng quản trị kỹ thuật. **Chẩn đoán** là màn hình/con mục bên trong Hệ thống, không còn là navigation cấp cao nhất | Khung 5.1; health 6.1; runtime performance 6.2; repair/log 6.3–6.4 |
+| Hệ thống → Sao lưu và khôi phục | Tạo backup, thời điểm/kết quả, chọn và kiểm bản phục hồi khi chức năng 7.x có thật | 7.x |
 
-Trước setup, dùng luồng theo bước, không đưa người dùng vào dashboard chưa có cửa hàng. Sau setup, điều hướng ổn định giữa Trang chính, Cài đặt và Chẩn đoán; mục Sao lưu chỉ xuất hiện khi chức năng có thật. Không tạo trang rỗng hoặc nút hoạt động giả cho phase tương lai.
+Trước setup, dùng luồng theo bước, không đưa người dùng vào dashboard chưa có cửa hàng. Sau setup, navigation cấp cao chỉ gồm **Tổng quan / Cấu hình / Hệ thống**. **Chẩn đoán**, **Nhật ký**, **Repair**, **Sao lưu/Khôi phục** và các chức năng kỹ thuật tương lai nằm trong **Hệ thống** khi chúng có implementation thật. Không tạo trang rỗng hoặc nút hoạt động giả cho phase tương lai.
+
+### 2.1. App shell và navigation sau setup
+
+Ba mục cấp cao dùng cùng một loại khái niệm và cùng một cấp độ thông tin:
+
+- **Tổng quan**: nơi vận hành hằng ngày. Hiển thị cửa hàng có sẵn sàng hay không, cảnh báo ngắn và action thường dùng như **Mở bán hàng**.
+- **Cấu hình**: các preference và thiết lập thuộc CoffeePOS Desktop như màn hình mở đầu, hành vi ứng dụng và cấu hình local/LAN khi phase tương ứng tồn tại.
+- **Hệ thống**: trạng thái runtime và công cụ kỹ thuật. Landing của Hệ thống ưu tiên health summary; **Chẩn đoán** là chức năng bên trong khu vực này. Phase 6.2 tối ưu runtime phía sau UI; Phase 6.3 Repair và 6.4 Log viewer/export mở rộng Hệ thống thay vì tạo thêm top-level tab.
+
+Shell dùng một cấu trúc ổn định trên cả ba khu vực:
+
+```text
+┌────────────────────────────────────────────────────┐
+│ CoffeePOS                              ● Trạng thái │
+├────────────────────────────────────────────────────┤
+│ Tổng quan        Cấu hình        Hệ thống          │
+├────────────────────────────────────────────────────┤
+│ <vùng nội dung cuộn của màn hình hiện tại>         │
+└────────────────────────────────────────────────────┘
+```
+
+Header và navigation giữ cùng vị trí khi đổi khu vực; phần nội dung phía dưới là vùng cuộn. Các màn hình dùng chung max-width, padding ngang, khoảng cách header → navigation → page heading → content và cùng hierarchy typography. Navigation cấp cao không dùng segmented-control/capsule nhiều lớp; active state dùng một cue rõ như underline hoặc nền nhẹ và vẫn có `aria-current`.
+
+Internal config key hiện có được giữ tương thích trong lúc refactor: `startup_view=home` mở **Tổng quan**, `settings` mở **Cấu hình**, và `diagnostics` mở **Hệ thống** tại mục **Chẩn đoán**. Không đổi schema/config chỉ để đổi nhãn hiển thị.
 
 ## 3. Luồng chính
 
@@ -28,7 +52,7 @@ Trước setup, dùng luồng theo bước, không đưa người dùng vào das
 
 ```text
 Chào mừng → Thông tin cửa hàng/tài khoản → Cài đặt
-         → Tiến trình thật → Hoàn tất → Trang chính → Mở bán hàng
+         → Tiến trình thật → Hoàn tất → Tổng quan → Mở bán hàng
 ```
 
 Phase 4.12 hoàn thiện tiến trình/recovery trên input setup cũ; Phase 5.2 đã bổ sung form tài khoản, review/complete, protected user-set credential và nghiệm thu fresh flow đầy đủ. Không kéo các hành vi Phase 5.4 như mở POS vào onboarding.
@@ -38,11 +62,11 @@ Màn hình tiến trình lấy trạng thái từ native. Nếu chưa có sự k
 ### Lần sau
 
 ```text
-Mở app → Đọc installation → Trang chính: Đang khởi động
+Mở app → Đọc installation → Tổng quan: Đang khởi động
        → Hệ thống sẵn sàng → Mở bán hàng → Đăng nhập/POS
 ```
 
-Auto-start chỉ có từ 5.5. Trước đó trang chính cho phép Khởi động thủ công. Reload UI không tự tạo provisioning, reset credentials hoặc spawn trùng. Khi cửa hàng đã cài thì không quay lại form fresh setup chỉ vì runtime đang dừng.
+Auto-start chỉ có từ 5.5. Trước đó màn hình vận hành cho phép Khởi động thủ công. Reload UI không tự tạo provisioning, reset credentials hoặc spawn trùng. Khi cửa hàng đã cài thì không quay lại form fresh setup chỉ vì runtime đang dừng.
 
 ### Khi lỗi hoặc bị gián đoạn
 
@@ -52,9 +76,9 @@ Setup lỗi/đóng giữa chừng → Mở lại → Native xác định checkpo
   → không thể retry: giữ dữ liệu + hướng xử lý + Xem chi tiết
 ```
 
-Không bắt đầu lại từ đầu hoặc xóa store để che lỗi. Lỗi input hiện tại field; lỗi setup ở bước đang làm; lỗi runtime ở trang chính kèm liên kết chẩn đoán. Một lỗi không tự biến thành màn hình trắng toàn app. Repair chỉ xuất hiện khi operation đó đã được triển khai.
+Không bắt đầu lại từ đầu hoặc xóa store để che lỗi. Lỗi input hiện tại field; lỗi setup ở bước đang làm; lỗi runtime ở **Tổng quan** kèm liên kết tới **Hệ thống → Chẩn đoán**. Một lỗi không tự biến thành màn hình trắng toàn app. Repair chỉ xuất hiện khi operation đó đã được triển khai.
 
-## 4. Trang chính và trạng thái
+## 4. Tổng quan và trạng thái
 
 | Trạng thái đã xác minh | Nội dung chính | Hành động |
 | --- | --- | --- |
@@ -69,7 +93,7 @@ Không bắt đầu lại từ đầu hoặc xóa store để che lỗi. Lỗi i
 
 Trước 5.4, trạng thái healthy chỉ thông báo kết quả, không có nút Mở bán hàng giả. Application healthy không đồng nghĩa đã đăng nhập, mở ca hoặc thanh toán thành công. Shell không suy đoán các trạng thái nghiệp vụ này.
 
-Trang chính không hiển thị thường trực PHP version, database port, manifest hash hay đường dẫn nội bộ. Thông tin đó ở Chẩn đoán. Start/stop/restart là thao tác vận hành có chủ đích, không phải ba nút nổi bật ngang hàng với Mở bán hàng.
+Tổng quan không hiển thị thường trực PHP version, database port, manifest hash hay đường dẫn nội bộ. Thông tin đó ở **Hệ thống → Chẩn đoán/Chi tiết kỹ thuật**. Start/stop/restart là thao tác vận hành có chủ đích trong Hệ thống, không phải ba nút nổi bật ngang hàng với **Mở bán hàng**.
 
 ## 5. Thông tin cửa hàng và tài khoản
 
@@ -93,15 +117,18 @@ Cả hai lựa chọn đều phải nghiệm thu login → POS → đơn test �
 
 Phase 5.5 tự khởi động runtime khi mở app trên store đã cài; không tự bật app cùng Windows trong scope này. Không tự mở thêm tab POS mỗi lần refresh/health poll.
 
-Baseline 5.6: thu nhỏ giữ runtime hoạt động; thoát app dừng runtime. Khi thoát/dừng hệ thống đang chạy, giải thích rằng POS và thiết bị đang kết nối sẽ mất kết nối, cho lựa chọn ở lại hoặc dừng và thoát. Không dùng xác nhận cho mọi thao tác điều hướng thông thường. Nếu bổ sung tray/background mode, phải đổi contract và kiểm ownership/process cleanup; chưa coi đó là tính năng đã có.
+Baseline 5.6 đã triển khai Windows-first: thu nhỏ dùng hành vi cửa sổ mặc định và giữ runtime hoạt động; Close/Alt+F4 bị native intercept trước khi đóng. Khi runtime active, Windows confirmation giải thích POS/thiết bị sẽ mất kết nối, mặc định an toàn là ở lại; chọn dừng và thoát bật admission gate trả 503 cho request mới, bounded-drain request đã được nhận, stop runtime rồi mới authorize app exit. Lifecycle đang bận hoặc forced cleanup còn child thì app ở lại. Không dùng xác nhận cho điều hướng thông thường. Tray/background mode vẫn ngoài scope.
 
 Đóng app không thay chốt ca. Khi dùng browser, không khẳng định mọi phiên bán hàng đã kết thúc vì shell không quan sát được tab. Bounded shutdown, request đang chạy và crash recovery thuộc native/plugin contracts; UI phản ánh thật, không hứa chống mất điện hoàn toàn.
 
 ## 8. Quy tắc trình bày và tương tác
 
+Trong **Hệ thống → Chẩn đoán**, Phase 6.1 hiển thị Database/PHP/WordPress/WooCommerce/CoffeePOS thành các dòng health độc lập. Chỉ gán **Có lỗi** khi native probe hoặc authenticated machine-health có bằng chứng cho đúng component; dependency chưa xác minh giữ **Chưa xác minh**. **Kiểm tra lại** chạy snapshot health thật, còn restart runtime là action riêng. Phase 6.2 không tạo thêm màn hình top-level; nó làm status/lifecycle/health phản hồi mượt hơn ở phía runtime. Port, version, path và structured error chi tiết được gom dưới **Chi tiết kỹ thuật**; repair và log export không xuất hiện trước Phase 6.3–6.4.
+
 - Một hành động chính cho mỗi bước/trạng thái; nhãn dùng từ của người vận hành: Cài đặt, Tiếp tục thiết lập, Mở bán hàng, Xem chi tiết.
-- Layout có tiêu đề, mô tả ngắn, vùng nội dung và action rõ ràng. Shell dùng cùng typography, spacing, button/input/error styles; không thêm UI framework chỉ để chia màn hình.
-- Dùng navigation gọn cho app sau setup; wizard có thứ tự bước trước setup. Lỗi/chờ là state của màn hình, không bắt buộc tạo route riêng cho mọi state.
+- Layout có tiêu đề, mô tả ngắn, vùng nội dung và action rõ ràng. Shell dùng cùng typography, spacing, max-width, padding và button/input/error styles; không thêm UI framework chỉ để chia màn hình.
+- Navigation cấp cao sau setup chỉ dùng **Tổng quan / Cấu hình / Hệ thống**. Chẩn đoán và công cụ kỹ thuật dùng navigation cấp hai trong Hệ thống. Wizard có thứ tự bước trước setup. Lỗi/chờ là state của màn hình, không bắt buộc tạo route riêng cho mọi state.
+- Không lặp hierarchy kiểu eyebrow → page title → card title khi các nhãn cùng nghĩa. Mỗi màn hình có một page heading chính; card/section heading chỉ dùng khi thực sự chia nội dung.
 - Có focus bàn phím rõ; Tab/Enter hoạt động; chuyển màn hình đưa focus tới tiêu đề phù hợp, lỗi form tới field liên quan. Progress dùng thông báo accessible, không đọc lặp mỗi poll.
 - Không chỉ dùng màu để báo lỗi/thành công. Text tiếng Việt nhất quán, không cắt nội dung quan trọng; resize và DPI/zoom phải giữ được nút chính, cho cuộn khi cần.
 - Operation đang chạy không bị nhân đôi bởi double click, Back hoặc reload. Draft không nhạy cảm được giữ khi điều hướng hợp lệ; secret phải có quy tắc vòng đời riêng.
@@ -112,8 +139,8 @@ Trước triển khai mỗi màn hình, spec phase phải có wireframe cho tr�
 
 | Nhóm | Phần UX phải nghiệm thu cùng backend |
 | --- | --- |
-| 6.x Diagnostics/Repair | Tóm tắt dễ hiểu, chi tiết kỹ thuật mở khi cần; repair giải thích phạm vi/kết quả; export log có trạng thái và redaction |
-| 7.x Backup/Restore | Địa điểm lưu, tiến trình, thành công/lỗi; validate bản restore và giải thích dữ liệu sẽ thay trước xác nhận; lỗi giữ đường phục hồi |
+| 6.x Hệ thống / Diagnostics / Repair | Hệ thống là khu vực cấp cao; Chẩn đoán tóm tắt dễ hiểu, chi tiết kỹ thuật mở khi cần; repair giải thích phạm vi/kết quả; export log có trạng thái và redaction |
+| 7.x Hệ thống / Backup / Restore | Địa điểm lưu, tiến trình, thành công/lỗi; validate bản restore và giải thích dữ liệu sẽ thay trước xác nhận; lỗi giữ đường phục hồi |
 | 8.x LAN | Mặc định tắt; bật/tắt rõ ràng, URL thực có thể copy, lỗi network/firewall, ảnh hưởng khi đổi địa chỉ hoặc dừng server |
 | 9.x Distribution/Update | Setup trên máy sạch, thông báo prerequisite; update tiến trình/lỗi và dữ liệu được giữ; không bắt người dùng chạy lệnh |
 

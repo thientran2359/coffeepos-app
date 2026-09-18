@@ -2,6 +2,8 @@
 
 Phase 5.3 hoàn thiện khu vực store đã cài của CoffeePOS Desktop. Trang chính dùng trạng thái native/runtime thật để nói ngắn gọn cửa hàng đang dừng, đang khởi động, đang kiểm tra, sẵn sàng hay gặp lỗi và đưa ra đúng một hành động vận hành phù hợp. Cài đặt chỉ chứa preference thuộc Desktop; chi tiết PHP/database/port/path tiếp tục nằm ở Chẩn đoán.
 
+> **Product IA revision (2026-09-18, sau Phase 6.1):** wireframe/acceptance dưới đây ghi đúng implementation snapshot của Phase 5.3. UI target đổi nhãn **Trang chính → Tổng quan**, **Cài đặt → Cấu hình**, và đưa **Chẩn đoán** vào **Hệ thống**. `startup_view` vẫn giữ các key `home/settings/diagnostics` để tương thích config cũ: chúng lần lượt mở **Tổng quan**, **Cấu hình**, và **Hệ thống → Chẩn đoán**. Không cần migration schema chỉ để đổi information architecture. Xem [UI-UX.md](UI-UX.md).
+
 ## Phạm vi
 
 - Store `ready + stopped` ở Trang chính có **Khởi động**; lỗi start gần nhất đổi hành động thành **Thử lại** nhưng vẫn gọi `start_runtime`, không provisioning lại.

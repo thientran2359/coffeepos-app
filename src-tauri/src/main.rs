@@ -15,9 +15,10 @@ use provisioning::ProvisioningInfo;
 use provisioning::{
     ProvisioningState, WORDPRESS_ADMIN_EMAIL, WORDPRESS_ADMIN_SECRET, WORDPRESS_ADMIN_USER,
 };
-use runtime::{RuntimeInfo, RuntimeManager, RuntimeState};
+use runtime::{HealthDiagnosticsInfo, RuntimeInfo, RuntimeManager, RuntimeState};
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use tauri::{Manager, State};
 
@@ -26,6 +27,7 @@ struct ShellState {
     store: Mutex<Option<Store>>,
     runtime: Mutex<Option<RuntimeManager>>,
     lifecycle: Mutex<()>,
+    exit_authorized: AtomicBool,
     #[cfg(debug_assertions)]
     provisioning: Mutex<()>,
 }
@@ -269,6 +271,44 @@ fn try_lifecycle<'a>(state: &'a ShellState, operation: &str) -> Result<MutexGuar
         ),
     }
 }
+
+#[cfg(windows)]
+fn shutdown_message_box(text: &str, title: &str, flags: u32) -> i32 {
+    use std::ptr;
+    use windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW;
+
+    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { MessageBoxW(ptr::null_mut(), text.as_ptr(), title.as_ptr(), flags) }
+}
+
+#[cfg(windows)]
+fn confirm_runtime_exit() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO,
+    };
+
+    shutdown_message_box(
+        "Dừng và thoát sẽ ngắt kết nối POS và các thiết bị đang dùng cửa hàng này. Thao tác này không chốt ca và không tự thay đổi trạng thái thanh toán.\n\nChọn Có để dừng cửa hàng và thoát, hoặc Không để ở lại.",
+        "Dừng cửa hàng và thoát CoffeePOS?",
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+    ) == IDYES
+}
+
+#[cfg(not(windows))]
+fn confirm_runtime_exit() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn show_shutdown_notice(title: &str, message: &str, error: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONWARNING, MB_OK};
+    let icon = if error { MB_ICONERROR } else { MB_ICONWARNING };
+    let _ = shutdown_message_box(message, title, MB_OK | icon);
+}
+
+#[cfg(not(windows))]
+fn show_shutdown_notice(_title: &str, _message: &str, _error: bool) {}
 
 #[tauri::command]
 fn get_shell_info(
@@ -521,6 +561,15 @@ fn retry_runtime_health(
 }
 
 #[tauri::command]
+fn get_health_diagnostics(
+    app: tauri::AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<HealthDiagnosticsInfo, String> {
+    let _lifecycle_guard = try_lifecycle(&state, "check health diagnostics")?;
+    with_runtime(&app, &state, |runtime| Ok(runtime.health_diagnostics()))
+}
+
+#[tauri::command]
 fn get_provisioning_info(
     app: tauri::AppHandle,
     state: State<'_, ShellState>,
@@ -698,6 +747,78 @@ fn provision_wordpress(
 fn main() {
     tauri::Builder::default()
         .manage(ShellState::default())
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            let state = window.state::<ShellState>();
+            if state.exit_authorized.load(Ordering::Acquire) {
+                return;
+            }
+            api.prevent_close();
+
+            let lifecycle_guard = match state.lifecycle.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => {
+                    show_shutdown_notice(
+                        "CoffeePOS đang bận",
+                        "CoffeePOS đang hoàn tất cài đặt hoặc thay đổi trạng thái hệ thống. Hãy chờ thao tác hiện tại kết thúc rồi thử thoát lại.",
+                        false,
+                    );
+                    return;
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    show_shutdown_notice(
+                        "Không thể thoát an toàn",
+                        "Trạng thái vòng đời runtime không còn khả dụng. Hãy giữ ứng dụng mở và kiểm tra Chẩn đoán trước khi thử lại.",
+                        true,
+                    );
+                    return;
+                }
+            };
+
+            let mut runtime_guard = match state.runtime.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    show_shutdown_notice(
+                        "Không thể thoát an toàn",
+                        "Không thể đọc trạng thái runtime để dừng cửa hàng an toàn. Hãy giữ ứng dụng mở và thử lại.",
+                        true,
+                    );
+                    return;
+                }
+            };
+
+            if let Some(runtime) = runtime_guard.as_ref() {
+                if runtime.requires_exit_confirmation() && !confirm_runtime_exit() {
+                    return;
+                }
+            }
+
+            if let Some(runtime) = runtime_guard.as_mut() {
+                if let Err(error) = runtime.stop() {
+                    if runtime.requires_exit_confirmation() {
+                        show_shutdown_notice(
+                            "Chưa thể dừng cửa hàng",
+                            &format!(
+                                "CoffeePOS chưa dừng hoàn toàn nên ứng dụng vẫn mở để tránh bỏ lại tiến trình.\n\n{}",
+                                error
+                            ),
+                            true,
+                        );
+                        return;
+                    }
+                }
+            }
+
+            drop(runtime_guard);
+            drop(lifecycle_guard);
+            state.exit_authorized.store(true, Ordering::Release);
+            window.app_handle().exit(0);
+        })
         .invoke_handler(tauri::generate_handler![
             get_shell_info,
             save_app_settings,
@@ -709,6 +830,7 @@ fn main() {
             stop_runtime,
             restart_runtime,
             retry_runtime_health,
+            get_health_diagnostics,
             open_wordpress,
             open_pos,
             get_provisioning_info,

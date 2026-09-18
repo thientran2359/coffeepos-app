@@ -25,6 +25,28 @@ pub(crate) const MACHINE_TOKEN_SECRET: &str = "config/machine-token.secret";
 pub(crate) const MACHINE_TOKEN_PENDING_SECRET: &str = "config/machine-token.pending.secret";
 const COFFEEPOS_HEALTH_SCHEMA_VERSION: u32 = 1;
 const COFFEEPOS_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
+const REQUEST_DRAIN_MARKER: &str = "config/runtime-draining.flag";
+const RUNTIME_ROUTER_WRAPPER: &str = r#"<?php
+$marker = getenv('COFFEEPOS_DRAIN_MARKER');
+$requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
+$requestPath = rawurldecode($requestPath);
+$local = getcwd() . DIRECTORY_SEPARATOR . ltrim(str_replace('/', DIRECTORY_SEPARATOR, $requestPath), DIRECTORY_SEPARATOR);
+$isDrainProbe = str_starts_with($requestPath, '/.coffeepos-runtime-health-')
+    && str_ends_with($requestPath, '.php')
+    && is_file($local);
+if ($marker && is_file($marker) && !$isDrainProbe) {
+    http_response_code(503);
+    header('Retry-After: 1');
+    header('Connection: close');
+    echo 'CoffeePOS is shutting down';
+    return true;
+}
+$managedRouter = getenv('COFFEEPOS_MANAGED_ROUTER');
+if ($managedRouter && is_file($managedRouter)) {
+    return require $managedRouter;
+}
+return false;
+"#;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -148,6 +170,61 @@ pub struct RuntimeInfo {
     pub last_error: Option<RuntimeErrorInfo>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentHealthState {
+    Unavailable,
+    Healthy,
+    Unhealthy,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ComponentHealthInfo {
+    pub state: ComponentHealthState,
+    pub error: Option<RuntimeErrorInfo>,
+}
+
+impl ComponentHealthInfo {
+    fn unavailable() -> Self {
+        Self {
+            state: ComponentHealthState::Unavailable,
+            error: None,
+        }
+    }
+
+    fn healthy() -> Self {
+        Self {
+            state: ComponentHealthState::Healthy,
+            error: None,
+        }
+    }
+
+    fn unhealthy(error: RuntimeErrorInfo) -> Self {
+        Self {
+            state: ComponentHealthState::Unhealthy,
+            error: Some(error),
+        }
+    }
+
+    fn unknown(error: Option<RuntimeErrorInfo>) -> Self {
+        Self {
+            state: ComponentHealthState::Unknown,
+            error,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct HealthDiagnosticsInfo {
+    pub runtime_state: RuntimeState,
+    pub database: ComponentHealthInfo,
+    pub php: ComponentHealthInfo,
+    pub wordpress: ComponentHealthInfo,
+    pub woocommerce: ComponentHealthInfo,
+    pub coffeepos: ComponentHealthInfo,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DevelopmentManifest {
@@ -223,6 +300,7 @@ pub struct RuntimeTimeouts {
     pub http_readiness: Duration,
     pub wordpress_readiness: Duration,
     pub probe_command: Duration,
+    pub request_drain: Duration,
     pub stop: Duration,
 }
 
@@ -233,6 +311,7 @@ impl Default for RuntimeTimeouts {
             http_readiness: Duration::from_secs(10),
             wordpress_readiness: Duration::from_secs(45),
             probe_command: Duration::from_secs(3),
+            request_drain: Duration::from_secs(3),
             stop: Duration::from_secs(5),
         }
     }
@@ -666,6 +745,158 @@ impl RuntimeManager {
         self.info()
     }
 
+    pub(crate) fn health_diagnostics(&mut self) -> HealthDiagnosticsInfo {
+        let runtime = self.refresh();
+        if runtime.state != RuntimeState::Running {
+            return health_diagnostics_for_inactive_runtime(&runtime);
+        }
+
+        let mut database = match self.database_port {
+            Some(port) => match self.database_probe(port) {
+                Ok(true) => ComponentHealthInfo::healthy(),
+                Ok(false) => ComponentHealthInfo::unhealthy(error_info(
+                    "database",
+                    "health",
+                    "MariaDB did not accept the authenticated diagnostic query.",
+                    "Retry the health check. If it still fails, restart the runtime and inspect the database log before attempting repair.",
+                )),
+                Err(error) => ComponentHealthInfo::unhealthy(error),
+            },
+            None => ComponentHealthInfo::unhealthy(error_info(
+                "database",
+                "health",
+                "The running runtime has no database port to probe.",
+                "Restart the runtime so MariaDB can be assigned and verified on a managed loopback port.",
+            )),
+        };
+
+        let php = match self.http_port {
+            Some(port) => self.probe_php_health_once(port),
+            None => ComponentHealthInfo::unhealthy(error_info(
+                "php",
+                "health",
+                "The running runtime has no HTTP port to probe.",
+                "Restart the runtime so PHP can be assigned and verified on a managed loopback port.",
+            )),
+        };
+
+        let mut wordpress = if database.state == ComponentHealthState::Healthy
+            && php.state == ComponentHealthState::Healthy
+        {
+            let Some(port) = self.http_port else {
+                unreachable!("healthy PHP diagnostic requires an HTTP port")
+            };
+            if wordpress_http_probe(port) {
+                self.wordpress_health = WordPressHealthState::Healthy;
+                self.wordpress_error = None;
+                ComponentHealthInfo::healthy()
+            } else {
+                let error = error_info(
+                    "wordpress",
+                    "health",
+                    "WordPress did not return the expected login readiness response.",
+                    "Retry the health check. If WordPress remains unavailable while Database and PHP are healthy, restart the runtime and inspect WordPress/PHP logs before repair.",
+                );
+                self.wordpress_health = WordPressHealthState::Unhealthy;
+                self.wordpress_error = Some(error.clone());
+                self.clear_coffeepos_health();
+                ComponentHealthInfo::unhealthy(error)
+            }
+        } else {
+            self.wordpress_health = WordPressHealthState::Unavailable;
+            self.wordpress_error = None;
+            self.clear_coffeepos_health();
+            ComponentHealthInfo::unknown(None)
+        };
+
+        let (woocommerce, coffeepos) = if wordpress.state == ComponentHealthState::Healthy {
+            self.refresh_coffeepos_health();
+            match &self.coffeepos_health {
+                CoffeePosHealthInfo {
+                    payload: Some(payload),
+                    ..
+                } => {
+                    if !payload.database {
+                        database = ComponentHealthInfo::unhealthy(machine_component_error(
+                            "database", "Database",
+                        ));
+                    }
+                    if !payload.wordpress {
+                        wordpress = ComponentHealthInfo::unhealthy(machine_component_error(
+                            "wordpress",
+                            "WordPress",
+                        ));
+                    }
+                    (
+                        machine_component_health(payload.woocommerce, "woocommerce", "WooCommerce"),
+                        machine_component_health(payload.coffeepos, "coffeepos", "CoffeePOS"),
+                    )
+                }
+                CoffeePosHealthInfo {
+                    state: CoffeePosHealthState::Failed,
+                    error,
+                    ..
+                } => (
+                    ComponentHealthInfo::unknown(None),
+                    ComponentHealthInfo::unknown(error.clone()),
+                ),
+                CoffeePosHealthInfo {
+                    state: CoffeePosHealthState::Checking,
+                    ..
+                }
+                | CoffeePosHealthInfo {
+                    state: CoffeePosHealthState::Unavailable,
+                    ..
+                } => (
+                    ComponentHealthInfo::unknown(None),
+                    ComponentHealthInfo::unknown(None),
+                ),
+                CoffeePosHealthInfo {
+                    state: CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded,
+                    payload: None,
+                    ..
+                } => (
+                    ComponentHealthInfo::unknown(None),
+                    ComponentHealthInfo::unknown(None),
+                ),
+            }
+        } else {
+            (
+                ComponentHealthInfo::unknown(None),
+                ComponentHealthInfo::unknown(None),
+            )
+        };
+
+        HealthDiagnosticsInfo {
+            runtime_state: self.state.clone(),
+            database,
+            php,
+            wordpress,
+            woocommerce,
+            coffeepos,
+        }
+    }
+
+    fn probe_php_health_once(&mut self, port: u16) -> ComponentHealthInfo {
+        let nonce = probe_nonce();
+        let probe_name = match self.write_php_probe(&nonce) {
+            Ok(probe_name) => probe_name,
+            Err(error) => return ComponentHealthInfo::unhealthy(error),
+        };
+        let healthy = http_probe(port, &probe_name, &nonce);
+        self.remove_php_probe();
+        if healthy {
+            ComponentHealthInfo::healthy()
+        } else {
+            ComponentHealthInfo::unhealthy(error_info(
+                "php",
+                "health",
+                "PHP did not execute the expected nonce diagnostic response.",
+                "Retry the health check. If it still fails, restart the runtime and inspect the PHP log before attempting repair.",
+            ))
+        }
+    }
+
     fn clear_coffeepos_health(&mut self) {
         self.coffeepos_health = CoffeePosHealthInfo::unavailable();
         self.last_coffeepos_probe = None;
@@ -769,6 +1000,12 @@ impl RuntimeManager {
             ));
         }
 
+        let drain_gate_active = if self.php.is_some() {
+            self.begin_request_drain()?;
+            true
+        } else {
+            false
+        };
         self.state = RuntimeState::Stopping;
         self.wordpress_health = WordPressHealthState::Unavailable;
         self.wordpress_error = None;
@@ -784,6 +1021,7 @@ impl RuntimeManager {
             }
         }
 
+        self.drain_php_requests();
         if let Some(php) = self.php.as_mut() {
             if let Err(error) = php.terminate("php", self.timeouts.stop) {
                 failure = Some(error);
@@ -819,6 +1057,13 @@ impl RuntimeManager {
         } else {
             RuntimeState::NotInstalled
         };
+        if drain_gate_active && self.php.is_none() {
+            if let Err(error) = self.clear_request_drain_marker() {
+                failure.get_or_insert(error);
+            }
+        } else if drain_gate_active {
+            self.log_event("request drain marker retained while managed PHP is still alive");
+        }
 
         if let Some(error) = failure {
             self.last_error = Some(error.clone());
@@ -828,6 +1073,19 @@ impl RuntimeManager {
         self.last_error = None;
         self.log_event("runtime stopped");
         Ok(self.info())
+    }
+
+    pub fn requires_exit_confirmation(&self) -> bool {
+        self.database.is_some()
+            || self.php.is_some()
+            || self.cron.is_some()
+            || matches!(
+                self.state,
+                RuntimeState::Installing
+                    | RuntimeState::Starting
+                    | RuntimeState::Running
+                    | RuntimeState::Stopping
+            )
     }
 
     fn wait_wordpress_ready(&mut self, port: u16) -> Result<(), RuntimeErrorInfo> {
@@ -949,6 +1207,8 @@ impl RuntimeManager {
 
     fn spawn_php(&self, port: u16) -> Result<ManagedChild, RuntimeErrorInfo> {
         let site = self.data_root.join("site");
+        let runtime_router = self.prepare_runtime_router_wrapper()?;
+        let managed_router = self.data_root.join("config/wordpress-router.php");
         let database_port = self.database_port.ok_or_else(|| {
             error_info(
                 "php",
@@ -981,10 +1241,16 @@ impl RuntimeManager {
             .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
             .env("COFFEEPOS_SITE_URL", format!("http://{LOOPBACK}:{port}"))
             .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
-            .current_dir(&site);
-        let router = self.data_root.join("config/wordpress-router.php");
-        if router.is_file() {
-            command.arg(router);
+            .env(
+                "COFFEEPOS_DRAIN_MARKER",
+                self.data_root.join(REQUEST_DRAIN_MARKER),
+            )
+            .current_dir(&site)
+            .arg(&runtime_router);
+        if managed_router.is_file() {
+            command.env("COFFEEPOS_MANAGED_ROUTER", managed_router);
+        } else {
+            command.env_remove("COFFEEPOS_MANAGED_ROUTER");
         }
         self.spawn_logged(command, "php", "php.log")
     }
@@ -1258,6 +1524,101 @@ impl RuntimeManager {
         Ok(())
     }
 
+    fn drain_php_requests(&mut self) {
+        if self.php.is_none() {
+            return;
+        }
+        let Some(port) = self.http_port else {
+            self.log_event(
+                "php request drain probe unavailable: HTTP port missing; waiting full budget",
+            );
+            thread::sleep(self.timeouts.request_drain);
+            return;
+        };
+
+        let nonce = probe_nonce();
+        let probe_name = match self.write_php_probe(&nonce) {
+            Ok(name) => name,
+            Err(_) => {
+                self.log_event("php request drain probe unavailable; waiting full budget");
+                thread::sleep(self.timeouts.request_drain);
+                return;
+            }
+        };
+        let drained = match child_finished(&mut self.php, "php", "request drain") {
+            Ok(true) => true,
+            Ok(false) => {
+                http_probe_with_timeout(port, &probe_name, &nonce, self.timeouts.request_drain)
+            }
+            Err(_) => false,
+        };
+        self.remove_php_probe();
+        if drained {
+            self.log_event("php request drain complete");
+        } else {
+            self.log_event("php request drain timeout; forcing managed PHP stop");
+        }
+    }
+
+    fn prepare_runtime_router_wrapper(&self) -> Result<PathBuf, RuntimeErrorInfo> {
+        let config_dir = self.data_root.join("config");
+        fs::create_dir_all(&config_dir).map_err(|error| {
+            error_info(
+                "php",
+                "prepare runtime router",
+                format!("Cannot create the runtime config directory: {error}."),
+                "Check application-data permissions and free disk space, then retry startup.",
+            )
+        })?;
+        self.clear_request_drain_marker()?;
+        let wrapper = config_dir.join("runtime-router.php");
+        fs::write(&wrapper, RUNTIME_ROUTER_WRAPPER.as_bytes()).map_err(|error| {
+            error_info(
+                "php",
+                "prepare runtime router",
+                format!("Cannot write the managed PHP runtime router wrapper: {error}."),
+                "Check application-data permissions and free disk space, then retry startup.",
+            )
+        })?;
+        Ok(wrapper)
+    }
+
+    fn begin_request_drain(&self) -> Result<(), RuntimeErrorInfo> {
+        let marker = self.data_root.join(REQUEST_DRAIN_MARKER);
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                error_info(
+                    "php",
+                    "begin request drain",
+                    format!("Cannot prepare the runtime drain marker directory: {error}."),
+                    "Keep CoffeePOS running, check application-data permissions, then retry shutdown.",
+                )
+            })?;
+        }
+        fs::write(&marker, b"draining\n").map_err(|error| {
+            error_info(
+                "php",
+                "begin request drain",
+                format!("Cannot enable the request admission gate: {error}."),
+                "Keep CoffeePOS running, check application-data permissions, then retry shutdown.",
+            )
+        })
+    }
+
+    fn clear_request_drain_marker(&self) -> Result<(), RuntimeErrorInfo> {
+        let marker = self.data_root.join(REQUEST_DRAIN_MARKER);
+        match fs::remove_file(&marker) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error_info(
+                "php",
+                "clear request drain",
+                format!("Cannot remove the runtime request drain marker: {error}."),
+                "Check application-data permissions before restarting CoffeePOS.",
+            )),
+        }
+    }
+
     fn cleanup_started(&mut self) -> Result<(), RuntimeErrorInfo> {
         let mut failure = None;
         if let Some(cron) = self.cron.as_mut() {
@@ -1434,23 +1795,31 @@ impl RuntimeManager {
                     "Check the site directory permissions and free disk space, then retry.",
                 )
             })?;
-        self.php_probe = Some(path);
-        file.write_all(body.as_bytes()).map_err(|error| {
-            error_info(
+        if let Err(error) = file.write_all(body.as_bytes()) {
+            let failure = error_info(
                 "php",
                 "prepare readiness probe",
                 format!("Cannot write the temporary PHP readiness probe: {error}."),
                 "Check the site directory permissions and free disk space, then retry.",
-            )
-        })?;
-        file.sync_all().map_err(|error| {
-            error_info(
+            );
+            drop(file);
+            self.php_probe = Some(path);
+            self.remove_php_probe();
+            return Err(failure);
+        }
+        if let Err(error) = file.sync_all() {
+            let failure = error_info(
                 "php",
                 "prepare readiness probe",
                 format!("Cannot flush the temporary PHP readiness probe: {error}."),
                 "Check the site directory storage health, then retry.",
-            )
-        })?;
+            );
+            drop(file);
+            self.php_probe = Some(path);
+            self.remove_php_probe();
+            return Err(failure);
+        }
+        self.php_probe = Some(path);
         Ok(file_name)
     }
 
@@ -1921,11 +2290,20 @@ pub(crate) fn wait_for_child_exit(
 }
 
 fn http_probe(port: u16, probe_name: &str, nonce: &str) -> bool {
+    http_probe_with_timeout(port, probe_name, nonce, Duration::from_millis(500))
+}
+
+fn http_probe_with_timeout(
+    port: u16,
+    probe_name: &str,
+    nonce: &str,
+    read_timeout: Duration,
+) -> bool {
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
         return false;
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_read_timeout(Some(read_timeout));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
     let request = format!(
         "GET /{probe_name} HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nConnection: close\r\n\r\n"
@@ -2338,6 +2716,54 @@ fn coffeepos_health_accepts_credential(health: &CoffeePosHealthInfo) -> bool {
     matches!(
         health.state,
         CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+    )
+}
+
+fn health_diagnostics_for_inactive_runtime(runtime: &RuntimeInfo) -> HealthDiagnosticsInfo {
+    let mut diagnostics = HealthDiagnosticsInfo {
+        runtime_state: runtime.state.clone(),
+        database: ComponentHealthInfo::unavailable(),
+        php: ComponentHealthInfo::unavailable(),
+        wordpress: ComponentHealthInfo::unavailable(),
+        woocommerce: ComponentHealthInfo::unavailable(),
+        coffeepos: ComponentHealthInfo::unavailable(),
+    };
+
+    if let Some(error) = runtime.last_error.clone() {
+        match error.component.as_str() {
+            "database" => diagnostics.database = ComponentHealthInfo::unhealthy(error),
+            "php" => diagnostics.php = ComponentHealthInfo::unhealthy(error),
+            "wordpress" => diagnostics.wordpress = ComponentHealthInfo::unhealthy(error),
+            "coffeepos" => diagnostics.coffeepos = ComponentHealthInfo::unhealthy(error),
+            _ => {}
+        }
+    }
+    diagnostics
+}
+
+fn machine_component_health(
+    ready: bool,
+    component: &'static str,
+    display_name: &'static str,
+) -> ComponentHealthInfo {
+    if ready {
+        ComponentHealthInfo::healthy()
+    } else {
+        ComponentHealthInfo::unhealthy(machine_component_error(component, display_name))
+    }
+}
+
+fn machine_component_error(
+    component: &'static str,
+    display_name: &'static str,
+) -> RuntimeErrorInfo {
+    error_info(
+        component,
+        "application health",
+        format!(
+            "Authenticated CoffeePOS machine health reports that {display_name} is not ready."
+        ),
+        "Retry the health check. If the same component remains unhealthy, restart the runtime before using the explicit repair flow.",
     )
 }
 
@@ -2865,6 +3291,7 @@ mod tests {
             http_readiness: Duration::from_millis(500),
             wordpress_readiness: Duration::from_millis(500),
             probe_command: Duration::from_millis(250),
+            request_drain: Duration::from_millis(250),
             stop: Duration::from_millis(500),
         });
         assert_eq!(manager.info().state, RuntimeState::Stopped);
@@ -2909,6 +3336,64 @@ mod tests {
         assert_eq!(value["http_port"], 8081);
         assert_eq!(value["wordpress_health"], "checking");
         assert_eq!(value["coffeepos_health"]["state"], "unavailable");
+    }
+
+    #[test]
+    fn inactive_health_diagnostics_preserves_failed_component_without_blame_spread() {
+        let database_error = error_info(
+            "database",
+            "health",
+            "Database probe failed.",
+            "Retry the database probe.",
+        );
+        let info = RuntimeInfo {
+            state: RuntimeState::Stopped,
+            runtime_version: Some("test-runtime".into()),
+            php_version: Some("test-php".into()),
+            mariadb_version: Some("test-db".into()),
+            database_port: None,
+            http_port: None,
+            database_pid: None,
+            php_pid: None,
+            wordpress_health: WordPressHealthState::Unavailable,
+            wordpress_error: None,
+            coffeepos_health: CoffeePosHealthInfo::unavailable(),
+            last_error: Some(database_error.clone()),
+        };
+
+        let diagnostics = health_diagnostics_for_inactive_runtime(&info);
+        assert_eq!(diagnostics.database.state, ComponentHealthState::Unhealthy);
+        assert_eq!(diagnostics.database.error, Some(database_error));
+        assert_eq!(diagnostics.php.state, ComponentHealthState::Unavailable);
+        assert_eq!(
+            diagnostics.wordpress.state,
+            ComponentHealthState::Unavailable
+        );
+        assert_eq!(
+            diagnostics.woocommerce.state,
+            ComponentHealthState::Unavailable
+        );
+        assert_eq!(
+            diagnostics.coffeepos.state,
+            ComponentHealthState::Unavailable
+        );
+    }
+
+    #[test]
+    fn machine_component_health_only_marks_the_reported_component_unhealthy() {
+        let woocommerce = machine_component_health(false, "woocommerce", "WooCommerce");
+        let coffeepos = machine_component_health(true, "coffeepos", "CoffeePOS");
+
+        assert_eq!(woocommerce.state, ComponentHealthState::Unhealthy);
+        assert_eq!(
+            woocommerce
+                .error
+                .as_ref()
+                .map(|error| error.component.as_str()),
+            Some("woocommerce")
+        );
+        assert_eq!(coffeepos.state, ComponentHealthState::Healthy);
+        assert!(coffeepos.error.is_none());
     }
 
     fn machine_health_response(status: u16, body: &str) -> Vec<u8> {
@@ -3120,6 +3605,43 @@ mod tests {
 
         manager.state = RuntimeState::Stopped;
         assert_eq!(manager.pos_url().unwrap_err().operation, "open POS");
+    }
+
+    #[test]
+    fn exit_confirmation_tracks_active_runtime_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().canonicalize().unwrap();
+        let mut manager = RuntimeManager::new(fake_runtime(), data).unwrap();
+
+        assert!(!manager.requires_exit_confirmation());
+        manager.state = RuntimeState::Running;
+        assert!(manager.requires_exit_confirmation());
+        manager.state = RuntimeState::Stopping;
+        assert!(manager.requires_exit_confirmation());
+        manager.state = RuntimeState::Stopped;
+        assert!(!manager.requires_exit_confirmation());
+    }
+
+    #[test]
+    fn request_drain_gate_marker_is_recoverable_across_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().canonicalize().unwrap();
+        let manager = RuntimeManager::new(fake_runtime(), data.clone()).unwrap();
+
+        let wrapper = manager.prepare_runtime_router_wrapper().unwrap();
+        let wrapper_body = fs::read_to_string(wrapper).unwrap();
+        assert!(wrapper_body.contains("COFFEEPOS_DRAIN_MARKER"));
+        assert!(wrapper_body.contains("COFFEEPOS_MANAGED_ROUTER"));
+        assert!(wrapper_body.contains("503"));
+
+        manager.begin_request_drain().unwrap();
+        assert!(data.join(REQUEST_DRAIN_MARKER).is_file());
+        manager.clear_request_drain_marker().unwrap();
+        assert!(!data.join(REQUEST_DRAIN_MARKER).exists());
+
+        fs::write(data.join(REQUEST_DRAIN_MARKER), b"stale\n").unwrap();
+        manager.prepare_runtime_router_wrapper().unwrap();
+        assert!(!data.join(REQUEST_DRAIN_MARKER).exists());
     }
 
     #[test]

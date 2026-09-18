@@ -16,13 +16,13 @@ Windows x64 là target được triển khai và nghiệm thu trước. macOS đ
 
 ## Ranh giới và dependency gates
 
-Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ngày 2026-09-18 điều chỉnh Phase 5 thành các milestone UI/UX dưới đây; số 5.x cũ không còn dùng để lên kế hoạch. Phase 5.1–5.2 đã hoàn thành Windows-first với native Tauri/WebView acceptance và staged runtime regressions. Phase 5.3–5.5 đã triển khai và pass lightweight automated checks; manual Windows acceptance còn chờ người dùng smoke-test. Đặc tả trải nghiệm nằm tại [UI-UX.md](UI-UX.md). Các mốc artifact/install/activation là checkpoint kỹ thuật của cùng một setup flow; không yêu cầu người vận hành bấm từng bước.
+Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ngày 2026-09-18 điều chỉnh Phase 5 thành các milestone UI/UX dưới đây; số 5.x cũ không còn dùng để lên kế hoạch. Phase 5.1–5.2 đã hoàn thành Windows-first với native Tauri/WebView acceptance và staged runtime regressions. Phase 5.3–5.6 đã triển khai và pass lightweight automated checks; manual Windows acceptance còn chờ người dùng smoke-test. Đặc tả trải nghiệm nằm tại [UI-UX.md](UI-UX.md). Các mốc artifact/install/activation là checkpoint kỹ thuật của cùng một setup flow; không yêu cầu người vận hành bấm từng bước.
 
 - `provisioning.ready` nghĩa là phần cài đặt đã hoàn tất, không chứng minh service đang chạy. Runtime readiness và application health là các kết quả riêng; chỉ hiển thị POS sẵn sàng sau health tương ứng.
-- Idempotency, retry an toàn, cleanup, lỗi có hướng phục hồi và bảo vệ secrets là yêu cầu ngay tại phase tạo hành vi đó. Phase 4.11–4.12 kiểm chứng tích hợp toàn stack; Phase 6 bổ sung diagnostics/repair UI, không trì hoãn xử lý lỗi cơ bản tới đó.
+- Idempotency, retry an toàn, cleanup, lỗi có hướng phục hồi và bảo vệ secrets là yêu cầu ngay tại phase tạo hành vi đó. Phase 4.11–4.12 kiểm chứng tích hợp toàn stack; Phase 6 bổ sung diagnostics, runtime performance và repair/log tooling, không trì hoãn xử lý lỗi cơ bản tới đó.
 - Phase 4.1–4.3 phải pass trước WooCommerce. Trước khi pin CoffeePOS ở 4.7, chốt contract health/POS URL/machine authentication với plugin; implementation và nghiệm thu endpoint vẫn ở 4.10.
 - UI/UX là deliverable của từng phase: màn hình, hành động chính, loading/error/retry và nghiệm thu thao tác thật. 5.1 sở hữu khung điều hướng; 5.2 setup/tài khoản; 5.3 trang chính/cài đặt; 5.4 mở POS/login; 5.5 auto-start; 5.6 shutdown. Không trì hoãn toàn bộ UI đến khi backend hoàn tất.
-- Kiểm chứng PHP self-request/background jobs từ 4.6; concurrency với POS từ 5.4. Chốt quyết định web server trước LAN hoặc release, theo [ARCHITECTURE.md](../ARCHITECTURE.md#php-built-in-server-quyết-định-có-điều-kiện). Không coi benchmark pass là chứng nhận production cho `php -S`.
+- Kiểm chứng PHP self-request/background jobs từ 4.6; concurrency với POS từ 5.4. Requirement thay thế `php -S` đã được ghi nhận và Phase 6.2 sở hữu quyết định/implementation serving stack concurrent trước LAN hoặc release; xem [ARCHITECTURE.md](../ARCHITECTURE.md#php-built-in-server-requirement-thay-thế-đã-được-chứng-minh). Không coi benchmark pass là chứng nhận production cho `php -S`.
 - Chốt thiết kế bảo mật LAN trước bind 8.1; 8.3 là nghiệm thu/hardening toàn flow. Phase 8.1–8.2 chỉ thử nghiệm có kiểm soát cho đến khi 8.3 pass.
 - Phase 7 dùng development artifact đã pin cho dump/restore; không phụ thuộc production bundling 9.1. Phase 9 chịu trách nhiệm bundle chính các công cụ đã nghiệm thu.
 - Development và acceptance dùng store/profile riêng trước khi thử dữ liệu vận hành. Không kiểm thử failure/restore/upgrade trên store thật.
@@ -51,7 +51,10 @@ Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ng
 | 5.3 — Home and app settings | 🟡 Đã triển khai, chờ manual acceptance | Home Start/Retry theo native state; stale health không giữ qua lifecycle; Desktop startup-view setting persist atomically; lightweight checks pass |
 | 5.4 — Open POS and login | 🟡 Đã triển khai, chờ manual acceptance | Home Mở bán hàng khi machine health healthy; system browser dùng verified dynamic origin + plugin pos_path; auth/session giữ ở WordPress/CoffeePOS; lightweight checks pass |
 | 5.5 — Daily startup | 🟡 Đã triển khai, chờ manual acceptance | Installed ready store auto-start khi runtime stopped; reload running không start lại; setup/recovery không auto-start; không tự mở POS; lightweight checks pass |
-| 5.6+ | ⏳ Chưa bắt đầu | Mốc implementation tiếp theo sau acceptance 5.5: Thu nhỏ, thoát và shutdown |
+| 5.6 — Minimize, exit and shutdown | 🟡 Đã triển khai, chờ manual acceptance | Minimize giữ runtime; Close/Alt+F4 native confirm; bounded PHP request drain + MariaDB shutdown; Windows Job Object crash containment; lightweight checks pass |
+| 6.1 — Health diagnostics | 🟡 Đã triển khai, chờ manual acceptance | Live authenticated Database/PHP probes; WordPress readiness + CoffeePOS machine-health mapping cho đủ 5 component; recovery action rõ ràng; lightweight checks pass |
+| 6.2 — Runtime performance and responsiveness | ⏳ Chưa bắt đầu | Mốc implementation tiếp theo: async lifecycle/health scheduling, OPcache và serving stack concurrent; spec đã chốt |
+| 6.3+ | ⏳ Chưa bắt đầu | Repair flow rồi Log viewer/export |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -179,13 +182,13 @@ Chốt schema/auth/POS route trước artifact 4.7; 4.10 triển khai và nghi�
 
 **Definition of Done:** inject/diễn tập failure ở các ranh giới DB, WordPress, WooCommerce và CoffeePOS; lần Retry tiếp tục hoặc trả repair error rõ ràng mà không tự xóa store.
 
-Nghiệm thu trực tiếp từ app: fresh store → setup toàn stack → application healthy; đóng/mở giữa setup → đọc journal → tiếp tục an toàn. Một flow UI điều phối các bước, không yêu cầu người dùng chạy staging/CLI hoặc vào wp-admin. Artifact development được chuẩn bị trước; production/offline payload thuộc Phase 9. Lỗi không retryable phải chỉ rõ hướng xử lý, không hiện nút Repair như thể engine 6.2 đã tồn tại.
+Nghiệm thu trực tiếp từ app: fresh store → setup toàn stack → application healthy; đóng/mở giữa setup → đọc journal → tiếp tục an toàn. Một flow UI điều phối các bước, không yêu cầu người dùng chạy staging/CLI hoặc vào wp-admin. Artifact development được chuẩn bị trước; production/offline payload thuộc Phase 9. Lỗi không retryable phải chỉ rõ hướng xử lý, không hiện nút Repair như thể engine 6.3 đã tồn tại.
 
 **Hoàn thành Windows-first 2026-09-18:** native provisioning có deterministic test-only interruption checkpoint sau từng side effect và trước journal commit. Real staged E2E recreate `Provisioner` + `RuntimeManager` trên cùng `data_root` qua các boundary database/site/WordPress/WooCommerce/CoffeePOS/machine health rồi Retry tới `ready`, giữ nguyên protected DB/admin/machine credentials. Interruption giữa `wp_install()` được bảo vệ riêng: bootstrap exit 6/7 persist optional `recovery_blocker=partial_wordpress_install`; relaunch trả `needs_repair`, `can_retry=false`, giữ nguyên tables/site và normal provisioning không bypass blocker. UI dùng cùng một Install/Retry flow và khi non-retryable chỉ cho kiểm tra lại trạng thái. Xem `docs/PHASE-04.12.md`.
 
 ## Phase 5 — Trải nghiệm ứng dụng và mở bán hàng
 
-Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3–5.5 đã triển khai code và lightweight validation, còn manual Windows acceptance theo [PHASE-05.3.md](PHASE-05.3.md), [PHASE-05.4.md](PHASE-05.4.md) và [PHASE-05.5.md](PHASE-05.5.md). Phase 5.6+ chưa triển khai. Trước code mỗi milestone, bổ sung spec phase với wireframe success/loading/error, contract native cần dùng và acceptance theo [UI-UX.md](UI-UX.md). Tái sử dụng runtime/provisioning hiện có; không viết lại backend chỉ để đổi giao diện.
+Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3–5.6 đã triển khai code và lightweight validation, còn manual Windows acceptance theo [PHASE-05.3.md](PHASE-05.3.md), [PHASE-05.4.md](PHASE-05.4.md), [PHASE-05.5.md](PHASE-05.5.md) và [PHASE-05.6.md](PHASE-05.6.md). Phase 6.1 health diagnostics cũng đã triển khai và chờ manual acceptance theo [PHASE-06.1.md](PHASE-06.1.md); Phase 6.2+ chưa triển khai. Sau snapshot 6.1, product IA được chốt lại: installed-store top-level navigation là **Tổng quan / Cấu hình / Hệ thống**; **Chẩn đoán** chuyển thành chức năng bên trong Hệ thống. Đây là target cho mọi UI change tiếp theo; acceptance lịch sử của 5.1 vẫn ghi đúng shell đã chạy lúc đó. Trước code mỗi milestone, bổ sung spec phase với wireframe success/loading/error, contract native cần dùng và acceptance theo [UI-UX.md](UI-UX.md). Tái sử dụng runtime/provisioning hiện có; không viết lại backend chỉ để đổi giao diện.
 
 ### Phase 5.1 — Khung giao diện và điều hướng
 
@@ -194,6 +197,8 @@ Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3–5.5 đã triển kh
 **Done khi:** điều hướng app thật bằng chuột/bàn phím, reload/relaunch chọn đúng màn hình theo installation; runtime không bị spawn lại do đổi trang. Resize/DPI không che action; không có trang chức năng tương lai rỗng. Native success/error hiện có vẫn hiển thị và thao tác được. Chưa cần auto-start, POS host hoặc repair engine.
 
 **Hoàn thành Windows-first 2026-09-18:** shell frontend tách setup/recovery khỏi installed-store navigation, chuyển controls kỹ thuật sang Chẩn đoán và giữ `store_name` ở setup để không phá Phase 4.12. Tauri acceptance chứng minh ready+stopped → Home; navigation/reload giữ nguyên long-lived runtime PID và không tăng `runtime start requested`; Diagnostics start/restart/stop vẫn đạt health đúng; native Windows mouse + keyboard Enter/Space đổi view và focus đúng heading; cửa sổ native resize tới WebView `460×560` vẫn cuộn/không overflow. Host chỉ có monitor 100%, nên 150% được kiểm bằng WebView2 `deviceScaleFactor=1.5` trong app Tauri thật thay vì đổi setting hệ thống. Ba staged provisioning/recovery regressions đều pass. Xem [PHASE-05.1.md](PHASE-05.1.md).
+
+**IA revision sau Phase 6.1 — đã áp dụng frontend 2026-09-18:** giữ invariant navigation không respawn runtime, focus/accessibility và responsive acceptance của 5.1, nhưng đổi product labels/hierarchy thành **Tổng quan / Cấu hình / Hệ thống**. Internal view/config keys `home/settings/diagnostics` được giữ tương thích; `diagnostics` dẫn vào Hệ thống tại mục Chẩn đoán. Header + top-level navigation giữ vị trí ổn định; content phía dưới cuộn độc lập và dùng chung max-width/padding/spacing. Segmented control cũ đã được thay bằng navigation ngang với active underline; Cấu hình dùng grid desktop và Hệ thống gom health/runtime theo hierarchy mới. UI typecheck/build và DOM-reference checks pass; manual Windows visual smoke-test vẫn thuộc acceptance của người dùng.
 
 ### Phase 5.2 — Thiết lập cửa hàng và tài khoản
 
@@ -207,7 +212,7 @@ Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3–5.5 đã triển kh
 
 **Scope:** tên cửa hàng, trạng thái dễ hiểu, hành động theo native state; cài đặt thuộc Desktop với save/error feedback. Tách thông tin kỹ thuật khỏi trang chính. Khi chưa có opener 5.4, chỉ hiển thị hệ thống sẵn sàng và chức năng thực sự có.
 
-**Done khi:** nghiệm thu installed/stopped/starting/healthy/error/stopping; health stale bị loại sau failure; Start/Retry có kết quả thật và không reinstall. Người dùng tìm được cài đặt/chẩn đoán mà không phải hiểu PHP/database. Không nhân bản dashboard hoặc settings nghiệp vụ POS.
+**Done khi:** nghiệm thu installed/stopped/starting/healthy/error/stopping; health stale bị loại sau failure; Start/Retry có kết quả thật và không reinstall. Người dùng tìm được **Cấu hình** và **Hệ thống → Chẩn đoán** mà không phải hiểu PHP/database. Không nhân bản dashboard hoặc settings nghiệp vụ POS.
 
 **Đã triển khai 2026-09-18, chờ manual acceptance:** Home có primary action theo native runtime/health state, transition busy chặn submit trùng và health Retry chỉ recheck WordPress/CoffeePOS mà không gọi provisioning. Settings thêm preference Desktop-only `startup_view` (`home`/`settings`/`diagnostics`) với atomic config persistence và default tương thích config schema 1 cũ. `git diff --check`, UI typecheck/build, Rust fmt check và 9 focused config tests đều pass; staged E2E/native interaction dài được bỏ theo yêu cầu kiểm thử gọn và để người dùng smoke-test. Xem [PHASE-05.3.md](PHASE-05.3.md).
 
@@ -233,21 +238,31 @@ Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3–5.5 đã triển kh
 
 **Done khi:** close/cancel/minimize/relaunch và crash không để process mồ côi; bounded drain/timeout được kiểm với request/đơn test đang chạy; kiểm recovery không tạo đơn trùng. Không hứa graceful shutdown khi mất điện/kill; không coi đóng app là chốt ca hoặc tự thay payment state.
 
+**Đã triển khai 2026-09-18, chờ manual acceptance:** Tauri intercept CloseRequested của main window và prevent-close trước khi shutdown. Khi runtime active, native Windows confirmation cho lựa chọn ở lại hoặc dừng và thoát; lifecycle/provisioning đang bận thì close bị từ chối. Runtime stop bật admission marker trước stopping; PHP chạy qua runtime router wrapper do Desktop quản lý nên request mới nhận 503 trước WordPress/CoffeePOS, còn drain probe nội bộ được phép đi qua để chờ pre-existing queue tối đa 3 giây. Sau đó giữ graceful MariaDB SHUTDOWN + forced-cleanup fallback hiện có; stale marker được clear trước mỗi PHP start. App chỉ exit khi không còn managed child; stop error còn child giữ cửa sổ mở. Minimize không có stop hook nên runtime tiếp tục chạy. Windows kill-on-close Job Object tiếp tục bảo đảm child không mồ côi khi desktop crash/kill, nhưng không được mô tả là graceful. Lightweight UI/Rust checks và staged PHP admission-gate check đều pass; native close/minimize, in-flight POS order/request, relaunch và crash containment để manual smoke-test. Xem [PHASE-05.6.md](PHASE-05.6.md).
+
 **Gate cuối Phase 5:** người thử hoàn tất setup → login/bán hàng → đóng/mở → dùng store cũ → xử lý lỗi thông thường mà không dùng terminal/wp-admin. Ghi rõ người thử, mức hỗ trợ, bằng chứng và giới hạn; developer acceptance không tự thay user usability test.
 
-## Phase 6 — Diagnostics và Repair
+## Phase 6 — Hệ thống: Diagnostics, hiệu năng và Repair
+
+Phase 6 mở rộng phần runtime/hệ thống sau khi POS thật đã hoạt động. Chẩn đoán, tối ưu runtime, Repair và Log viewer/export cùng giữ ranh giới kỹ thuật của Desktop; không đưa business logic POS sang native layer và không thêm công cụ kỹ thuật thành các tab ngang cấp với **Tổng quan** và **Cấu hình**.
 
 ### Phase 6.1 — Health diagnostics
 
 Hiển thị component health cho Database / PHP / WordPress / WooCommerce / CoffeePOS. **Done khi** failure được phân loại đúng component với recovery action rõ ràng.
 
-### Phase 6.2 — Repair flow
+**Đã triển khai 2026-09-18, chờ manual acceptance:** snapshot ban đầu dùng top-level Chẩn đoán và có native diagnostics được serialize bằng lifecycle lock, kiểm trực tiếp MariaDB bằng authenticated `SELECT 1`, PHP bằng nonce HTTP probe, WordPress bằng readiness response, sau đó dùng authenticated CoffeePOS machine-health schema 1 để phân loại Database/WordPress/WooCommerce/CoffeePOS ở application layer. Payload `degraded` chỉ gán lỗi cho boolean component `false`; machine-health auth/transport/contract fail không suy đoán WooCommerce hỏng khi chưa có payload. UI hiển thị 5 component, recovery action, **Kiểm tra lại**, và gom port/version/path/error kỹ thuật vào phần chi tiết. Product IA mới giữ nguyên contract này nhưng đặt màn hình tại **Hệ thống → Chẩn đoán**. Full diagnostics chỉ chạy khi mở Chẩn đoán hoặc người dùng yêu cầu; Phase 6.2 sẽ tách fast process status khỏi background application-health scheduling để poll shell không tranh request với POS. Repair và log export lùi thành 6.3/6.4. Lightweight TypeScript/Rust checks pass; native degraded/failure interaction để manual smoke-test. Xem [PHASE-06.1.md](PHASE-06.1.md).
 
-Repair các file/config/plugin managed bị thiếu hoặc hỏng trong phạm vi có thể khôi phục an toàn. **Done khi** repair không xóa dữ liệu store và từ chối tự động sửa trường hợp ownership/compatibility không rõ.
+### Phase 6.2 — Hiệu năng runtime và độ mượt
 
-### Phase 6.3 — Log viewer/export
+Đưa lifecycle/readiness/health I/O khỏi Tauri UI thread; tách fast runtime status khỏi application-health probe; bật OPcache; thay serving path POS single-process `php -S` bằng local web-serving/FastCGI worker model có concurrency và được Desktop pin/quản lý. Giữ loopback/dynamic port, machine-health, provisioning, Phase 5.6 admission/drain và Windows Job Object semantics. **Done khi** app vẫn phản hồi trong start/restart, status poll không tự tạo WordPress request, OPcache active, benchmark cùng máy cải thiện rõ ràng và 4 request động concurrent không còn serialize gần tuyến tính. Xem [PHASE-06.2.md](PHASE-06.2.md).
 
-Cho phép xem/export diagnostic logs đã redact secret. **Done khi** một support bundle đủ để chẩn đoán runtime/provisioning failure mà không chứa credential.
+### Phase 6.3 — Repair flow
+
+Trong **Hệ thống**, repair các file/config/plugin managed bị thiếu hoặc hỏng trong phạm vi có thể khôi phục an toàn. **Done khi** repair không xóa dữ liệu store và từ chối tự động sửa trường hợp ownership/compatibility không rõ.
+
+### Phase 6.4 — Log viewer/export
+
+Trong **Hệ thống**, cho phép xem/export diagnostic logs đã redact secret. **Done khi** một support bundle đủ để chẩn đoán runtime/provisioning failure mà không chứa credential.
 
 ## Phase 7 — Backup / Restore
 
@@ -321,4 +336,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.5** đã triển khai và pass lightweight automated validation, còn manual acceptance. Sau khi acceptance 5.5 đạt, mốc implementation tiếp theo là **Phase 5.6 — Thu nhỏ, thoát và shutdown**.
+Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6** và **Phase 6.1** đã triển khai, pass lightweight automated validation và còn manual acceptance. Mốc implementation tiếp theo là **Phase 6.2 — Hiệu năng runtime và độ mượt**.
