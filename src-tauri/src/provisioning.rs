@@ -1457,7 +1457,7 @@ fn wordpress_http_ready(port: u16) -> bool {
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let request = format!(
-        "GET /wp-login.php HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nConnection: close\r\n\r\n"
+        "GET /wp-login.php?doing_wp_cron=coffeepos-health HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nConnection: close\r\n\r\n"
     );
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
@@ -1570,7 +1570,7 @@ if ($uploadRoot && str_starts_with($requestPath, $uploadPrefix)) {
 }
 
 $local = $siteRoot . DIRECTORY_SEPARATOR . ltrim(str_replace('/', DIRECTORY_SEPARATOR, $requestPath), DIRECTORY_SEPARATOR);
-if ($requestPath !== '/' && is_file($local)) {
+if ($requestPath !== '/' && (is_file($local) || is_dir($local))) {
     return false;
 }
 
@@ -1623,6 +1623,20 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn http_get(port: u16, path: &str) -> String {
+        let mut stream = std::net::TcpStream::connect((LOOPBACK, port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request =
+            format!("GET {path} HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    #[cfg(windows)]
     #[test]
     fn checked_in_wordpress_manifest_matches_native_schema() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1638,6 +1652,7 @@ mod tests {
     #[test]
     fn managed_runtime_files_use_environment_for_dynamic_values() {
         assert!(WORDPRESS_ROUTER.contains("COFFEEPOS_UPLOAD_ROOT"));
+        assert!(WORDPRESS_ROUTER.contains("is_file($local) || is_dir($local)"));
         assert!(WORDPRESS_UPLOADS_MU_PLUGIN.contains("COFFEEPOS_SITE_URL"));
         assert!(WORDPRESS_BOOTSTRAP.contains("COFFEEPOS_ADMIN_PASSWORD"));
     }
@@ -1689,7 +1704,12 @@ mod tests {
         .unwrap();
         assert_eq!(provisioner.inspect().state, ProvisioningState::NotInstalled);
 
-        let prepared = provisioner.prepare().unwrap();
+        let prepared = provisioner.prepare().unwrap_or_else(|error| {
+            let log = fs::read_to_string(data_root.join("logs/provisioning.log")).unwrap_or_else(
+                |read_error| format!("<cannot read provisioning log: {read_error}>"),
+            );
+            panic!("provisioning prepare failed: {error}\n--- provisioning.log ---\n{log}");
+        });
         assert_eq!(prepared.state, ProvisioningState::Installing);
         assert!(data_root.join("database/mysql").is_dir());
         assert!(data_root.join("site/wp-settings.php").is_file());
@@ -1716,7 +1736,16 @@ mod tests {
 
         let healthy = manager.restart().unwrap();
         assert_eq!(healthy.state, RuntimeState::Running);
-        assert_eq!(healthy.wordpress_health, WordPressHealthState::Healthy);
+        if healthy.wordpress_health != WordPressHealthState::Healthy {
+            let php_log = fs::read_to_string(data_root.join("logs/php.log"))
+                .unwrap_or_else(|error| format!("<cannot read php.log: {error}>"));
+            let database_log = fs::read_to_string(data_root.join("logs/database.log"))
+                .unwrap_or_else(|error| format!("<cannot read database.log: {error}>"));
+            panic!(
+                "WordPress health after restart was {:?}: {:?}\n--- php.log ---\n{}\n--- database.log ---\n{}",
+                healthy.wordpress_health, healthy.wordpress_error, php_log, database_log
+            );
+        }
         assert!(healthy.wordpress_error.is_none());
 
         manager.kill_php_for_test();
@@ -1752,6 +1781,49 @@ mod tests {
             retried_start.wordpress_health,
             WordPressHealthState::Healthy
         );
+
+        let old_http_port = retried_start.http_port.unwrap();
+        assert_eq!(
+            manager.wordpress_url().unwrap(),
+            format!("http://{LOOPBACK}:{old_http_port}/")
+        );
+        manager.stop().unwrap();
+        assert!(manager.wordpress_url().is_err());
+        let occupied_old_http = std::net::TcpListener::bind((LOOPBACK, old_http_port)).unwrap();
+        let moved_runtime = manager.start().unwrap();
+        let moved_http_port = moved_runtime.http_port.unwrap();
+        assert_ne!(moved_http_port, old_http_port);
+        assert_eq!(
+            moved_runtime.wordpress_health,
+            WordPressHealthState::Healthy
+        );
+        assert_eq!(
+            manager.wordpress_url().unwrap(),
+            format!("http://{LOOPBACK}:{moved_http_port}/")
+        );
+        let admin_response = http_get(moved_http_port, "/wp-admin/");
+        assert!(
+            admin_response.contains(&format!(
+                "Location: http://{LOOPBACK}:{moved_http_port}/wp-login.php"
+            )),
+            "unexpected /wp-admin/ response after moving HTTP port:\n{admin_response}"
+        );
+        assert!(!admin_response.contains(&format!(
+            "Location: http://{LOOPBACK}:{old_http_port}/wp-login.php"
+        )));
+        let login_response = http_get(moved_http_port, "/wp-login.php");
+        assert!(login_response.contains(&format!("http://{LOOPBACK}:{moved_http_port}/")));
+        assert!(!login_response.contains(&format!("http://{LOOPBACK}:{old_http_port}/")));
+        assert!(
+            login_response.contains(&format!("http://{LOOPBACK}:{moved_http_port}/wp-includes/"))
+        );
+        let static_asset_response = http_get(moved_http_port, "/wp-includes/css/dashicons.min.css");
+        assert!(
+            static_asset_response.starts_with("HTTP/1.0 200 ")
+                || static_asset_response.starts_with("HTTP/1.1 200 "),
+            "WordPress static asset did not return HTTP 200 on the moved port"
+        );
+        drop(occupied_old_http);
 
         let sentinel = data_root.join("site/wp-content/coffeepos-phase3-e2e-sentinel.txt");
         fs::write(&sentinel, b"preserve me").unwrap();

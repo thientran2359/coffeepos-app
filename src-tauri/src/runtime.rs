@@ -503,6 +503,34 @@ impl RuntimeManager {
         self.info()
     }
 
+    pub fn wordpress_url(&self) -> Result<String, RuntimeErrorInfo> {
+        if self.state != RuntimeState::Running {
+            return Err(error_info(
+                "wordpress",
+                "open",
+                "WordPress cannot be opened because the local runtime is not running.",
+                "Start the local runtime and wait for WordPress health to become healthy before opening the site.",
+            ));
+        }
+        if self.wordpress_health != WordPressHealthState::Healthy {
+            return Err(error_info(
+                "wordpress",
+                "open",
+                "WordPress cannot be opened because health has not been verified for the current runtime instance.",
+                "Wait for WordPress health to become healthy or restart the runtime if the health check failed.",
+            ));
+        }
+        let port = self.http_port.ok_or_else(|| {
+            error_info(
+                "wordpress",
+                "open",
+                "WordPress cannot be opened because the managed HTTP port is unavailable.",
+                "Restart the runtime so CoffeePOS Desktop can select and verify a loopback HTTP port.",
+            )
+        })?;
+        Ok(format!("http://{LOOPBACK}:{port}/"))
+    }
+
     pub fn stop(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
         self.refresh();
         if (self.state == RuntimeState::NotInstalled || self.state == RuntimeState::Stopped)
@@ -1595,19 +1623,42 @@ fn wordpress_http_probe(port: u16) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
         return false;
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(750)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
     let request = format!(
-        "GET /wp-login.php HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nConnection: close\r\n\r\n"
+        "GET /wp-login.php?doing_wp_cron=coffeepos-health HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nConnection: close\r\n\r\n"
     );
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
-    let mut response = Vec::new();
-    if stream.take(256 * 1024).read_to_end(&mut response).is_err() {
-        return false;
+    let mut response = Vec::with_capacity(8192);
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                response.extend_from_slice(&chunk[..count]);
+                if response.len() > 256 * 1024 {
+                    return false;
+                }
+                if wordpress_probe_response_healthy(&response) {
+                    return true;
+                }
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(_) => return false,
+        }
     }
-    let text = String::from_utf8_lossy(&response);
+    wordpress_probe_response_healthy(&response)
+}
+
+fn wordpress_probe_response_healthy(response: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(response);
     (text.starts_with("HTTP/1.0 200 ") || text.starts_with("HTTP/1.1 200 "))
         && text.contains("loginform")
 }
@@ -2177,6 +2228,39 @@ mod tests {
         assert_eq!(value["database_port"], 3307);
         assert_eq!(value["http_port"], 8081);
         assert_eq!(value["wordpress_health"], "checking");
+    }
+
+    #[test]
+    fn wordpress_probe_response_accepts_valid_partial_login_page() {
+        assert!(wordpress_probe_response_healthy(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<form id=\"loginform\""
+        ));
+        assert!(!wordpress_probe_response_healthy(
+            b"HTTP/1.1 302 Found\r\nLocation: /wp-login.php\r\n\r\n"
+        ));
+        assert!(!wordpress_probe_response_healthy(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nloading"
+        ));
+    }
+
+    #[test]
+    fn wordpress_url_requires_current_healthy_running_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().canonicalize().unwrap();
+        let mut manager = RuntimeManager::new(fake_runtime(), data).unwrap();
+
+        assert_eq!(manager.wordpress_url().unwrap_err().operation, "open");
+
+        manager.state = RuntimeState::Running;
+        manager.http_port = Some(43127);
+        manager.wordpress_health = WordPressHealthState::Unhealthy;
+        assert_eq!(manager.wordpress_url().unwrap_err().operation, "open");
+
+        manager.wordpress_health = WordPressHealthState::Healthy;
+        assert_eq!(manager.wordpress_url().unwrap(), "http://127.0.0.1:43127/");
+
+        manager.state = RuntimeState::Stopped;
+        assert_eq!(manager.wordpress_url().unwrap_err().operation, "open");
     }
 
     #[test]

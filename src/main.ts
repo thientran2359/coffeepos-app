@@ -63,6 +63,8 @@ const runtimeDescription = element("runtime-description");
 const runtimeStart = element<HTMLButtonElement>("runtime-start");
 const runtimeStop = element<HTMLButtonElement>("runtime-stop");
 const runtimeRestart = element<HTMLButtonElement>("runtime-restart");
+const openWordPress = element<HTMLButtonElement>("open-wordpress");
+const openWordPressStatus = element("open-wordpress-status");
 const wordpressHealth = element("wordpress-health");
 const wordpressHealthError = element("wordpress-health-error");
 
@@ -91,6 +93,7 @@ function setRuntimeControls(info: RuntimeInfo | null): void {
     runtimeStart.disabled = true;
     runtimeStop.disabled = true;
     runtimeRestart.disabled = true;
+    openWordPress.disabled = true;
     return;
   }
   const provisioningReady = currentProvisioning?.state === "ready";
@@ -98,11 +101,13 @@ function setRuntimeControls(info: RuntimeInfo | null): void {
     runtimeStart.disabled = true;
     runtimeRestart.disabled = true;
     runtimeStop.disabled = info.state !== "running";
+    openWordPress.disabled = true;
     return;
   }
   runtimeStart.disabled = info.state === "running" || info.state === "starting" || info.state === "stopping";
   runtimeStop.disabled = info.state !== "running";
   runtimeRestart.disabled = info.state === "starting" || info.state === "stopping" || info.state === "installing";
+  openWordPress.disabled = info.state !== "running" || info.wordpress_health !== "healthy" || !info.http_port;
 }
 
 function renderRuntime(info: RuntimeInfo): void {
@@ -272,6 +277,7 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
   wordpressHealth.textContent = "unavailable";
   wordpressHealthError.hidden = true;
   wordpressHealthError.textContent = "";
+  openWordPressStatus.textContent = "";
   runtimeDescription.textContent = command === "stop_runtime" ? "Đang dừng PHP và MariaDB…" : "Đang khởi động runtime và kiểm tra WordPress…";
   try {
     renderRuntime(await invoke<RuntimeInfo>(command));
@@ -282,6 +288,21 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
     runtimeBusy = false;
     if (currentProvisioning) renderProvisioning(currentProvisioning);
     if (currentRuntime) renderRuntime(currentRuntime);
+  }
+}
+
+async function openManagedWordPress(): Promise<void> {
+  if (provisioningBusy || runtimeBusy || openWordPress.disabled) return;
+  openWordPress.disabled = true;
+  openWordPressStatus.textContent = "Đang mở WordPress bằng địa chỉ runtime hiện tại…";
+  try {
+    const url = await invoke<string>("open_wordpress");
+    openWordPressStatus.textContent = `Đã mở ${url}`;
+  } catch (error) {
+    openWordPressStatus.textContent = nativeErrorText(error);
+    await refreshRuntime();
+  } finally {
+    setRuntimeControls(currentRuntime);
   }
 }
 
@@ -300,7 +321,7 @@ async function bootstrap(): Promise<void> {
     element("version").textContent = info.version;
     element("settings").hidden = false;
     title.textContent = "Desktop shell đã sẵn sàng";
-    description.textContent = "Phase 4.2 theo dõi riêng trạng thái cài đặt, runtime readiness và WordPress health.";
+    description.textContent = "Phase 4.3 mở WordPress bằng đúng dynamic loopback URL sau khi runtime và WordPress health đã sẵn sàng.";
     await refreshProvisioning();
     await refreshRuntime();
   } catch (error) {
@@ -321,6 +342,7 @@ provisionWordPress.addEventListener("click", () => {
 runtimeStart.addEventListener("click", () => void runtimeAction("start_runtime"));
 runtimeStop.addEventListener("click", () => void runtimeAction("stop_runtime"));
 runtimeRestart.addEventListener("click", () => void runtimeAction("restart_runtime"));
+openWordPress.addEventListener("click", () => void openManagedWordPress());
 element<HTMLFormElement>("settings-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (provisioningBusy || runtimeBusy) return;

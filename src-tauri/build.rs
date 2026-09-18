@@ -7,6 +7,7 @@ fn main() {
             "start_runtime",
             "stop_runtime",
             "restart_runtime",
+            "open_wordpress",
             "get_provisioning_info",
             "provision_wordpress",
         ]),

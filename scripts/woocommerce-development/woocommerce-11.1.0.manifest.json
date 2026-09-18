@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-pc-windows-msvc",
+  "woocommerce": {
+    "version": "11.1.0",
+    "archive": "woocommerce.11.1.0.zip",
+    "source": "https://downloads.wordpress.org/plugin/woocommerce.11.1.0.zip",
+    "release_source": "https://developer.woocommerce.com/releases/",
+    "plugin_directory_source": "https://wordpress.org/plugins/woocommerce/",
+    "archive_sha256": "6bae9bf74d722b6deb15f049687c311cfafc26e3a5d8fa55ac6ea4b9a3a8df19",
+    "archive_sha256_source": "independently computed from the pinned official WordPress.org plugin archive on 2026-09-18",
+    "license": "GPL-3.0-or-later",
+    "plugin_root": "woocommerce/woocommerce",
+    "entry_file": "woocommerce/woocommerce/woocommerce.php",
+    "license_file": "woocommerce/woocommerce/license.txt",
+    "readme_file": "woocommerce/woocommerce/readme.txt"
+  },
+  "compatibility": {
+    "plugin_metadata_source": "https://wordpress.org/plugins/woocommerce/",
+    "server_requirements_source": "https://woocommerce.com/document/server-requirements/",
+    "minimum_wordpress": "7.0",
+    "tested_wordpress": "7.1",
+    "minimum_php": "7.4",
+    "recommended_php": "8.3 or greater; tested up to PHP 8.4",
+    "recommended_mariadb": "10.6 or greater",
+    "development_wordpress": "7.1",
+    "development_php": "8.4.25",
+    "development_mariadb": "11.4.13"
+  }
+}

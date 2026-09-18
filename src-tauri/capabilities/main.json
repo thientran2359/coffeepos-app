@@ -10,6 +10,7 @@
     "allow-start-runtime",
     "allow-stop-runtime",
     "allow-restart-runtime",
+    "allow-open-wordpress",
     "allow-get-provisioning-info",
     "allow-provision-wordpress"
   ]

@@ -10,7 +10,7 @@ mod secret;
 use config::{AppConfig, Store};
 #[cfg(debug_assertions)]
 use provisioning::Provisioner;
-use provisioning::ProvisioningInfo;
+use provisioning::{ProvisioningInfo, ProvisioningState};
 use runtime::{RuntimeInfo, RuntimeManager};
 use serde::Serialize;
 #[cfg(debug_assertions)]
@@ -102,11 +102,11 @@ fn development_runtime_paths() -> Result<(PathBuf, PathBuf), String> {
     Ok((project_root, manifest))
 }
 
-fn with_runtime(
+fn with_runtime<T>(
     _app: &tauri::AppHandle,
     state: &ShellState,
-    operation: impl FnOnce(&mut RuntimeManager) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo>,
-) -> Result<RuntimeInfo, String> {
+    operation: impl FnOnce(&mut RuntimeManager) -> Result<T, runtime::RuntimeErrorInfo>,
+) -> Result<T, String> {
     #[cfg(debug_assertions)]
     let root = data_root(_app, state)?;
     let mut guard = state
@@ -131,6 +131,69 @@ fn with_runtime(
         .as_mut()
         .ok_or_else(|| "Runtime manager unavailable. Retry startup.".to_string())?;
     operation(manager).map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+fn inspect_provisioning(
+    app: &tauri::AppHandle,
+    state: &ShellState,
+) -> Result<ProvisioningInfo, String> {
+    let provisioning_guard = match state.provisioning.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::WouldBlock) => None,
+        Err(TryLockError::Poisoned(_)) => {
+            return Err(
+                "Provisioning state unavailable. Restart CoffeePOS Desktop before retrying.".into(),
+            );
+        }
+    };
+    let root = data_root(app, state)?;
+    let (project_root, manifest) = development_runtime_paths()?;
+    let resolved = runtime::resolve_development_manifest(&project_root, &manifest)
+        .map_err(|error| error.to_string())?;
+    let provisioner = Provisioner::from_development(&project_root, &manifest, resolved, root)
+        .map_err(|error| error.to_string())?;
+    if provisioning_guard.is_some() {
+        Ok(provisioner.inspect())
+    } else {
+        Ok(provisioner.installing_info())
+    }
+}
+
+#[cfg(windows)]
+fn open_system_browser(url: &str) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let operation: Vec<u16> = OsStr::new("open").encode_wide().chain(once(0)).collect();
+    let target: Vec<u16> = OsStr::new(url).encode_wide().chain(once(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as isize <= 32 {
+        Err(format!(
+            "Windows could not open the managed WordPress URL in the system browser (ShellExecuteW code {}). Check the default browser association and retry.",
+            result as isize
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn open_system_browser(_url: &str) -> Result<(), String> {
+    Err("Opening WordPress in the system browser is currently qualified only for Windows x64 development builds.".into())
 }
 
 fn try_lifecycle<'a>(state: &'a ShellState, operation: &str) -> Result<MutexGuard<'a, ()>, String> {
@@ -205,33 +268,40 @@ fn get_provisioning_info(
 ) -> Result<ProvisioningInfo, String> {
     #[cfg(debug_assertions)]
     {
-        let provisioning_guard = match state.provisioning.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(TryLockError::WouldBlock) => None,
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(
-                    "Provisioning state unavailable. Restart CoffeePOS Desktop before retrying."
-                        .into(),
-                );
-            }
-        };
-        let root = data_root(&app, &state)?;
-        let (project_root, manifest) = development_runtime_paths()?;
-        let resolved = runtime::resolve_development_manifest(&project_root, &manifest)
-            .map_err(|error| error.to_string())?;
-        let provisioner = Provisioner::from_development(&project_root, &manifest, resolved, root)
-            .map_err(|error| error.to_string())?;
-        if provisioning_guard.is_some() {
-            Ok(provisioner.inspect())
-        } else {
-            Ok(provisioner.installing_info())
-        }
+        inspect_provisioning(&app, &state)
     }
     #[cfg(not(debug_assertions))]
     {
         let _ = app;
         let _ = state;
         Err("Bundled Phase 3 WordPress resources are not packaged yet. Use a development build until runtime packaging is implemented.".into())
+    }
+}
+
+#[tauri::command]
+fn open_wordpress(app: tauri::AppHandle, state: State<'_, ShellState>) -> Result<String, String> {
+    #[cfg(debug_assertions)]
+    {
+        let _lifecycle_guard = try_lifecycle(&state, "open WordPress")?;
+        let provisioning = inspect_provisioning(&app, &state)?;
+        if provisioning.state != ProvisioningState::Ready {
+            return Err(
+                "WordPress can only be opened after provisioning is ready. Finish or repair provisioning first."
+                    .into(),
+            );
+        }
+        let url = with_runtime(&app, &state, |runtime| {
+            runtime.refresh();
+            runtime.wordpress_url()
+        })?;
+        open_system_browser(&url)?;
+        Ok(url)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = app;
+        let _ = state;
+        Err("Bundled runtime resources are not packaged yet. Open WordPress is available only in the qualified development build until Phase 9.".into())
     }
 }
 
@@ -320,6 +390,7 @@ fn main() {
             start_runtime,
             stop_runtime,
             restart_runtime,
+            open_wordpress,
             get_provisioning_info,
             provision_wordpress
         ])

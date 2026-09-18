@@ -36,7 +36,9 @@ Giữ nguyên số phase. Các mốc artifact/install/activation là checkpoint 
 | 3 — WordPress Provisioning | ✅ Hoàn thành Windows-first | Fresh WordPress install, retry/idempotency, runtime E2E |
 | 4.1 — Provisioning UI | ✅ Hoàn thành Windows-first | Fresh app → Install → Installing → Ready → restart vẫn Ready |
 | 4.2 — WordPress runtime UX | ✅ Hoàn thành Windows-first | Runtime lifecycle + WordPress health + retry/process-death handling |
-| 4.3+ | ⏳ Chưa bắt đầu | Mốc tiếp theo: Open WordPress test |
+| 4.3 — Open WordPress test | ✅ Hoàn thành Windows-first | Managed dynamic URL, occupied-port fallback, redirect/static assets và system-browser open đã pass |
+| 4.4 — WooCommerce artifact | ✅ Hoàn thành Windows-first | WooCommerce 11.1.0 exact archive + SHA256 + compatibility metadata + deterministic staging |
+| 4.5+ | ⏳ Chưa bắt đầu | Mốc tiếp theo: WooCommerce provisioning |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -72,6 +74,8 @@ Action development mở trang WordPress bằng trình duyệt hệ thống, ch�
 
 Diễn tập port cũ bị chiếm: URL mới, redirect và static assets vẫn đúng origin; dừng runtime thì action mở site bị disable.
 
+**Hoàn thành Windows-first 2026-09-18:** `RuntimeManager::wordpress_url()` chỉ trả managed loopback URL khi runtime `running` và WordPress `healthy`; `open_wordpress` không nhận URL từ frontend và mở bằng system browser trên Windows; UI chỉ enable action khi provisioning ready + runtime running + health healthy. Acceptance đã pass cho occupied old port → new port, redirect/static assets trên origin mới, system-browser open bằng app thật và stop → action disabled. Xem `docs/PHASE-04.3.md`.
+
 ### Phase 4.4 — WooCommerce artifact
 
 **Mục tiêu:** pin một WooCommerce release cụ thể tương thích với WordPress/PHP/MariaDB đã chọn.
@@ -79,6 +83,8 @@ Diễn tập port cũ bị chiếm: URL mới, redirect và static assets vẫn 
 **Scope:** exact version, official source, checksum, license/readme metadata, deterministic staging script và ignored development target.
 
 **Definition of Done:** staging từ clean target tái tạo đúng artifact và checksum; không tải `latest` lúc app chạy.
+
+**Hoàn thành Windows-first 2026-09-18:** pin WooCommerce `11.1.0` từ exact WordPress.org archive, SHA256 `6bae9bf74d722b6deb15f049687c311cfafc26e3a5d8fa55ac6ea4b9a3a8df19`, license/readme/plugin metadata và compatibility baseline. `scripts/stage-woocommerce-development.ps1` stage vào ignored development target và verify checksum + version/requirements trước/sau extract. Repeated staging tạo cùng tree 5,862 files với cùng fingerprint. Xem `docs/PHASE-04.4.md`.
 
 ### Phase 4.5 — WooCommerce provisioning
 
@@ -262,4 +268,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Không bắt đầu WooCommerce trước khi Phase 4.1–4.3 pass. Phase 4.2 đã hoàn thành Windows-first; mốc tiếp theo là **Phase 4.3 — Open WordPress test** để mở đúng dynamic runtime URL chỉ sau khi WordPress health đạt.
+Phase 4.1–4.4 đã pass Windows-first. Mốc tiếp theo là **Phase 4.5 — WooCommerce provisioning**; phải dùng exact staged WooCommerce 11.1.0 artifact của Phase 4.4 và chưa activate plugin cho tới Phase 4.6.

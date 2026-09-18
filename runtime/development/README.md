@@ -63,3 +63,28 @@ runtime/development/x86_64-pc-windows-msvc/
 ```
 
 WordPress 7.1 archive: `https://wordpress.org/wordpress-7.1.zip`; SHA256 `d1ae02b5ae18428031ffc3943659fa87ab361d827f4aa804adf9276e4dc75df6`; official SHA1 `b2b81d9242a122a8c7104a92387794eb64fcde97`. `wordpress-manifest.json` resolves `core_root` as `wordpress/wordpress` relative to the development target root. Actual core and staged manifest remain ignored; the checked-in manifest template/script are the reproducible source of truth.
+
+## WooCommerce artifact cho Phase 4.4
+
+WooCommerce được stage riêng khỏi WordPress core và chưa được copy/activate vào managed site ở Phase 4.4:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\stage-woocommerce-development.ps1
+```
+
+Script đọc `scripts/woocommerce-development/woocommerce-11.1.0.manifest.json`, tải exact official WordPress.org plugin archive, kiểm SHA256 đã pin và metadata plugin trước/sau khi stage. Layout ignored:
+
+```text
+runtime/development/x86_64-pc-windows-msvc/
+├── woocommerce-manifest.json
+└── woocommerce/
+    └── woocommerce/
+        ├── woocommerce.php
+        ├── license.txt
+        ├── readme.txt
+        ├── includes/
+        ├── src/
+        └── vendor/
+```
+
+Pinned WooCommerce 11.1.0 archive: `https://downloads.wordpress.org/plugin/woocommerce.11.1.0.zip`; SHA256 `6bae9bf74d722b6deb15f049687c311cfafc26e3a5d8fa55ac6ea4b9a3a8df19`. Package header requires WordPress 7.0+ and PHP 7.4+; official plugin metadata is tested through WordPress 7.1. Runtime development versions WordPress 7.1, PHP 8.4.25 and MariaDB 11.4.13 satisfy the selected baseline. The archive `readme.txt` currently contains a stale `Stable tag: 11.0.1`, so the staging contract intentionally verifies the `woocommerce.php` version plus pinned release/checksum rather than treating that field as authoritative.
