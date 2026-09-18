@@ -5,11 +5,15 @@
   "windows": ["main"],
   "permissions": [
     "allow-get-shell-info",
-    "allow-save-store-name",
+    "allow-save-app-settings",
+    "allow-get-setup-info",
+    "allow-save-setup-profile",
+    "allow-copy-admin-password",
     "allow-get-runtime-info",
     "allow-start-runtime",
     "allow-stop-runtime",
     "allow-restart-runtime",
+    "allow-retry-runtime-health",
     "allow-open-wordpress",
     "allow-get-provisioning-info",
     "allow-provision-wordpress"

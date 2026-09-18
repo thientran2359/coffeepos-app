@@ -16,7 +16,7 @@ Windows x64 là target được triển khai và nghiệm thu trước. macOS đ
 
 ## Ranh giới và dependency gates
 
-Giữ nguyên số và bằng chứng của Phase 1–4.11 đã hoàn thành. Ngày 2026-09-18 điều chỉnh Phase 5 chưa triển khai thành các milestone UI/UX dưới đây; số 5.x cũ không còn dùng để lên kế hoạch. Đặc tả trải nghiệm nằm tại [UI-UX.md](UI-UX.md). Các mốc artifact/install/activation là checkpoint kỹ thuật của cùng một setup flow; không yêu cầu người vận hành bấm từng bước.
+Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ngày 2026-09-18 điều chỉnh Phase 5 thành các milestone UI/UX dưới đây; số 5.x cũ không còn dùng để lên kế hoạch. Phase 5.1–5.2 đã hoàn thành Windows-first với native Tauri/WebView acceptance và staged runtime regressions. Phase 5.3 đã triển khai và pass lightweight automated checks; manual Windows acceptance còn chờ người dùng smoke-test. Đặc tả trải nghiệm nằm tại [UI-UX.md](UI-UX.md). Các mốc artifact/install/activation là checkpoint kỹ thuật của cùng một setup flow; không yêu cầu người vận hành bấm từng bước.
 
 - `provisioning.ready` nghĩa là phần cài đặt đã hoàn tất, không chứng minh service đang chạy. Runtime readiness và application health là các kết quả riêng; chỉ hiển thị POS sẵn sàng sau health tương ứng.
 - Idempotency, retry an toàn, cleanup, lỗi có hướng phục hồi và bảo vệ secrets là yêu cầu ngay tại phase tạo hành vi đó. Phase 4.11–4.12 kiểm chứng tích hợp toàn stack; Phase 6 bổ sung diagnostics/repair UI, không trì hoãn xử lý lỗi cơ bản tới đó.
@@ -46,7 +46,10 @@ Giữ nguyên số và bằng chứng của Phase 1–4.11 đã hoàn thành. Ng
 | 4.10 — CoffeePOS health endpoint | ✅ Hoàn thành Windows-first | CoffeePOS 1.0.1 machine-health schema 1, DPAPI token auth, native classification, rotation/recovery, real E2E |
 | 4.11 — Full install idempotency | ✅ Hoàn thành Windows-first | Second full DB → WordPress → WooCommerce → CoffeePOS provisioning preserves credentials, uploads, business data, plugin ownership/state and machine token |
 | 4.12 — First-run recovery | ✅ Hoàn thành Windows-first | Journal-boundary interruption recovery, credential preservation, persistent partial-WordPress repair blocker, real staged E2E |
-| 5.1+ | ⏳ Chưa bắt đầu | Mốc tiếp theo: khung giao diện và điều hướng |
+| 5.1 — UI shell and navigation | ✅ Hoàn thành Windows-first | Setup tách khỏi installed shell; Home/Settings/Diagnostics; native mouse/keyboard/resize; navigation/reload không respawn runtime; recovery 4.12 regressions pass |
+| 5.2 — Store and account onboarding | ✅ Hoàn thành Windows-first | Fresh wizard + user-set admin credential trong DPAPI; WordPress/CoffeePOS store identity; real POS login; clipboard copy; retry/relaunch + legacy credential preservation |
+| 5.3 — Home and app settings | 🟡 Đã triển khai, chờ manual acceptance | Home Start/Retry theo native state; stale health không giữ qua lifecycle; Desktop startup-view setting persist atomically; lightweight checks pass |
+| 5.4+ | ⏳ Chưa bắt đầu | Mốc implementation tiếp theo sau acceptance 5.3: Mở POS và đăng nhập |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -180,7 +183,7 @@ Nghiệm thu trực tiếp từ app: fresh store → setup toàn stack → appli
 
 ## Phase 5 — Trải nghiệm ứng dụng và mở bán hàng
 
-Tất cả 5.x dưới đây **chưa triển khai**. Trước code mỗi milestone, bổ sung spec phase với wireframe success/loading/error, contract native cần dùng và acceptance theo [UI-UX.md](UI-UX.md). Tái sử dụng runtime/provisioning hiện có; không viết lại backend chỉ để đổi giao diện.
+Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3 đã triển khai code và lightweight validation, còn manual Windows acceptance theo [PHASE-05.3.md](PHASE-05.3.md). Phase 5.4+ chưa triển khai. Trước code mỗi milestone, bổ sung spec phase với wireframe success/loading/error, contract native cần dùng và acceptance theo [UI-UX.md](UI-UX.md). Tái sử dụng runtime/provisioning hiện có; không viết lại backend chỉ để đổi giao diện.
 
 ### Phase 5.1 — Khung giao diện và điều hướng
 
@@ -188,17 +191,23 @@ Tất cả 5.x dưới đây **chưa triển khai**. Trước code mỗi milesto
 
 **Done khi:** điều hướng app thật bằng chuột/bàn phím, reload/relaunch chọn đúng màn hình theo installation; runtime không bị spawn lại do đổi trang. Resize/DPI không che action; không có trang chức năng tương lai rỗng. Native success/error hiện có vẫn hiển thị và thao tác được. Chưa cần auto-start, POS host hoặc repair engine.
 
+**Hoàn thành Windows-first 2026-09-18:** shell frontend tách setup/recovery khỏi installed-store navigation, chuyển controls kỹ thuật sang Chẩn đoán và giữ `store_name` ở setup để không phá Phase 4.12. Tauri acceptance chứng minh ready+stopped → Home; navigation/reload giữ nguyên long-lived runtime PID và không tăng `runtime start requested`; Diagnostics start/restart/stop vẫn đạt health đúng; native Windows mouse + keyboard Enter/Space đổi view và focus đúng heading; cửa sổ native resize tới WebView `460×560` vẫn cuộn/không overflow. Host chỉ có monitor 100%, nên 150% được kiểm bằng WebView2 `deviceScaleFactor=1.5` trong app Tauri thật thay vì đổi setting hệ thống. Ba staged provisioning/recovery regressions đều pass. Xem [PHASE-05.1.md](PHASE-05.1.md).
+
 ### Phase 5.2 — Thiết lập cửa hàng và tài khoản
 
 **Scope:** Chào mừng → thông tin cửa hàng/tài khoản → tiến trình → hoàn tất, reuse recovery 4.12. Chốt input/persistence/credential contract trước code; WordPress/plugin giữ nguồn sự thật cho store/account. Cách đặt/nhận credential phải dùng được với cả fresh store và store cũ có generated secret, không reset tài khoản khi retry.
 
 **Done khi:** fresh setup từ form thật tạo đúng store/account; validation, quay lại sửa, double-submit và interruption/relaunch được nghiệm thu; tài khoản đăng nhập được qua auth hiện có của WordPress/CoffeePOS trên trình duyệt test. Store đã cài bỏ qua fresh wizard, dữ liệu cũ được giữ; secret không lọt vào logs/URL/draft storage. Tích hợp nút mở bán hàng thuộc 5.4.
 
+**Hoàn thành Windows-first 2026-09-18:** fresh Tauri wizard chấp nhận tên Unicode/HTML-special hợp lệ, validation focus đúng field, save/edit clear password khỏi form và không dùng URL/localStorage/sessionStorage. Native dùng pending-secret transaction + Windows DPAPI, khóa profile khi provisioning bắt đầu và copy initial password thẳng vào Windows clipboard mà IPC không trả plaintext. Real staged E2E tạo custom administrator, verify WordPress canonical blogname, CoffeePOS raw semantic store name/health và đăng nhập POS thật; journal-boundary recovery, partial-WordPress blocker và legacy full-idempotency đều pass. Native Tauri acceptance chứng minh double-submit chỉ tạo một provisioning prepare request, Complete → Home hiển thị đúng store, clipboard khớp credential test, DPAPI blob không đổi qua provision/relaunch và relaunch không auto-start runtime. Runtime stop/restart cũng được harden để reap child sau terminate timeout và không bỏ sót cron. Xem [PHASE-05.2.md](PHASE-05.2.md).
+
 ### Phase 5.3 — Trang chính và cài đặt ứng dụng
 
 **Scope:** tên cửa hàng, trạng thái dễ hiểu, hành động theo native state; cài đặt thuộc Desktop với save/error feedback. Tách thông tin kỹ thuật khỏi trang chính. Khi chưa có opener 5.4, chỉ hiển thị hệ thống sẵn sàng và chức năng thực sự có.
 
 **Done khi:** nghiệm thu installed/stopped/starting/healthy/error/stopping; health stale bị loại sau failure; Start/Retry có kết quả thật và không reinstall. Người dùng tìm được cài đặt/chẩn đoán mà không phải hiểu PHP/database. Không nhân bản dashboard hoặc settings nghiệp vụ POS.
+
+**Đã triển khai 2026-09-18, chờ manual acceptance:** Home có primary action theo native runtime/health state, transition busy chặn submit trùng và health Retry chỉ recheck WordPress/CoffeePOS mà không gọi provisioning. Settings thêm preference Desktop-only `startup_view` (`home`/`settings`/`diagnostics`) với atomic config persistence và default tương thích config schema 1 cũ. `git diff --check`, UI typecheck/build, Rust fmt check và 9 focused config tests đều pass; staged E2E/native interaction dài được bỏ theo yêu cầu kiểm thử gọn và để người dùng smoke-test. Xem [PHASE-05.3.md](PHASE-05.3.md).
 
 ### Phase 5.4 — Mở POS và đăng nhập
 
@@ -306,4 +315,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.12 đã pass Windows-first. Mốc tiếp theo là **Phase 5.1 — Khung giao diện và điều hướng**; giữ recovery flow 4.12 hoạt động trong khi tách setup khỏi khu vực cửa hàng đã cài và chuyển technical controls sang Chẩn đoán.
+Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3** đã triển khai và pass lightweight automated validation, còn manual acceptance. Sau khi acceptance 5.3 đạt, mốc implementation tiếp theo là **Phase 5.4 — Mở POS và đăng nhập**.

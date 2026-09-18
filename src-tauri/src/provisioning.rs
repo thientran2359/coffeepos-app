@@ -20,9 +20,9 @@ const LOOPBACK: &str = "127.0.0.1";
 const PROVISIONING_SCHEMA_VERSION: u32 = 1;
 const WORDPRESS_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const DATABASE_BOOTSTRAP_SECRET: &str = "config/database-bootstrap.secret";
-const WORDPRESS_ADMIN_SECRET: &str = "config/wordpress-admin.secret";
-const WORDPRESS_ADMIN_USER: &str = "coffeepos_admin";
-const WORDPRESS_ADMIN_EMAIL: &str = "admin@coffeepos.local";
+pub const WORDPRESS_ADMIN_SECRET: &str = "config/wordpress-admin.secret";
+pub const WORDPRESS_ADMIN_USER: &str = "coffeepos_admin";
+pub const WORDPRESS_ADMIN_EMAIL: &str = "admin@coffeepos.local";
 const MANAGED_CONFIG_MARKER: &str = "CoffeePOS Desktop managed configuration";
 const MANAGED_ROUTER_MARKER: &str = "CoffeePOS Desktop managed router";
 const MANAGED_MU_PLUGIN_MARKER: &str = "CoffeePOS Desktop managed uploads bridge";
@@ -290,6 +290,8 @@ pub struct Provisioner {
     coffeepos: ResolvedCoffeePos,
     data_root: PathBuf,
     containment: ProcessContainment,
+    admin_username: String,
+    admin_email: String,
     #[cfg(test)]
     failure_after: Option<ProvisioningBoundary>,
 }
@@ -341,9 +343,42 @@ impl Provisioner {
             coffeepos,
             data_root,
             containment: ProcessContainment::new()?,
+            admin_username: WORDPRESS_ADMIN_USER.into(),
+            admin_email: WORDPRESS_ADMIN_EMAIL.into(),
             #[cfg(test)]
             failure_after: None,
         })
+    }
+
+    pub fn configure_initial_admin(
+        &mut self,
+        admin_username: &str,
+        admin_email: &str,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let admin_username = admin_username.trim();
+        let admin_email = admin_email.trim();
+        if admin_username.is_empty() || admin_email.is_empty() {
+            return Err(provisioning_error(
+                "configure initial administrator",
+                "Initial administrator username and email are required.",
+                "Return to setup, enter the administrator account details, then retry.",
+            ));
+        }
+        if let Some(journal) = self.load_journal()? {
+            if journal.admin_username != admin_username {
+                return Err(provisioning_error(
+                    "configure initial administrator",
+                    format!(
+                        "Provisioning already started with administrator '{}'; refusing to replace it with '{}'.",
+                        journal.admin_username, admin_username
+                    ),
+                    "Continue setup with the existing administrator. CoffeePOS Desktop will not reset an account after provisioning has started.",
+                ));
+            }
+        }
+        self.admin_username = admin_username.into();
+        self.admin_email = admin_email.into();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -469,7 +504,7 @@ impl Provisioner {
                 woocommerce_active: true,
                 coffeepos_version: self.coffeepos.version.clone(),
                 coffeepos_active: true,
-                admin_username: Some(WORDPRESS_ADMIN_USER.into()),
+                admin_username: journal.as_ref().map(|value| value.admin_username.clone()),
                 can_retry: false,
                 last_error: None,
             };
@@ -551,7 +586,7 @@ impl Provisioner {
             woocommerce_active: false,
             coffeepos_version: self.coffeepos.version.clone(),
             coffeepos_active: false,
-            admin_username: Some(WORDPRESS_ADMIN_USER.into()),
+            admin_username: Some(self.admin_username.clone()),
             can_retry: false,
             last_error: None,
         }
@@ -578,7 +613,7 @@ impl Provisioner {
             woocommerce_active: false,
             coffeepos_version: self.coffeepos.version.clone(),
             coffeepos_active: false,
-            admin_username: Some(WORDPRESS_ADMIN_USER.into()),
+            admin_username: Some(self.admin_username.clone()),
             can_retry: false,
             last_error: None,
         })
@@ -649,9 +684,17 @@ impl Provisioner {
             .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
             .env("COFFEEPOS_SITE_ROOT", self.data_root.join("site"))
             .env("COFFEEPOS_STORE_NAME", store_name)
-            .env("COFFEEPOS_ADMIN_USER", WORDPRESS_ADMIN_USER)
-            .env("COFFEEPOS_ADMIN_EMAIL", WORDPRESS_ADMIN_EMAIL)
+            .env("COFFEEPOS_ADMIN_USER", &self.admin_username)
+            .env("COFFEEPOS_ADMIN_EMAIL", &self.admin_email)
             .env("COFFEEPOS_ADMIN_PASSWORD", admin_password)
+            .env(
+                "COFFEEPOS_VERIFY_INITIAL_SETUP",
+                if wordpress_already_installed {
+                    "0"
+                } else {
+                    "1"
+                },
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -699,7 +742,7 @@ impl Provisioner {
         self.interruption_checkpoint(ProvisioningBoundary::CoffeePosProvisioned)?;
         self.persist_stage(ProvisioningStage::CoffeePosProvisioned)?;
         self.log_event("coffeepos plugin provisioned");
-        self.activate_coffeepos(runtime_info)?;
+        self.activate_coffeepos(runtime_info, store_name)?;
         self.interruption_checkpoint(ProvisioningBoundary::CoffeePosActivated)?;
         self.persist_stage(ProvisioningStage::CoffeePosActivated)?;
         self.log_event("coffeepos plugin activated and verified");
@@ -715,7 +758,7 @@ impl Provisioner {
             woocommerce_active: true,
             coffeepos_version: self.coffeepos.version.clone(),
             coffeepos_active: true,
-            admin_username: Some(WORDPRESS_ADMIN_USER.into()),
+            admin_username: Some(self.admin_username.clone()),
             can_retry: false,
             last_error: None,
         })
@@ -812,7 +855,11 @@ impl Provisioner {
         Ok(())
     }
 
-    fn activate_coffeepos(&self, runtime_info: &RuntimeInfo) -> Result<(), RuntimeErrorInfo> {
+    fn activate_coffeepos(
+        &self,
+        runtime_info: &RuntimeInfo,
+        store_name: &str,
+    ) -> Result<(), RuntimeErrorInfo> {
         let database_port = runtime_info.database_port.ok_or_else(|| {
             provisioning_error(
                 "activate CoffeePOS",
@@ -871,6 +918,8 @@ impl Provisioner {
             .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
             .env("COFFEEPOS_SITE_ROOT", self.data_root.join("site"))
             .env("COFFEEPOS_EXPECTED_VERSION", &self.coffeepos.version)
+            .env("COFFEEPOS_INITIAL_STORE_NAME", store_name)
+            .env("COFFEEPOS_INITIAL_ADMIN_USER", &self.admin_username)
             .env(
                 "COFFEEPOS_EXPECTED_WOOCOMMERCE_VERSION",
                 &self.woocommerce.version,
@@ -2342,7 +2391,10 @@ require_once ABSPATH . 'wp-settings.php';\n",
             coffeepos_version: (stage >= ProvisioningStage::CoffeePosProvisioned)
                 .then(|| self.coffeepos.version.clone()),
             stage,
-            admin_username: WORDPRESS_ADMIN_USER.into(),
+            admin_username: existing
+                .as_ref()
+                .map(|value| value.admin_username.clone())
+                .unwrap_or_else(|| self.admin_username.clone()),
             recovery_blocker: existing.and_then(|value| value.recovery_blocker),
         };
         self.persist_journal(&journal)
@@ -3930,6 +3982,7 @@ $storeName = getenv('COFFEEPOS_STORE_NAME');
 $adminUser = getenv('COFFEEPOS_ADMIN_USER');
 $adminEmail = getenv('COFFEEPOS_ADMIN_EMAIL');
 $adminPassword = getenv('COFFEEPOS_ADMIN_PASSWORD');
+$verifyInitialSetup = getenv('COFFEEPOS_VERIFY_INITIAL_SETUP') === '1';
 
 if (!$siteRoot || !$storeName || !$adminUser || !$adminEmail || !$adminPassword) {
     fwrite(STDERR, "CoffeePOS WordPress bootstrap environment is incomplete.\n");
@@ -3978,6 +4031,27 @@ if (!$installed) {
         }
         $user = new WP_User($userId);
         $user->set_role('administrator');
+    }
+}
+
+if ($verifyInitialSetup) {
+    $createdAdmin = get_user_by('login', $adminUser);
+    if (!$createdAdmin || strcasecmp((string) $createdAdmin->user_email, $adminEmail) !== 0) {
+        fwrite(STDERR, "CoffeePOS initial administrator identity verification failed.\n");
+        exit(8);
+    }
+    if (!in_array('administrator', (array) $createdAdmin->roles, true)) {
+        fwrite(STDERR, "CoffeePOS initial administrator role verification failed.\n");
+        exit(9);
+    }
+    if (!wp_check_password($adminPassword, (string) $createdAdmin->user_pass, (int) $createdAdmin->ID)) {
+        fwrite(STDERR, "CoffeePOS initial administrator password verification failed.\n");
+        exit(10);
+    }
+    $expectedBlogName = (string) sanitize_option('blogname', $storeName);
+    if ((string) get_option('blogname', '') !== $expectedBlogName) {
+        fwrite(STDERR, "CoffeePOS initial WordPress store name verification failed.\n");
+        exit(11);
     }
 }
 
@@ -4144,9 +4218,11 @@ declare(strict_types=1);
 $siteRoot = getenv('COFFEEPOS_SITE_ROOT');
 $expectedVersion = getenv('COFFEEPOS_EXPECTED_VERSION');
 $expectedWooCommerceVersion = getenv('COFFEEPOS_EXPECTED_WOOCOMMERCE_VERSION');
+$initialStoreName = getenv('COFFEEPOS_INITIAL_STORE_NAME');
+$initialAdminUser = getenv('COFFEEPOS_INITIAL_ADMIN_USER');
 $applyBaseline = getenv('COFFEEPOS_APPLY_ACTIVATION_BASELINE') === '1';
 
-if (!$siteRoot || !$expectedVersion || !$expectedWooCommerceVersion) {
+if (!$siteRoot || !$expectedVersion || !$expectedWooCommerceVersion || !$initialStoreName || !$initialAdminUser) {
     fwrite(STDERR, "CoffeePOS activation environment is incomplete.\n");
     exit(2);
 }
@@ -4207,6 +4283,26 @@ if (!class_exists('\\CoffeePOS\\Core\\Lifecycle')) {
 }
 if ($wasActive && $applyBaseline) {
     \CoffeePOS\Core\Lifecycle::activate();
+}
+if ($applyBaseline) {
+    if (!class_exists('\\CoffeePOS\\Infrastructure\\Settings\\Settings')) {
+        fwrite(STDERR, "CoffeePOS settings service is unavailable after activation.\n");
+        exit(12);
+    }
+    $initialAdmin = get_user_by('login', $initialAdminUser);
+    if (!$initialAdmin) {
+        fwrite(STDERR, "Initial CoffeePOS administrator is unavailable after activation.\n");
+        exit(13);
+    }
+    wp_set_current_user((int) $initialAdmin->ID);
+    \CoffeePOS\Infrastructure\Settings\Settings::update(
+        \CoffeePOS\Infrastructure\Settings\Settings::OPTION_STORE_NAME,
+        $initialStoreName
+    );
+    if (\CoffeePOS\Infrastructure\Settings\Settings::getStoreName() !== sanitize_text_field($initialStoreName)) {
+        fwrite(STDERR, "CoffeePOS initial store name verification failed.\n");
+        exit(14);
+    }
 }
 
 fwrite(STDOUT, "CoffeePOS {$expectedVersion} activation lifecycle completed.\n");
@@ -4732,6 +4828,128 @@ mod tests {
             }
         }
         String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[cfg(windows)]
+    fn form_encode(value: &str) -> String {
+        let mut encoded = String::new();
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                encoded.push(char::from(byte));
+            } else if byte == b' ' {
+                encoded.push('+');
+            } else {
+                use std::fmt::Write as _;
+                write!(&mut encoded, "%{byte:02X}").unwrap();
+            }
+        }
+        encoded
+    }
+
+    #[cfg(windows)]
+    fn http_post_form(port: u16, path: &str, fields: &[(&str, &str)]) -> String {
+        let body = fields
+            .iter()
+            .map(|(name, value)| format!("{}={}", form_encode(name), form_encode(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut stream = std::net::TcpStream::connect((LOOPBACK, port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let request = format!(
+            "POST {path} HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        while response.len() < 2 * 1024 * 1024 {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => response.extend_from_slice(&chunk[..count]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("HTTP acceptance POST read failed: {error}"),
+            }
+        }
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[cfg(windows)]
+    fn html_input_value(html: &str, input_name: &str) -> Option<String> {
+        let marker = format!("name=\"{input_name}\"");
+        let offset = html.find(&marker)?;
+        let remainder = &html[offset..];
+        let value_offset = remainder.find("value=\"")? + "value=\"".len();
+        let value = &remainder[value_offset..];
+        let end = value.find('"')?;
+        Some(value[..end].to_string())
+    }
+
+    #[cfg(windows)]
+    fn response_cookies(response: &str) -> String {
+        response
+            .lines()
+            .filter_map(|line| {
+                let value = line.strip_prefix("Set-Cookie: ")?;
+                value.split(';').next().map(str::to_owned)
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    #[cfg(windows)]
+    fn response_location(response: &str) -> Option<String> {
+        response.lines().find_map(|line| {
+            line.strip_prefix("Location: ")
+                .map(|value| value.trim().to_string())
+        })
+    }
+
+    #[cfg(windows)]
+    fn assert_text_files_do_not_contain(root: &Path, secret_value: &str) {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                for entry in fs::read_dir(&path).unwrap().flatten() {
+                    stack.push(entry.path());
+                }
+                continue;
+            }
+            if metadata.len() > 2 * 1024 * 1024 {
+                continue;
+            }
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let text_like = matches!(
+                extension.as_str(),
+                "json" | "log" | "txt" | "php" | "ini" | "conf" | "html" | "css" | "js"
+            );
+            if !text_like {
+                continue;
+            }
+            let bytes = fs::read(&path).unwrap();
+            assert!(
+                !bytes
+                    .windows(secret_value.len())
+                    .any(|window| window == secret_value.as_bytes()),
+                "plaintext administrator password leaked into {}",
+                path.display()
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -5802,6 +6020,190 @@ mod tests {
     #[cfg(windows)]
     #[test]
     #[ignore = "uses the staged real PHP/MariaDB/WordPress development runtime"]
+    fn staged_runtime_phase_5_2_fresh_onboarding_login_and_secret_hygiene() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let project_root = manifest_dir.parent().unwrap().to_path_buf();
+        let runtime_manifest =
+            project_root.join("runtime/development/x86_64-pc-windows-msvc/manifest.json");
+        let runtime = resolve_development_manifest(&project_root, &runtime_manifest).unwrap();
+
+        let e2e_root = manifest_dir.join("target/phase5-2-e2e");
+        fs::create_dir_all(&e2e_root).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("onboarding-")
+            .tempdir_in(&e2e_root)
+            .unwrap();
+        let data_root = temp.path().join("store");
+
+        let store_name = "Coffee & \"Co\" Café 5.2";
+        let admin_username = "owner_52";
+        let admin_email = "owner52@example.com";
+        let admin_password = "Phase52SecurePassword2026";
+
+        let mut config_store = crate::config::Store::open(data_root.clone()).unwrap();
+        config_store
+            .save_setup_profile(store_name, admin_username, admin_email)
+            .unwrap();
+        secret::store_password(&data_root.join(WORDPRESS_ADMIN_SECRET), admin_password).unwrap();
+        let app_config = fs::read_to_string(data_root.join("config/app.json")).unwrap();
+        let parsed_config: crate::config::AppConfig = serde_json::from_str(&app_config).unwrap();
+        assert_eq!(parsed_config.store_name, store_name);
+        assert_eq!(
+            parsed_config.setup_admin_username.as_deref(),
+            Some(admin_username)
+        );
+        assert_eq!(
+            parsed_config.setup_admin_email.as_deref(),
+            Some(admin_email)
+        );
+        assert!(!app_config.contains(admin_password));
+        drop(config_store);
+
+        let protected_password = fs::read(data_root.join(WORDPRESS_ADMIN_SECRET)).unwrap();
+        assert!(!protected_password
+            .windows(admin_password.len())
+            .any(|window| window == admin_password.as_bytes()));
+
+        let mut provisioner = Provisioner::from_development(
+            &project_root,
+            &runtime_manifest,
+            runtime.clone(),
+            data_root.clone(),
+        )
+        .unwrap();
+        provisioner
+            .configure_initial_admin(admin_username, admin_email)
+            .unwrap();
+        assert_eq!(provisioner.inspect().state, ProvisioningState::NotInstalled);
+        provisioner.prepare().unwrap();
+
+        let mut manager = RuntimeManager::new(runtime, data_root.clone()).unwrap();
+        let running = manager.start().unwrap();
+        let installed = provisioner
+            .install_wordpress(store_name, &running)
+            .unwrap_or_else(|error| {
+                let provisioning_log = fs::read_to_string(data_root.join("logs/provisioning.log"))
+                    .unwrap_or_else(|read_error| {
+                        format!("<cannot read provisioning.log: {read_error}>")
+                    });
+                panic!(
+                    "Phase 5.2 onboarding provisioning failed: {error}\n--- provisioning.log ---\n{provisioning_log}"
+                )
+            });
+        assert_eq!(installed.state, ProvisioningState::Ready);
+        assert_eq!(installed.admin_username.as_deref(), Some(admin_username));
+        let journal = provisioner.load_journal().unwrap().unwrap();
+        assert_eq!(journal.admin_username, admin_username);
+        assert_eq!(journal.stage, ProvisioningStage::MachineHealthBootstrapped);
+
+        let database_port = running.database_port.unwrap();
+        assert_eq!(
+            query_wordpress_option(&provisioner, database_port, "blogname"),
+            "Coffee &amp; &quot;Co&quot; Café 5.2"
+        );
+        assert_eq!(
+            query_wordpress_option(&provisioner, database_port, "coffeepos_store_name"),
+            store_name
+        );
+        assert_eq!(
+            query_database_scalar(
+                &provisioner,
+                database_port,
+                &format!(
+                    "SELECT user_email FROM wp_users WHERE user_login = '{}' LIMIT 1",
+                    sql_literal(admin_username)
+                ),
+            ),
+            admin_email
+        );
+        assert_eq!(
+            secret::load(&data_root.join(WORDPRESS_ADMIN_SECRET)).unwrap(),
+            admin_password
+        );
+
+        let healthy = manager.refresh_wordpress_health();
+        assert_eq!(healthy.wordpress_health, WordPressHealthState::Healthy);
+        assert_eq!(
+            healthy.coffeepos_health.state,
+            CoffeePosHealthState::Healthy
+        );
+        assert_eq!(
+            healthy
+                .coffeepos_health
+                .payload
+                .as_ref()
+                .unwrap()
+                .store
+                .name,
+            store_name
+        );
+        let http_port = healthy.http_port.unwrap();
+        let login_page = http_get(http_port, "/pos/");
+        assert!(
+            login_page.starts_with("HTTP/1.0 200 ") || login_page.starts_with("HTTP/1.1 200 "),
+            "CoffeePOS login page did not return HTTP 200"
+        );
+        let nonce = html_input_value(&login_page, "coffeepos_nonce")
+            .expect("CoffeePOS login form did not contain a nonce");
+        let login_response = http_post_form(
+            http_port,
+            "/pos/",
+            &[
+                ("coffeepos_nonce", nonce.as_str()),
+                ("log", admin_username),
+                ("pwd", admin_password),
+                ("rememberme", "1"),
+            ],
+        );
+        assert!(
+            login_response.starts_with("HTTP/1.0 302 ")
+                || login_response.starts_with("HTTP/1.1 302 "),
+            "CoffeePOS login did not redirect after valid onboarding credentials"
+        );
+        let cookies = response_cookies(&login_response);
+        assert!(
+            cookies.contains("wordpress_logged_in_"),
+            "CoffeePOS login did not issue a WordPress logged-in cookie"
+        );
+        let location = response_location(&login_response)
+            .expect("CoffeePOS login did not include a redirect location");
+        let origin = format!("http://{LOOPBACK}:{http_port}");
+        assert!(
+            location.starts_with(&origin),
+            "CoffeePOS login redirected outside the managed origin: {location}"
+        );
+        let target_path = location.strip_prefix(&origin).unwrap_or("/pos/");
+        let authenticated =
+            http_get_with_headers(http_port, target_path, &[("Cookie", cookies.as_str())]);
+        assert!(
+            authenticated.starts_with("HTTP/1.0 200 ")
+                || authenticated.starts_with("HTTP/1.1 200 "),
+            "Authenticated CoffeePOS landing page did not return HTTP 200"
+        );
+        assert!(
+            !authenticated.contains("data-component=\"staff-login-form\""),
+            "Authenticated CoffeePOS request returned the login form"
+        );
+
+        assert_text_files_do_not_contain(&data_root.join("config"), admin_password);
+        assert_text_files_do_not_contain(&data_root.join("logs"), admin_password);
+        assert_text_files_do_not_contain(&data_root.join("site"), admin_password);
+
+        let stopped = manager.stop().unwrap();
+        assert_eq!(stopped.state, RuntimeState::Stopped);
+        assert!(stopped.database_pid.is_none());
+        assert!(stopped.php_pid.is_none());
+        drop(manager);
+        drop(provisioner);
+        temp.close().unwrap();
+        if fs::read_dir(&e2e_root).unwrap().next().is_none() {
+            fs::remove_dir(&e2e_root).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "uses the staged real PHP/MariaDB/WordPress development runtime"]
     fn staged_runtime_recovers_across_first_run_journal_boundaries() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let project_root = manifest_dir.parent().unwrap().to_path_buf();
@@ -5818,14 +6220,37 @@ mod tests {
         let data_root = temp.path().join("store");
         fs::create_dir_all(&data_root).unwrap();
 
+        let recovery_store_name = "CoffeePOS Phase 5.2 Recovery";
+        let recovery_admin_username = "recovery_owner_52";
+        let recovery_admin_email = "recovery52@example.com";
+        let recovery_admin_password = "Phase52RecoveryPassword2026";
+        let mut config_store = crate::config::Store::open(data_root.clone()).unwrap();
+        config_store
+            .save_setup_profile(
+                recovery_store_name,
+                recovery_admin_username,
+                recovery_admin_email,
+            )
+            .unwrap();
+        secret::store_password(
+            &data_root.join(WORDPRESS_ADMIN_SECRET),
+            recovery_admin_password,
+        )
+        .unwrap();
+        drop(config_store);
+
         let make_provisioner = || {
-            Provisioner::from_development(
+            let mut provisioner = Provisioner::from_development(
                 &project_root,
                 &runtime_manifest,
                 runtime.clone(),
                 data_root.clone(),
             )
-            .unwrap()
+            .unwrap();
+            provisioner
+                .configure_initial_admin(recovery_admin_username, recovery_admin_email)
+                .unwrap();
+            provisioner
         };
 
         let mut provisioner = make_provisioner();
@@ -5849,6 +6274,10 @@ mod tests {
         assert_eq!(
             provisioner.load_journal().unwrap().unwrap().stage,
             ProvisioningStage::DatabaseReady
+        );
+        assert_eq!(
+            provisioner.load_journal().unwrap().unwrap().admin_username,
+            recovery_admin_username
         );
         assert!(provisioner.inspect().can_retry);
         drop(provisioner);
@@ -5889,7 +6318,7 @@ mod tests {
             let running = manager.start().unwrap();
             provisioner.fail_after_for_test(boundary);
             let error = provisioner
-                .install_wordpress("CoffeePOS Phase 4.12 Recovery", &running)
+                .install_wordpress(recovery_store_name, &running)
                 .unwrap_err();
             assert_eq!(error.operation, "simulate provisioning interruption");
             assert_eq!(
@@ -5899,6 +6328,48 @@ mod tests {
             let inspect = provisioner.inspect();
             assert_eq!(inspect.state, ProvisioningState::NeedsRepair);
             assert!(inspect.can_retry);
+
+            if boundary == ProvisioningBoundary::WordPressInstalled {
+                let database_port = running.database_port.unwrap();
+                let database_password =
+                    secret::load(&data_root.join(DATABASE_WORDPRESS_SECRET)).unwrap();
+                let endpoint = DatabaseEndpoint::Tcp(database_port);
+                provisioner
+                    .run_database_sql(
+                        &endpoint,
+                        DATABASE_WORDPRESS_USER,
+                        &database_password,
+                        &format!(
+                            "UPDATE coffeepos.wp_users SET user_email = 'tampered@example.com' WHERE user_login = '{}';\n",
+                            sql_literal(recovery_admin_username)
+                        ),
+                    )
+                    .unwrap();
+
+                let mut retry_provisioner = make_provisioner();
+                let retry_error = retry_provisioner
+                    .install_wordpress(recovery_store_name, &running)
+                    .unwrap_err();
+                assert_eq!(retry_error.operation, "install WordPress");
+                assert_eq!(
+                    retry_provisioner.load_journal().unwrap().unwrap().stage,
+                    ProvisioningStage::SiteReady
+                );
+                drop(retry_provisioner);
+
+                provisioner
+                    .run_database_sql(
+                        &endpoint,
+                        DATABASE_WORDPRESS_USER,
+                        &database_password,
+                        &format!(
+                            "UPDATE coffeepos.wp_users SET user_email = '{}' WHERE user_login = '{}';\n",
+                            sql_literal(recovery_admin_email),
+                            sql_literal(recovery_admin_username)
+                        ),
+                    )
+                    .unwrap();
+            }
 
             if data_root.join(WORDPRESS_ADMIN_SECRET).is_file() {
                 let current = secret::load(&data_root.join(WORDPRESS_ADMIN_SECRET)).unwrap();
@@ -5928,11 +6399,15 @@ mod tests {
         let mut manager = RuntimeManager::new(runtime, data_root.clone()).unwrap();
         let running = manager.start().unwrap();
         let ready = provisioner
-            .install_wordpress("CoffeePOS Phase 4.12 Recovery", &running)
+            .install_wordpress(recovery_store_name, &running)
             .unwrap();
         assert_eq!(ready.state, ProvisioningState::Ready);
         assert!(ready.woocommerce_active);
         assert!(ready.coffeepos_active);
+        assert_eq!(
+            ready.admin_username.as_deref(),
+            Some(recovery_admin_username)
+        );
         assert_eq!(
             provisioner.load_journal().unwrap().unwrap().stage,
             ProvisioningStage::MachineHealthBootstrapped
@@ -5947,13 +6422,29 @@ mod tests {
         );
         assert_eq!(
             secret::load(&data_root.join(WORDPRESS_ADMIN_SECRET)).unwrap(),
-            wordpress_admin_secret.unwrap()
+            recovery_admin_password
         );
+        assert_eq!(wordpress_admin_secret.unwrap(), recovery_admin_password);
         assert_eq!(
             secret::load(&data_root.join(MACHINE_TOKEN_SECRET)).unwrap(),
             machine_token.unwrap()
         );
         assert_eq!(provisioner.inspect().state, ProvisioningState::Ready);
+        let final_health = manager.refresh_wordpress_health();
+        assert_eq!(
+            final_health.coffeepos_health.state,
+            CoffeePosHealthState::Healthy
+        );
+        assert_eq!(
+            final_health
+                .coffeepos_health
+                .payload
+                .as_ref()
+                .unwrap()
+                .store
+                .name,
+            recovery_store_name
+        );
 
         manager.stop().unwrap();
         drop(manager);

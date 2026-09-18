@@ -1,6 +1,6 @@
 # CoffeePOS Desktop — Đặc tả UI/UX
 
-Ngày cập nhật: 2026-09-18. Đây là đặc tả trải nghiệm cần triển khai, không phải bằng chứng UI đã hoàn thành. Phase 1–4.11 giữ nguyên kết quả kỹ thuật đã nghiệm thu. Scope, thứ tự và trạng thái phase do [ROADMAP.md](ROADMAP.md) quản lý.
+Ngày cập nhật: 2026-09-18. Đây là đặc tả trải nghiệm; bằng chứng triển khai nằm trong tài liệu từng phase. Phase 1–4.12 giữ nguyên kết quả kỹ thuật đã nghiệm thu; Phase 5.1 shell/navigation và Phase 5.2 store/account onboarding đã hoàn thành Windows-first. Phase 5.3 Home/app settings đã triển khai và pass lightweight automated checks, còn manual acceptance do người dùng thực hiện. Scope, thứ tự và trạng thái phase do [ROADMAP.md](ROADMAP.md) quản lý.
 
 ## 1. Mục tiêu
 
@@ -31,7 +31,7 @@ Chào mừng → Thông tin cửa hàng/tài khoản → Cài đặt
          → Tiến trình thật → Hoàn tất → Trang chính → Mở bán hàng
 ```
 
-Phase 4.12 chỉ hoàn thiện tiến trình/recovery trên input setup hiện có; form tài khoản và trải nghiệm đầy đủ thuộc 5.2. Không kéo toàn bộ onboarding vào phase recovery.
+Phase 4.12 hoàn thiện tiến trình/recovery trên input setup cũ; Phase 5.2 đã bổ sung form tài khoản, review/complete, protected user-set credential và nghiệm thu fresh flow đầy đủ. Không kéo các hành vi Phase 5.4 như mở POS vào onboarding.
 
 Màn hình tiến trình lấy trạng thái từ native. Nếu chưa có sự kiện từng bước, dùng trạng thái tổng quát có thật; không chạy thanh phần trăm theo timer. Sau thành công, nói rõ cửa hàng đã cài xong; chỉ nói hệ thống sẵn sàng khi live application health đạt.
 

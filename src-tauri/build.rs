@@ -2,11 +2,15 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "get_shell_info",
-            "save_store_name",
+            "save_app_settings",
+            "get_setup_info",
+            "save_setup_profile",
+            "copy_admin_password",
             "get_runtime_info",
             "start_runtime",
             "stop_runtime",
             "restart_runtime",
+            "retry_runtime_health",
             "open_wordpress",
             "get_provisioning_info",
             "provision_wordpress",

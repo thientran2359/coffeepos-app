@@ -190,6 +190,30 @@ pub fn create(path: &Path) -> Result<String, String> {
     Ok(password)
 }
 
+#[cfg(debug_assertions)]
+pub fn store_password(path: &Path, password: &str) -> Result<(), String> {
+    if password.is_empty() {
+        return Err("Password cannot be empty.".into());
+    }
+    store(path, password, "WordPress administrator credential")
+}
+
+#[cfg(debug_assertions)]
+pub fn promote_staged_password(staged_path: &Path, active_path: &Path) -> Result<(), String> {
+    let password = load(staged_path).map_err(|error| {
+        format!("Cannot read staged WordPress administrator credential: {error}")
+    })?;
+    store_password(active_path, &password)?;
+    let verified = load(active_path)?;
+    if verified != password {
+        return Err("Protected WordPress administrator credential verification failed after promotion. The staged credential has been preserved and provisioning is blocked.".into());
+    }
+    fs::remove_file(staged_path).map_err(|error| {
+        format!("Cannot remove staged WordPress administrator credential after promotion: {error}. Provisioning remains blocked until setup is saved again.")
+    })?;
+    Ok(())
+}
+
 pub fn create_machine_token(path: &Path) -> Result<String, String> {
     if path.exists() {
         let token = load(path)?;
@@ -249,5 +273,41 @@ mod tests {
         assert!(!protected
             .windows(first.len())
             .any(|window| window == first.as_bytes()));
+    }
+
+    #[test]
+    fn user_supplied_password_round_trip_is_protected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wordpress-admin.secret");
+        let password = "Phase52SecurePassword2026";
+        store_password(&path, password).unwrap();
+        assert_eq!(load(&path).unwrap(), password);
+        let protected = fs::read(path).unwrap();
+        assert!(!protected
+            .windows(password.len())
+            .any(|window| window == password.as_bytes()));
+    }
+
+    #[test]
+    fn staged_password_promotion_replaces_active_and_cleans_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("wordpress-admin.secret");
+        let pending = temp.path().join("wordpress-admin.pending.secret");
+        store_password(&active, "Phase52OldPassword2026").unwrap();
+        store_password(&pending, "Phase52NewPassword2026").unwrap();
+        promote_staged_password(&pending, &active).unwrap();
+        assert_eq!(load(&active).unwrap(), "Phase52NewPassword2026");
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn staged_password_replacement_keeps_pending_marker_and_latest_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let pending = temp.path().join("wordpress-admin.pending.secret");
+        store_password(&pending, "FirstPendingPassword2026").unwrap();
+        assert!(pending.exists());
+        store_password(&pending, "ReplacementPassword2026").unwrap();
+        assert!(pending.exists());
+        assert_eq!(load(&pending).unwrap(), "ReplacementPassword2026");
     }
 }

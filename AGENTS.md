@@ -914,7 +914,10 @@ Current Windows-first status:
 - Phase 4.10 — CoffeePOS health endpoint: complete Windows-first.
 - Phase 4.11 — Full install idempotency: complete Windows-first.
 - Phase 4.12 — First-run recovery: complete Windows-first.
-- Next milestone: Phase 5.1 — UI shell and navigation.
+- Phase 5.1 — UI shell and navigation: complete Windows-first.
+- Phase 5.2 — Store and account onboarding: complete Windows-first.
+- Phase 5.3 — Home and app settings: implemented; lightweight validation passed, manual Windows acceptance pending.
+- Next implementation milestone after Phase 5.3 acceptance: Phase 5.4 — Open POS and login.
 
 From Phase 4 onward, work is intentionally split into small independently verifiable milestones:
 

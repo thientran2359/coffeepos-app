@@ -258,19 +258,36 @@ impl ManagedChild {
         })
     }
 
-    fn terminate(&mut self, timeout: Duration) -> Result<(), RuntimeErrorInfo> {
+    fn terminate(
+        &mut self,
+        component: &'static str,
+        timeout: Duration,
+    ) -> Result<(), RuntimeErrorInfo> {
         if self.try_wait()?.is_some() {
             return Ok(());
         }
+        let pid = self.id();
         self.child.kill().map_err(|error| {
             error_info(
-                "runtime",
+                component,
                 "terminate process",
-                format!("Cannot terminate child process: {error}."),
+                format!("Cannot terminate managed {component} process {pid}: {error}."),
                 "Close the child process from the operating system, then reopen CoffeePOS Desktop.",
             )
         })?;
-        wait_for_child_exit(&mut self.child, timeout).map(|_| ())
+        wait_for_child_exit(&mut self.child, timeout)
+            .map(|_| ())
+            .map_err(|error| {
+                error_info(
+                    component,
+                    "wait for process",
+                    format!(
+                        "Managed {component} process {pid} did not exit after forced termination: {}",
+                        error.message
+                    ),
+                    error.recovery,
+                )
+            })
     }
 }
 
@@ -383,6 +400,13 @@ impl RuntimeManager {
 
     pub fn refresh(&mut self) -> RuntimeInfo {
         self.refresh_cron_child();
+        if self.state == RuntimeState::Stopping {
+            let database_error = reap_finished_child(&mut self.database, "database");
+            let php_error = reap_finished_child(&mut self.php, "php");
+            if let Some(error) = database_error.or(php_error) {
+                self.last_error = Some(error);
+            }
+        }
         if self.state == RuntimeState::Running {
             let database_exit = child_exit(&mut self.database, "database");
             let php_exit = child_exit(&mut self.php, "php");
@@ -418,7 +442,7 @@ impl RuntimeManager {
                     self.refresh_coffeepos_health();
                 }
             }
-        } else if self.database.is_none() && self.php.is_none() {
+        } else if self.database.is_none() && self.php.is_none() && self.cron.is_none() {
             self.state = if installation_ready(&self.data_root) {
                 RuntimeState::Stopped
             } else {
@@ -680,6 +704,7 @@ impl RuntimeManager {
         if (self.state == RuntimeState::NotInstalled || self.state == RuntimeState::Stopped)
             && self.database.is_none()
             && self.php.is_none()
+            && self.cron.is_none()
         {
             return Ok(self.info());
         }
@@ -700,7 +725,7 @@ impl RuntimeManager {
         let mut failure = None;
 
         if let Some(cron) = self.cron.as_mut() {
-            if let Err(error) = cron.terminate(self.timeouts.stop) {
+            if let Err(error) = cron.terminate("cron", self.timeouts.stop) {
                 failure = Some(error);
             } else {
                 self.cron = None;
@@ -708,7 +733,7 @@ impl RuntimeManager {
         }
 
         if let Some(php) = self.php.as_mut() {
-            if let Err(error) = php.terminate(self.timeouts.stop) {
+            if let Err(error) = php.terminate("php", self.timeouts.stop) {
                 failure = Some(error);
             } else {
                 self.php = None;
@@ -721,7 +746,7 @@ impl RuntimeManager {
             }
         }
         if let Some(database) = self.database.as_mut() {
-            if let Err(error) = database.terminate(self.timeouts.stop) {
+            if let Err(error) = database.terminate("database", self.timeouts.stop) {
                 failure.get_or_insert(error);
             } else {
                 self.database = None;
@@ -735,7 +760,7 @@ impl RuntimeManager {
         if self.php.is_none() {
             self.http_port = None;
         }
-        self.state = if self.database.is_some() || self.php.is_some() {
+        self.state = if self.database.is_some() || self.php.is_some() || self.cron.is_some() {
             RuntimeState::Stopping
         } else if installation_ready(&self.data_root) {
             RuntimeState::Stopped
@@ -780,6 +805,7 @@ impl RuntimeManager {
     }
 
     pub fn restart(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        self.refresh();
         match self.state {
             RuntimeState::Installing | RuntimeState::Starting | RuntimeState::Stopping => {
                 Err(error_info(
@@ -1183,21 +1209,21 @@ impl RuntimeManager {
     fn cleanup_started(&mut self) -> Result<(), RuntimeErrorInfo> {
         let mut failure = None;
         if let Some(cron) = self.cron.as_mut() {
-            if let Err(error) = cron.terminate(self.timeouts.stop) {
+            if let Err(error) = cron.terminate("cron", self.timeouts.stop) {
                 failure = Some(error);
             } else {
                 self.cron = None;
             }
         }
         if let Some(php) = self.php.as_mut() {
-            if let Err(error) = php.terminate(self.timeouts.stop) {
+            if let Err(error) = php.terminate("php", self.timeouts.stop) {
                 failure = Some(error);
             } else {
                 self.php = None;
             }
         }
         if let Some(database) = self.database.as_mut() {
-            if let Err(error) = database.terminate(self.timeouts.stop) {
+            if let Err(error) = database.terminate("database", self.timeouts.stop) {
                 failure.get_or_insert(error);
             } else {
                 self.database = None;
@@ -1755,6 +1781,26 @@ fn child_exit(child: &mut Option<ManagedChild>, component: &str) -> Option<Runti
         )),
         Ok(None) => None,
         Err(error) => Some(error),
+    }
+}
+
+fn reap_finished_child(
+    child: &mut Option<ManagedChild>,
+    component: &str,
+) -> Option<RuntimeErrorInfo> {
+    let status = child.as_mut()?.try_wait();
+    match status {
+        Ok(Some(_)) => {
+            *child = None;
+            None
+        }
+        Ok(None) => None,
+        Err(error) => Some(error_info(
+            component,
+            "inspect stopping process",
+            error.message,
+            error.recovery,
+        )),
     }
 }
 
