@@ -13,7 +13,7 @@ Phase 3 native provisioning hiện thực theo ensure semantics:
 5. Start MariaDB/PHP qua Runtime Manager, chạy WordPress bootstrap để tạo schema và initial administrator, sau đó kiểm tra `/wp-login.php` thật trước khi ghi journal `wordpress_installed`.
 6. Retry giữ nguyên datadir/site đã quản lý, không đổi credential hiện có và từ chối ghi đè site/config không thuộc CoffeePOS Desktop.
 
-Uploads được tách khỏi core mutable tại application-data root. Baseline Phase 3 chỉ chứa WordPress core. UI provisioning thuộc Phase 4.1–4.3; WooCommerce thuộc Phase 4.4–4.6; CoffeePOS thuộc Phase 4.7–4.10; full-stack idempotency/recovery thuộc Phase 4.11–4.12. Xem [ROADMAP.md](ROADMAP.md).
+Uploads được tách khỏi core mutable tại application-data root. Baseline Phase 3 chỉ chứa WordPress core. UI provisioning thuộc Phase 4.1–4.3; WooCommerce thuộc Phase 4.4–4.6; CoffeePOS artifact/provisioning/activation đã hoàn thành ở Phase 4.7–4.9, machine health thuộc Phase 4.10; full-stack idempotency/recovery thuộc Phase 4.11–4.12. Xem [ROADMAP.md](ROADMAP.md).
 
 Validation Windows x64 dùng staged runtime thật:
 
@@ -22,7 +22,13 @@ Validation Windows x64 dùng staged runtime thật:
 cargo test --manifest-path .\src-tauri\Cargo.toml --locked provisioning::tests::staged_runtime_provisions_twice_stops_and_cleans_temp_store -- --ignored
 ```
 
-Test tạo store tạm trong `src-tauri/target/phase3-e2e`, chạy fresh provisioning, start/install/stop, chạy provisioning lần hai, kiểm tra file sentinel vẫn còn và xác nhận PID/port/staging/probe được cleanup trước khi xóa store tạm.
+Test tạo store tạm trong `src-tauri/target/phase3-e2e`, chạy fresh provisioning toàn baseline đến CoffeePOS activation, start/install/stop, chạy provisioning lần hai, kiểm tra WordPress/WooCommerce/CoffeePOS/unrelated-plugin sentinel vẫn còn và xác nhận PID/port/staging/probe được cleanup trước khi xóa store tạm.
+
+Phase 4.8 native provisioning consume `coffeepos-manifest.json` + exact staged CoffeePOS `1.0.0`, preflight compatibility với WordPress `7.1`, PHP `8.4.25`, MariaDB `11.4.13`, WooCommerce `11.1.0`, rồi ensure plugin qua owned `coffeepos.provisioning` và atomic rename. Journal append `coffee_pos_provisioned`; CoffeePOS chưa active ở stage này. Existing Phase 4.6 journal không có `coffeepos_version` vẫn đọc được và chuyển `needs_repair + can_retry` cho tới retry.
+
+Phase 4.9 tiếp tục cùng orchestration path bằng hai bounded pinned-PHP process. Activation process xác minh exact active WooCommerce 11.1.0 rồi gọi WordPress `activate_plugin` cho CoffeePOS 1.0.0; nếu retry sau một partial attempt đã để plugin active nhưng journal còn `coffee_pos_provisioned`, native gọi lại `CoffeePOS\Core\Lifecycle::activate()` để plugin tự đảm bảo defaults/capabilities/migration/rewrite. Fresh verification process sau đó load WordPress từ đầu và chỉ pass khi exact CoffeePOS runtime/autoload có mặt, `Migrator::SCHEMA_VERSION` khớp option và mọi `Schema::tableNames()` tồn tại vật lý, mọi `Settings::optionNames()` đã được seed, CoffeePOS roles/capabilities tồn tại, rewrite version/rules đúng và REST server thật chứa `/coffeepos/v1/health` cùng toàn bộ `RouteRegistrar::registeredRoutes()` của artifact. Native không tạo table/default/capability thay plugin. Journal chỉ chuyển sang `coffee_pos_activated` sau verifier pass; timeout/failure giữ stage provisioned để retry và giữ nguyên dữ liệu.
+
+Pinned CoffeePOS 1.0.0 artifact của Phase 4.9 có schema `0.0.1` và rewrite version `1.0.0:3`. Đây là trạng thái của exact artifact SHA256 đã pin ở Phase 4.7; sibling plugin checkout đang phát triển không được dùng để suy diễn baseline Desktop. Nếu Phase 4.10 thay plugin code/schema để implement machine-health contract thì phải bump version/hash và repin theo gate Phase 4.7.
 
 ## CoffeePOS machine-health contract
 
@@ -64,6 +70,6 @@ Contract schema/token bootstrap/rotation/version/POS route này được chốt 
 ## Các gate tích hợp còn lại
 
 - `ProvisioningInfo.ready` là trạng thái installation; không thay health sau mỗi lần start/restart ở 4.2. Trước khi có endpoint CoffeePOS, kiểm WordPress riêng trong phạm vi đã có.
-- Phase 4.6/4.9 phải kiểm initialization/schema/tasks cần thiết ngoài cờ plugin active. Cách xử lý onboarding và background jobs phải được ghi rõ, không yêu cầu người vận hành tự hoàn tất setup trong wp-admin.
+- Phase 4.6 và 4.9 đã kiểm initialization/schema/plugin-owned baseline ngoài cờ plugin active. Phase 4.10 phải giữ ranh giới này: machine-health đọc trạng thái application thật, không thay activation verifier bằng file/journal metadata.
 - Phase 4.11/4.12 là kiểm chứng tích hợp; từng ensure operation phải an toàn với retry ngay từ lúc triển khai. Cuối 4.12, UI điều phối setup toàn stack và recovery qua journal sau khi app bị đóng giữa chừng.
 - Trước 5.2 chốt UX đặt/nhận credential ban đầu và login thật. Secret được bảo vệ trong native storage không có nghĩa người dùng đã đăng nhập được; machine health auth tách khỏi staff auth. Không reset credential khi restart hoặc retry.

@@ -101,6 +101,48 @@ fn generate_password() -> Result<String, String> {
     Ok(password)
 }
 
+fn generate_hex_secret(byte_len: usize, label: &str) -> Result<String, String> {
+    let mut random = vec![0_u8; byte_len];
+    getrandom::fill(&mut random).map_err(|e| format!("Cannot generate {label}: {e}."))?;
+    let mut value = String::with_capacity(random.len() * 2);
+    for byte in random {
+        use std::fmt::Write as _;
+        write!(&mut value, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(value)
+}
+
+fn store(path: &Path, plaintext: &str, label: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Protected {label} directory is missing."))?;
+    fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "Cannot create protected {label} directory {}: {e}.",
+            parent.display()
+        )
+    })?;
+    let protected = protect(plaintext.as_bytes())?;
+    let mut temporary = NamedTempFile::new_in(parent).map_err(|e| {
+        format!(
+            "Cannot create temporary protected {label} in {}: {e}.",
+            parent.display()
+        )
+    })?;
+    temporary
+        .write_all(&protected)
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|e| format!("Cannot write protected {label}: {e}."))?;
+    temporary.persist(path).map_err(|e| {
+        format!(
+            "Cannot persist protected {label} at {}: {}.",
+            path.display(),
+            e.error
+        )
+    })?;
+    Ok(())
+}
+
 pub fn load(path: &Path) -> Result<String, String> {
     let protected = fs::read(path).map_err(|e| {
         format!(
@@ -148,6 +190,34 @@ pub fn create(path: &Path) -> Result<String, String> {
     Ok(password)
 }
 
+pub fn create_machine_token(path: &Path) -> Result<String, String> {
+    if path.exists() {
+        let token = load(path)?;
+        if token.len() == 64
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Ok(token);
+        }
+        return Err("Protected CoffeePOS machine token has an invalid format.".into());
+    }
+    let token = generate_hex_secret(32, "CoffeePOS machine token")?;
+    store(path, &token, "CoffeePOS machine token")?;
+    Ok(token)
+}
+
+pub fn store_machine_token(path: &Path, token: &str) -> Result<(), String> {
+    if token.len() != 64
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("CoffeePOS machine token has an invalid format.".into());
+    }
+    store(path, token, "CoffeePOS machine token")
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -164,5 +234,20 @@ mod tests {
         assert!(!protected
             .windows(first.len())
             .any(|w| w == first.as_bytes()));
+    }
+
+    #[test]
+    fn protected_machine_token_is_32_random_bytes_as_lowercase_hex() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("machine-token.secret");
+        let first = create_machine_token(&path).unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(first.to_ascii_lowercase(), first);
+        assert_eq!(create_machine_token(&path).unwrap(), first);
+        let protected = fs::read(path).unwrap();
+        assert!(!protected
+            .windows(first.len())
+            .any(|window| window == first.as_bytes()));
     }
 }

@@ -1,8 +1,9 @@
 use crate::runtime::{
-    choose_loopback_port, configure_child_command, run_command_bounded, wait_for_child_exit,
-    ProcessContainment, ResolvedRuntime, RuntimeErrorInfo, RuntimeInfo, DATABASE_NAME,
-    DATABASE_RUNTIME_SECRET, DATABASE_RUNTIME_USER, DATABASE_WORDPRESS_SECRET,
-    DATABASE_WORDPRESS_USER,
+    choose_loopback_port, configure_child_command, probe_coffeepos_health,
+    probe_coffeepos_health_with_token, run_command_bounded, wait_for_child_exit,
+    CoffeePosHealthState, ProcessContainment, ResolvedRuntime, RuntimeErrorInfo, RuntimeInfo,
+    DATABASE_NAME, DATABASE_RUNTIME_SECRET, DATABASE_RUNTIME_USER, DATABASE_WORDPRESS_SECRET,
+    DATABASE_WORDPRESS_USER, MACHINE_TOKEN_PENDING_SECRET, MACHINE_TOKEN_SECRET,
 };
 use crate::secret;
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,25 @@ const MANAGED_MU_PLUGIN_MARKER: &str = "CoffeePOS Desktop managed uploads bridge
 const WOOCOMMERCE_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const WOOCOMMERCE_OWNERSHIP_SCHEMA_VERSION: u32 = 1;
 const WOOCOMMERCE_PLUGIN_SLUG: &str = "woocommerce";
-const WOOCOMMERCE_OWNERSHIP_FILE: &str = ".coffeepos-managed.json";
+const COFFEEPOS_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const COFFEEPOS_OWNERSHIP_SCHEMA_VERSION: u32 = 1;
+const COFFEEPOS_PLUGIN_SLUG: &str = "coffeepos";
+const COFFEEPOS_PHASE_4_9_VERSION: &str = "1.0.0";
+const COFFEEPOS_PHASE_4_9_SHA256: &str =
+    "ee9f241a516e7c6ddddc6e84ad26515d0a9cd9ccd5d6fd101d078a738e598f2a";
+const COFFEEPOS_PHASE_4_10_VERSION: &str = "1.0.1";
+const COFFEEPOS_PHASE_4_10_SHA256: &str =
+    "8f0e7a7c91f1679a05d012da85115934fd47ec25ddfa9a47b1ea989d6aded44a";
+const COFFEEPOS_UPGRADE_BACKUP: &str = "coffeepos.previous";
+const MANAGED_PLUGIN_OWNERSHIP_FILE: &str = ".coffeepos-managed.json";
+const COFFEEPOS_REQUIRED_FILES: [&str; 4] = [
+    "coffeepos.php",
+    "readme.txt",
+    "LICENSE",
+    "vendor/autoload.php",
+];
+const COFFEEPOS_REQUIRED_DIRECTORIES: [&str; 5] =
+    ["assets", "includes", "languages", "templates", "vendor"];
 const WOOCOMMERCE_DB_VERSION: &str = "11.1.0-1";
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -46,6 +65,8 @@ pub struct ProvisioningInfo {
     pub wordpress_version: String,
     pub woocommerce_version: String,
     pub woocommerce_active: bool,
+    pub coffeepos_version: String,
+    pub coffeepos_active: bool,
     pub admin_username: Option<String>,
     pub can_retry: bool,
     pub last_error: Option<RuntimeErrorInfo>,
@@ -129,6 +150,48 @@ struct WooCommerceCompatibilityManifest {
     development_mariadb: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoffeePosDevelopmentManifest {
+    schema_version: u32,
+    target: String,
+    coffeepos: CoffeePosArtifactManifest,
+    compatibility: CoffeePosCompatibilityManifest,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoffeePosArtifactManifest {
+    version: String,
+    archive: String,
+    archive_sha256: String,
+    archive_sha256_source: String,
+    source_kind: String,
+    source_git_commit: String,
+    build_script: String,
+    composer_version: String,
+    build_php_version: String,
+    license: String,
+    requires_plugin: String,
+    plugin_root: PathBuf,
+    entry_file: PathBuf,
+    readme_file: PathBuf,
+    license_file: PathBuf,
+    autoload_file: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoffeePosCompatibilityManifest {
+    minimum_wordpress: String,
+    tested_wordpress: String,
+    minimum_php: String,
+    development_wordpress: String,
+    development_php: String,
+    development_mariadb: String,
+    development_woocommerce: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ResolvedWordPress {
     pub version: String,
@@ -142,6 +205,17 @@ pub struct ResolvedWooCommerce {
     pub archive_sha256: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct ResolvedCoffeePos {
+    pub version: String,
+    pub plugin_root: PathBuf,
+    pub archive_sha256: String,
+    pub required_wordpress_version: String,
+    pub required_php_version: String,
+    pub required_mariadb_version: String,
+    pub required_woocommerce_version: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 enum ProvisioningStage {
@@ -150,6 +224,9 @@ enum ProvisioningStage {
     WordPressInstalled,
     WooCommerceProvisioned,
     WooCommerceActivated,
+    CoffeePosProvisioned,
+    CoffeePosActivated,
+    MachineHealthBootstrapped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -159,6 +236,8 @@ struct ProvisioningJournal {
     wordpress_version: String,
     #[serde(default)]
     woocommerce_version: Option<String>,
+    #[serde(default)]
+    coffeepos_version: Option<String>,
     stage: ProvisioningStage,
     admin_username: String,
 }
@@ -176,6 +255,7 @@ pub struct Provisioner {
     runtime: ResolvedRuntime,
     wordpress: ResolvedWordPress,
     woocommerce: ResolvedWooCommerce,
+    coffeepos: ResolvedCoffeePos,
     data_root: PathBuf,
     containment: ProcessContainment,
 }
@@ -199,10 +279,32 @@ impl Provisioner {
                 "Resolve the application data directory through Tauri before provisioning.",
             ));
         }
+        let wordpress = resolve_development_wordpress(project_root, runtime_manifest_path)?;
+        let woocommerce = resolve_development_woocommerce(project_root, runtime_manifest_path)?;
+        let coffeepos = resolve_development_coffeepos(project_root, runtime_manifest_path)?;
+        if coffeepos.required_wordpress_version != wordpress.version
+            || coffeepos.required_php_version != runtime.php_version
+            || coffeepos.required_mariadb_version != runtime.mariadb_version
+            || coffeepos.required_woocommerce_version != woocommerce.version
+        {
+            return Err(provisioning_error(
+                "resolve CoffeePOS baseline",
+                format!(
+                    "CoffeePOS {} compatibility baseline does not match the staged stack (WordPress {}, PHP {}, MariaDB {}, WooCommerce {}).",
+                    coffeepos.version,
+                    wordpress.version,
+                    runtime.php_version,
+                    runtime.mariadb_version,
+                    woocommerce.version
+                ),
+                "Restage the pinned runtime, WordPress, WooCommerce, and CoffeePOS artifacts from compatible manifests before provisioning.",
+            ));
+        }
         Ok(Self {
             runtime,
-            wordpress: resolve_development_wordpress(project_root, runtime_manifest_path)?,
-            woocommerce: resolve_development_woocommerce(project_root, runtime_manifest_path)?,
+            wordpress,
+            woocommerce,
+            coffeepos,
             data_root,
             containment: ProcessContainment::new()?,
         })
@@ -217,6 +319,8 @@ impl Provisioner {
                     wordpress_version: self.wordpress.version.clone(),
                     woocommerce_version: self.woocommerce.version.clone(),
                     woocommerce_active: false,
+                    coffeepos_version: self.coffeepos.version.clone(),
+                    coffeepos_active: false,
                     admin_username: None,
                     can_retry: false,
                     last_error: Some(error),
@@ -230,9 +334,23 @@ impl Provisioner {
             && self.data_root.join("site/wp-config.php").is_file()
             && self.data_root.join("config/wordpress-router.php").is_file();
         let woocommerce_ready = woocommerce_installation_ready(&self.data_root, &self.woocommerce);
+        let coffeepos_ready = coffeepos_installation_ready(&self.data_root, &self.coffeepos);
+        let machine_token_ready = self.data_root.join(MACHINE_TOKEN_SECRET).is_file()
+            && secret::load(&self.data_root.join(MACHINE_TOKEN_SECRET))
+                .map(|token| {
+                    token.len() == 64
+                        && token
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                })
+                .unwrap_or(false);
         let woocommerce_activated = journal
             .as_ref()
             .map(|value| value.stage >= ProvisioningStage::WooCommerceActivated)
+            .unwrap_or(false);
+        let coffeepos_activated = journal
+            .as_ref()
+            .map(|value| value.stage >= ProvisioningStage::CoffeePosActivated)
             .unwrap_or(false);
         let complete = journal
             .as_ref()
@@ -241,18 +359,23 @@ impl Provisioner {
                     && value.wordpress_version == self.wordpress.version
                     && value.woocommerce_version.as_deref()
                         == Some(self.woocommerce.version.as_str())
-                    && value.stage >= ProvisioningStage::WooCommerceActivated
+                    && value.coffeepos_version.as_deref() == Some(self.coffeepos.version.as_str())
+                    && value.stage >= ProvisioningStage::MachineHealthBootstrapped
             })
             .unwrap_or(false)
             && database_ready
             && site_ready
-            && woocommerce_ready;
+            && woocommerce_ready
+            && coffeepos_ready
+            && machine_token_ready;
         if complete {
             return ProvisioningInfo {
                 state: ProvisioningState::Ready,
                 wordpress_version: self.wordpress.version.clone(),
                 woocommerce_version: self.woocommerce.version.clone(),
                 woocommerce_active: true,
+                coffeepos_version: self.coffeepos.version.clone(),
+                coffeepos_active: true,
                 admin_username: Some(WORDPRESS_ADMIN_USER.into()),
                 can_retry: false,
                 last_error: None,
@@ -267,12 +390,23 @@ impl Provisioner {
         } else {
             ProvisioningState::NeedsRepair
         };
+        let machine_credential_broken = journal
+            .as_ref()
+            .map(|value| value.stage >= ProvisioningStage::MachineHealthBootstrapped)
+            .unwrap_or(false)
+            && !machine_token_ready;
         let last_error = if pristine {
             None
+        } else if machine_credential_broken {
+            Some(provisioning_error(
+                "inspect machine credential",
+                "Provisioning journal says CoffeePOS machine health was bootstrapped, but the protected active machine credential is missing or unreadable.",
+                "Preserve the store and use the explicit machine-credential repair/rotation flow. Normal provisioning will not create a replacement credential implicitly.",
+            ))
         } else {
             Some(provisioning_error(
                 "inspect store",
-                "WordPress/WooCommerce provisioning is incomplete or the managed store layout is inconsistent.",
+                "WordPress/WooCommerce/CoffeePOS provisioning is incomplete or the managed store layout is inconsistent.",
                 "Retry provisioning. Existing site/database/plugin data is preserved; if retry is refused, use an explicit repair flow instead of deleting store data.",
             ))
         };
@@ -281,8 +415,10 @@ impl Provisioner {
             wordpress_version: self.wordpress.version.clone(),
             woocommerce_version: self.woocommerce.version.clone(),
             woocommerce_active: woocommerce_activated,
+            coffeepos_version: self.coffeepos.version.clone(),
+            coffeepos_active: coffeepos_activated,
             admin_username: journal.map(|value| value.admin_username),
-            can_retry: true,
+            can_retry: !machine_credential_broken,
             last_error,
         }
     }
@@ -293,6 +429,8 @@ impl Provisioner {
             wordpress_version: self.wordpress.version.clone(),
             woocommerce_version: self.woocommerce.version.clone(),
             woocommerce_active: false,
+            coffeepos_version: self.coffeepos.version.clone(),
+            coffeepos_active: false,
             admin_username: Some(WORDPRESS_ADMIN_USER.into()),
             can_retry: false,
             last_error: None,
@@ -313,6 +451,8 @@ impl Provisioner {
             wordpress_version: self.wordpress.version.clone(),
             woocommerce_version: self.woocommerce.version.clone(),
             woocommerce_active: false,
+            coffeepos_version: self.coffeepos.version.clone(),
+            coffeepos_active: false,
             admin_username: Some(WORDPRESS_ADMIN_USER.into()),
             can_retry: false,
             last_error: None,
@@ -407,12 +547,23 @@ impl Provisioner {
         self.activate_woocommerce(runtime_info)?;
         self.persist_stage(ProvisioningStage::WooCommerceActivated)?;
         self.log_event("woocommerce plugin activated and verified");
-        self.log_event("wordpress + woocommerce provisioning ready");
+        ensure_coffeepos_plugin(&self.data_root, &self.coffeepos, &self.woocommerce)?;
+        self.persist_stage(ProvisioningStage::CoffeePosProvisioned)?;
+        self.log_event("coffeepos plugin provisioned");
+        self.activate_coffeepos(runtime_info)?;
+        self.persist_stage(ProvisioningStage::CoffeePosActivated)?;
+        self.log_event("coffeepos plugin activated and verified");
+        self.bootstrap_machine_health(runtime_info)?;
+        self.persist_stage(ProvisioningStage::MachineHealthBootstrapped)?;
+        self.log_event("coffeepos machine health credential bootstrapped and verified");
+        self.log_event("wordpress + woocommerce + coffeepos provisioning ready");
         Ok(ProvisioningInfo {
             state: ProvisioningState::Ready,
             wordpress_version: self.wordpress.version.clone(),
             woocommerce_version: self.woocommerce.version.clone(),
             woocommerce_active: true,
+            coffeepos_version: self.coffeepos.version.clone(),
+            coffeepos_active: true,
             admin_username: Some(WORDPRESS_ADMIN_USER.into()),
             can_retry: false,
             last_error: None,
@@ -467,7 +618,7 @@ impl Provisioner {
             .env_remove("PHPRC")
             .env("PHP_INI_SCAN_DIR", "")
             .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
-            .env("COFFEEPOS_DB_PASSWORD", database_password)
+            .env("COFFEEPOS_DB_PASSWORD", &database_password)
             .env(
                 "COFFEEPOS_SITE_URL",
                 format!("http://{LOOPBACK}:{http_port}"),
@@ -505,6 +656,562 @@ impl Provisioner {
                 "activate WooCommerce",
                 format!("WooCommerce activation/setup exited with status {status}."),
                 "Inspect logs/woocommerce.log and retry provisioning. WordPress, WooCommerce files, and existing database data are preserved.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn activate_coffeepos(&self, runtime_info: &RuntimeInfo) -> Result<(), RuntimeErrorInfo> {
+        let database_port = runtime_info.database_port.ok_or_else(|| {
+            provisioning_error(
+                "activate CoffeePOS",
+                "MariaDB port is unavailable while activating CoffeePOS.",
+                "Keep the provisioned WordPress/plugin files, restart provisioning, and inspect runtime logs if MariaDB is not ready.",
+            )
+        })?;
+        let http_port = runtime_info.http_port.ok_or_else(|| {
+            provisioning_error(
+                "activate CoffeePOS",
+                "HTTP port is unavailable while activating CoffeePOS.",
+                "Keep the provisioned WordPress/plugin files, restart provisioning, and inspect runtime logs if PHP is not ready.",
+            )
+        })?;
+        let database_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+            .map_err(|error| {
+                provisioning_error(
+                    "activate CoffeePOS",
+                    error,
+                    "Retry with the same Windows user profile. Existing WordPress/WooCommerce/CoffeePOS files and database data are preserved.",
+                )
+            })?;
+        let apply_baseline = self
+            .load_journal()?
+            .map(|journal| {
+                journal.stage < ProvisioningStage::CoffeePosActivated
+                    || journal.coffeepos_version.as_deref() != Some(self.coffeepos.version.as_str())
+            })
+            .unwrap_or(true);
+        let script = self.write_coffeepos_activation_script()?;
+        let log_path = self.data_root.join("logs/coffeepos.log");
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|error| {
+                provisioning_error(
+                    "activate CoffeePOS",
+                    format!("Cannot open CoffeePOS activation log: {error}."),
+                    "Check application-data permissions and retry.",
+                )
+            })?;
+        let mut command = Command::new(&self.runtime.php_executable);
+        command
+            .arg("-c")
+            .arg(&self.runtime.php_ini)
+            .arg(&script)
+            .env_remove("PHPRC")
+            .env("PHP_INI_SCAN_DIR", "")
+            .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
+            .env("COFFEEPOS_DB_PASSWORD", &database_password)
+            .env(
+                "COFFEEPOS_SITE_URL",
+                format!("http://{LOOPBACK}:{http_port}"),
+            )
+            .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
+            .env("COFFEEPOS_SITE_ROOT", self.data_root.join("site"))
+            .env("COFFEEPOS_EXPECTED_VERSION", &self.coffeepos.version)
+            .env(
+                "COFFEEPOS_EXPECTED_WOOCOMMERCE_VERSION",
+                &self.woocommerce.version,
+            )
+            .env(
+                "COFFEEPOS_APPLY_ACTIVATION_BASELINE",
+                if apply_baseline { "1" } else { "0" },
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().map_err(|error| {
+                provisioning_error(
+                    "activate CoffeePOS",
+                    format!("Cannot duplicate CoffeePOS log handle: {error}."),
+                    "Check application-data permissions and retry.",
+                )
+            })?))
+            .stderr(Stdio::from(log))
+            .current_dir(self.data_root.join("site"));
+        configure_child_command(&mut command);
+        let status = run_command_bounded(
+            command,
+            Duration::from_secs(60),
+            "coffeepos",
+            "activate lifecycle",
+            &self.containment,
+        );
+        let _ = fs::remove_file(&script);
+        let status = status?;
+        if !status.success() {
+            return Err(provisioning_error(
+                "activate CoffeePOS",
+                format!("CoffeePOS activation lifecycle exited with status {status}."),
+                "Inspect logs/coffeepos.log and retry provisioning. WordPress, WooCommerce, CoffeePOS files, and existing database data are preserved.",
+            ));
+        }
+
+        let verification_script = self.write_coffeepos_activation_verification_script()?;
+        let verification_log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|error| {
+                provisioning_error(
+                    "verify CoffeePOS activation",
+                    format!("Cannot reopen CoffeePOS activation log: {error}."),
+                    "Check application-data permissions and retry.",
+                )
+            })?;
+        let mut verification_command = Command::new(&self.runtime.php_executable);
+        verification_command
+            .arg("-c")
+            .arg(&self.runtime.php_ini)
+            .arg(&verification_script)
+            .env_remove("PHPRC")
+            .env("PHP_INI_SCAN_DIR", "")
+            .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
+            .env("COFFEEPOS_DB_PASSWORD", database_password)
+            .env(
+                "COFFEEPOS_SITE_URL",
+                format!("http://{LOOPBACK}:{http_port}"),
+            )
+            .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
+            .env("COFFEEPOS_SITE_ROOT", self.data_root.join("site"))
+            .env("COFFEEPOS_EXPECTED_VERSION", &self.coffeepos.version)
+            .env(
+                "COFFEEPOS_EXPECTED_WOOCOMMERCE_VERSION",
+                &self.woocommerce.version,
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(verification_log.try_clone().map_err(
+                |error| {
+                    provisioning_error(
+                        "verify CoffeePOS activation",
+                        format!("Cannot duplicate CoffeePOS verification log handle: {error}."),
+                        "Check application-data permissions and retry.",
+                    )
+                },
+            )?))
+            .stderr(Stdio::from(verification_log))
+            .current_dir(self.data_root.join("site"));
+        configure_child_command(&mut verification_command);
+        let verification_status = run_command_bounded(
+            verification_command,
+            Duration::from_secs(60),
+            "coffeepos",
+            "verify activation baseline",
+            &self.containment,
+        );
+        let _ = fs::remove_file(&verification_script);
+        let verification_status = verification_status?;
+        if !verification_status.success() {
+            return Err(provisioning_error(
+                "verify CoffeePOS activation",
+                format!(
+                    "CoffeePOS fresh-process activation verification exited with status {verification_status}."
+                ),
+                "Inspect logs/coffeepos.log and retry provisioning. The journal remains at the provisioned stage until the plugin-owned baseline verifies successfully.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn bootstrap_machine_health(&self, runtime_info: &RuntimeInfo) -> Result<(), RuntimeErrorInfo> {
+        let http_port = runtime_info.http_port.ok_or_else(|| {
+            provisioning_error(
+                "bootstrap CoffeePOS machine health",
+                "HTTP port is unavailable while bootstrapping the CoffeePOS machine credential.",
+                "Keep the installed store, restart provisioning, and inspect runtime logs if PHP is not ready.",
+            )
+        })?;
+        let database_port = runtime_info.database_port.ok_or_else(|| {
+            provisioning_error(
+                "bootstrap CoffeePOS machine health",
+                "MariaDB port is unavailable while bootstrapping the CoffeePOS machine credential.",
+                "Keep the installed store, restart provisioning, and inspect runtime logs if MariaDB is not ready.",
+            )
+        })?;
+        let database_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+            .map_err(|error| {
+                provisioning_error(
+                    "bootstrap CoffeePOS machine health",
+                    error,
+                    "Retry with the same Windows user profile. Existing store data and plugin files are preserved.",
+                )
+            })?;
+        let pending_token_path = self.data_root.join(MACHINE_TOKEN_PENDING_SECRET);
+        if pending_token_path.is_file() {
+            let recovered = probe_coffeepos_health(&self.data_root, http_port);
+            if pending_token_path.is_file()
+                || !matches!(
+                    recovered.state,
+                    CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+                )
+            {
+                return Err(provisioning_error(
+                    "recover CoffeePOS machine credential",
+                    "A pending CoffeePOS machine credential remains after crash recovery could not identify an accepted credential.",
+                    "Preserve the active and pending protected credentials and use explicit machine-credential repair. Provisioning will not guess or reset the server hash.",
+                ));
+            }
+        }
+        let token_path = self.data_root.join(MACHINE_TOKEN_SECRET);
+        let token = secret::create_machine_token(&token_path).map_err(|error| {
+            provisioning_error(
+                "bootstrap CoffeePOS machine health",
+                error,
+                "Check protected application-data storage and operating-system random generation, then retry.",
+            )
+        })?;
+        let script = self.write_machine_health_bootstrap_script()?;
+        let log_path = self.data_root.join("logs/coffeepos.log");
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|error| {
+                provisioning_error(
+                    "bootstrap CoffeePOS machine health",
+                    format!("Cannot open CoffeePOS log: {error}."),
+                    "Check application-data permissions and retry.",
+                )
+            })?;
+        let mut command = Command::new(&self.runtime.php_executable);
+        command
+            .arg("-c")
+            .arg(&self.runtime.php_ini)
+            .arg(&script)
+            .env_remove("PHPRC")
+            .env("PHP_INI_SCAN_DIR", "")
+            .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
+            .env("COFFEEPOS_DB_PASSWORD", database_password)
+            .env(
+                "COFFEEPOS_SITE_URL",
+                format!("http://{LOOPBACK}:{http_port}"),
+            )
+            .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
+            .env("COFFEEPOS_SITE_ROOT", self.data_root.join("site"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(log.try_clone().map_err(|error| {
+                provisioning_error(
+                    "bootstrap CoffeePOS machine health",
+                    format!("Cannot duplicate CoffeePOS log handle: {error}."),
+                    "Check application-data permissions and retry.",
+                )
+            })?))
+            .stderr(Stdio::from(log))
+            .current_dir(self.data_root.join("site"));
+        configure_child_command(&mut command);
+        let mut child = command.spawn().map_err(|error| {
+            provisioning_error(
+                "bootstrap CoffeePOS machine health",
+                format!("Cannot start pinned PHP for machine-token bootstrap: {error}."),
+                "Verify the pinned PHP runtime and retry.",
+            )
+        })?;
+        if let Err(error) = self.containment.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&script);
+            return Err(error);
+        }
+        let stdin_result = match child.stdin.take() {
+            Some(mut stdin) => stdin.write_all(token.as_bytes()),
+            None => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "pinned PHP stdin pipe is unavailable",
+            )),
+        };
+        if let Err(error) = stdin_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&script);
+            return Err(provisioning_error(
+                "bootstrap CoffeePOS machine health",
+                format!("Cannot pass the machine credential to pinned PHP over stdin: {error}."),
+                "Retry provisioning. The protected credential is preserved and is never placed in process arguments or logs.",
+            ));
+        }
+        let status = match wait_for_child_exit(&mut child, Duration::from_secs(30)) {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_file(&script);
+                return Err(provisioning_error(
+                    "bootstrap CoffeePOS machine health",
+                    format!("Machine-token bootstrap exceeded its bounded timeout: {}.", error.message),
+                    "The pinned PHP bootstrap was terminated. The protected token is preserved because the WordPress hash may already have committed; inspect logs/coffeepos.log and retry.",
+                ));
+            }
+        };
+        let _ = fs::remove_file(&script);
+        if !status.success() {
+            return Err(provisioning_error(
+                "bootstrap CoffeePOS machine health",
+                format!("Machine-token bootstrap exited with status {status}."),
+                "Inspect logs/coffeepos.log and retry. The protected token is preserved for the same store.",
+            ));
+        }
+
+        let health = probe_coffeepos_health(&self.data_root, http_port);
+        if !matches!(
+            health.state,
+            CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+        ) {
+            let details = health
+                .error
+                .map(|error| format!("{} {}", error.message, error.recovery))
+                .unwrap_or_else(|| "CoffeePOS machine-health probe is unavailable.".into());
+            return Err(provisioning_error(
+                "verify CoffeePOS machine health",
+                details,
+                "Keep the protected token and installed store, correct the endpoint/auth/bootstrap issue, then retry provisioning.",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn rotate_machine_health_token(
+        &self,
+        runtime_info: &RuntimeInfo,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let http_port = runtime_info.http_port.ok_or_else(|| {
+            provisioning_error(
+                "rotate CoffeePOS machine credential",
+                "HTTP port is unavailable during rotation.",
+                "Start the managed runtime and wait for WordPress health before retrying.",
+            )
+        })?;
+        let active_path = self.data_root.join(MACHINE_TOKEN_SECRET);
+        let pending_path = self.data_root.join(MACHINE_TOKEN_PENDING_SECRET);
+        if pending_path.is_file() {
+            let recovered = probe_coffeepos_health(&self.data_root, http_port);
+            if pending_path.is_file()
+                || !matches!(
+                    recovered.state,
+                    CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+                )
+            {
+                return Err(provisioning_error(
+                    "recover CoffeePOS machine credential",
+                    "An existing pending machine credential could not be resolved safely.",
+                    "Preserve both protected credential files and use explicit repair.",
+                ));
+            }
+        }
+
+        let active = secret::load(&active_path).map_err(|error| {
+            provisioning_error(
+                "rotate CoffeePOS machine credential",
+                error,
+                "Repair the active protected credential before rotating it.",
+            )
+        })?;
+        let active_health = probe_coffeepos_health_with_token(http_port, &active);
+        if !matches!(
+            active_health.state,
+            CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+        ) {
+            return Err(provisioning_error(
+                "rotate CoffeePOS machine credential",
+                "The current machine credential is not accepted by the CoffeePOS endpoint.",
+                "Repair the active credential first; rotation will not overwrite an unverified server hash.",
+            ));
+        }
+
+        let pending = secret::create_machine_token(&pending_path).map_err(|error| {
+            provisioning_error(
+                "rotate CoffeePOS machine credential",
+                error,
+                "Check protected application-data storage and retry.",
+            )
+        })?;
+        self.switch_machine_health_token(runtime_info, &active, &pending)?;
+        let pending_health = probe_coffeepos_health_with_token(http_port, &pending);
+        if matches!(
+            pending_health.state,
+            CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+        ) {
+            secret::store_machine_token(&active_path, &pending).map_err(|error| {
+                provisioning_error(
+                    "promote CoffeePOS machine credential",
+                    error,
+                    "The server accepts the pending credential. Preserve the pending protected file and retry recovery.",
+                )
+            })?;
+            fs::remove_file(&pending_path).map_err(|error| {
+                provisioning_error(
+                    "promote CoffeePOS machine credential",
+                    format!("Cannot remove the promoted pending credential: {error}."),
+                    "Retry recovery; the active protected credential already matches WordPress.",
+                )
+            })?;
+            return Ok(());
+        }
+
+        let pending_failure = pending_health
+            .error
+            .as_ref()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| "pending credential probe failed".into());
+        if let Err(error) = self.switch_machine_health_token(runtime_info, &pending, &active) {
+            return Err(provisioning_error(
+                "rollback CoffeePOS machine credential",
+                format!(
+                    "Pending verification failed ({pending_failure}) and rollback could not switch the server hash: {error}."
+                ),
+                "Preserve both protected credential files for explicit recovery.",
+            ));
+        }
+        let restored = probe_coffeepos_health_with_token(http_port, &active);
+        if !matches!(
+            restored.state,
+            CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+        ) {
+            return Err(provisioning_error(
+                "rollback CoffeePOS machine credential",
+                "The previous active credential could not be re-verified after rollback.",
+                "Preserve both protected credential files and use explicit repair.",
+            ));
+        }
+        fs::remove_file(&pending_path).map_err(|error| {
+            provisioning_error(
+                "rollback CoffeePOS machine credential",
+                format!("Rollback succeeded but the pending credential cannot be removed: {error}."),
+                "The previous active credential is restored; remove the stale pending file through explicit repair.",
+            )
+        })?;
+        Err(provisioning_error(
+            "rotate CoffeePOS machine credential",
+            format!("The pending credential failed endpoint verification: {pending_failure}."),
+            "The previous active credential was restored and verified. Correct the endpoint issue before retrying rotation.",
+        ))
+    }
+
+    fn switch_machine_health_token(
+        &self,
+        runtime_info: &RuntimeInfo,
+        expected_current: &str,
+        replacement: &str,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let database_port = runtime_info.database_port.ok_or_else(|| {
+            provisioning_error(
+                "switch CoffeePOS machine credential",
+                "MariaDB port is unavailable during rotation.",
+                "Keep both protected credentials and restart the managed runtime before recovery.",
+            )
+        })?;
+        let http_port = runtime_info.http_port.ok_or_else(|| {
+            provisioning_error(
+                "switch CoffeePOS machine credential",
+                "HTTP port is unavailable during rotation.",
+                "Keep both protected credentials and restart the managed runtime before recovery.",
+            )
+        })?;
+        let database_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+            .map_err(|error| {
+                provisioning_error(
+                    "switch CoffeePOS machine credential",
+                    error,
+                    "Retry with the same Windows user profile; both protected machine credentials are preserved.",
+                )
+            })?;
+        let script = self.write_machine_token_switch_script()?;
+        let log_path = self.data_root.join("logs/coffeepos.log");
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|error| {
+                provisioning_error(
+                    "switch CoffeePOS machine credential",
+                    format!("Cannot open CoffeePOS log: {error}."),
+                    "Check application-data permissions and retry.",
+                )
+            })?;
+        let mut command = Command::new(&self.runtime.php_executable);
+        command
+            .arg("-c")
+            .arg(&self.runtime.php_ini)
+            .arg(&script)
+            .env_remove("PHPRC")
+            .env("PHP_INI_SCAN_DIR", "")
+            .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
+            .env("COFFEEPOS_DB_PASSWORD", database_password)
+            .env(
+                "COFFEEPOS_SITE_URL",
+                format!("http://{LOOPBACK}:{http_port}"),
+            )
+            .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
+            .env("COFFEEPOS_SITE_ROOT", self.data_root.join("site"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(log.try_clone().map_err(|error| {
+                provisioning_error(
+                    "switch CoffeePOS machine credential",
+                    format!("Cannot duplicate CoffeePOS log handle: {error}."),
+                    "Check application-data permissions and retry.",
+                )
+            })?))
+            .stderr(Stdio::from(log))
+            .current_dir(self.data_root.join("site"));
+        configure_child_command(&mut command);
+        let mut child = command.spawn().map_err(|error| {
+            provisioning_error(
+                "switch CoffeePOS machine credential",
+                format!("Cannot start pinned PHP for rotation: {error}."),
+                "Keep both protected credentials and verify the pinned PHP runtime.",
+            )
+        })?;
+        if let Err(error) = self.containment.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&script);
+            return Err(error);
+        }
+        let input = format!("{expected_current}\n{replacement}\n");
+        let stdin_result = match child.stdin.take() {
+            Some(mut stdin) => stdin.write_all(input.as_bytes()),
+            None => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "pinned PHP stdin pipe is unavailable",
+            )),
+        };
+        if let Err(error) = stdin_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&script);
+            return Err(provisioning_error(
+                "switch CoffeePOS machine credential",
+                format!("Cannot pass rotation credentials to pinned PHP over stdin: {error}."),
+                "Both protected credentials are preserved. Retry recovery after checking the runtime.",
+            ));
+        }
+        let status = match wait_for_child_exit(&mut child, Duration::from_secs(30)) {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_file(&script);
+                return Err(provisioning_error(
+                    "switch CoffeePOS machine credential",
+                    format!("Credential switch exceeded its bounded timeout: {}.", error.message),
+                    "Both protected credentials are preserved because the server commit point is unknown. Retry recovery, not a new rotation.",
+                ));
+            }
+        };
+        let _ = fs::remove_file(&script);
+        if !status.success() {
+            return Err(provisioning_error(
+                "switch CoffeePOS machine credential",
+                format!("Credential switch exited with status {status}."),
+                "Both protected credentials are preserved. Inspect logs/coffeepos.log and use recovery rather than overwriting the server hash.",
             ));
         }
         Ok(())
@@ -1159,6 +1866,133 @@ require_once ABSPATH . 'wp-settings.php';\n",
         Ok(path)
     }
 
+    fn write_coffeepos_activation_script(&self) -> Result<PathBuf, RuntimeErrorInfo> {
+        let config = self.data_root.join("config");
+        let mut temporary = NamedTempFile::new_in(&config).map_err(|error| {
+            provisioning_error(
+                "prepare CoffeePOS activation",
+                format!("Cannot create temporary CoffeePOS activation script: {error}."),
+                "Check application-data permissions and free disk space, then retry.",
+            )
+        })?;
+        temporary
+            .write_all(COFFEEPOS_ACTIVATION_BOOTSTRAP.as_bytes())
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|error| {
+                provisioning_error(
+                    "prepare CoffeePOS activation",
+                    format!("Cannot write CoffeePOS activation script: {error}."),
+                    "Check application-data storage health and retry.",
+                )
+            })?;
+        let (_file, path) = temporary.keep().map_err(|error| {
+            provisioning_error(
+                "prepare CoffeePOS activation",
+                format!(
+                    "Cannot retain CoffeePOS activation script: {}.",
+                    error.error
+                ),
+                "Check application-data permissions and retry.",
+            )
+        })?;
+        Ok(path)
+    }
+
+    fn write_coffeepos_activation_verification_script(&self) -> Result<PathBuf, RuntimeErrorInfo> {
+        let config = self.data_root.join("config");
+        let mut temporary = NamedTempFile::new_in(&config).map_err(|error| {
+            provisioning_error(
+                "prepare CoffeePOS activation verification",
+                format!(
+                    "Cannot create temporary CoffeePOS activation verification script: {error}."
+                ),
+                "Check application-data permissions and free disk space, then retry.",
+            )
+        })?;
+        temporary
+            .write_all(COFFEEPOS_ACTIVATION_VERIFY_BOOTSTRAP.as_bytes())
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|error| {
+                provisioning_error(
+                    "prepare CoffeePOS activation verification",
+                    format!("Cannot write CoffeePOS activation verification script: {error}."),
+                    "Check application-data storage health and retry.",
+                )
+            })?;
+        let (_file, path) = temporary.keep().map_err(|error| {
+            provisioning_error(
+                "prepare CoffeePOS activation verification",
+                format!(
+                    "Cannot retain CoffeePOS activation verification script: {}.",
+                    error.error
+                ),
+                "Check application-data permissions and retry.",
+            )
+        })?;
+        Ok(path)
+    }
+
+    fn write_machine_health_bootstrap_script(&self) -> Result<PathBuf, RuntimeErrorInfo> {
+        let config = self.data_root.join("config");
+        let mut temporary = NamedTempFile::new_in(&config).map_err(|error| {
+            provisioning_error(
+                "prepare CoffeePOS machine health",
+                format!("Cannot create temporary machine-health bootstrap script: {error}."),
+                "Check application-data permissions and free disk space, then retry.",
+            )
+        })?;
+        temporary
+            .write_all(COFFEEPOS_MACHINE_HEALTH_BOOTSTRAP.as_bytes())
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|error| {
+                provisioning_error(
+                    "prepare CoffeePOS machine health",
+                    format!("Cannot write machine-health bootstrap script: {error}."),
+                    "Check application-data storage health and retry.",
+                )
+            })?;
+        let (_file, path) = temporary.keep().map_err(|error| {
+            provisioning_error(
+                "prepare CoffeePOS machine health",
+                format!(
+                    "Cannot retain machine-health bootstrap script: {}.",
+                    error.error
+                ),
+                "Check application-data permissions and retry.",
+            )
+        })?;
+        Ok(path)
+    }
+
+    fn write_machine_token_switch_script(&self) -> Result<PathBuf, RuntimeErrorInfo> {
+        let config = self.data_root.join("config");
+        let mut temporary = NamedTempFile::new_in(&config).map_err(|error| {
+            provisioning_error(
+                "prepare CoffeePOS machine credential rotation",
+                format!("Cannot create temporary credential-switch script: {error}."),
+                "Check application-data permissions and free disk space, then retry.",
+            )
+        })?;
+        temporary
+            .write_all(COFFEEPOS_MACHINE_TOKEN_SWITCH_BOOTSTRAP.as_bytes())
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|error| {
+                provisioning_error(
+                    "prepare CoffeePOS machine credential rotation",
+                    format!("Cannot write credential-switch script: {error}."),
+                    "Check application-data storage health and retry.",
+                )
+            })?;
+        let (_file, path) = temporary.keep().map_err(|error| {
+            provisioning_error(
+                "prepare CoffeePOS machine credential rotation",
+                format!("Cannot retain credential-switch script: {}.", error.error),
+                "Check application-data permissions and retry.",
+            )
+        })?;
+        Ok(path)
+    }
+
     fn prepare_logs(&self) -> Result<(), RuntimeErrorInfo> {
         fs::create_dir_all(self.data_root.join("logs")).map_err(|error| {
             provisioning_error(
@@ -1237,6 +2071,8 @@ require_once ABSPATH . 'wp-settings.php';\n",
             wordpress_version: self.wordpress.version.clone(),
             woocommerce_version: (stage >= ProvisioningStage::WooCommerceProvisioned)
                 .then(|| self.woocommerce.version.clone()),
+            coffeepos_version: (stage >= ProvisioningStage::CoffeePosProvisioned)
+                .then(|| self.coffeepos.version.clone()),
             stage,
             admin_username: WORDPRESS_ADMIN_USER.into(),
         };
@@ -1584,6 +2420,316 @@ fn validate_woocommerce_manifest(
     Ok(())
 }
 
+pub fn resolve_development_coffeepos(
+    project_root: &Path,
+    runtime_manifest_path: &Path,
+) -> Result<ResolvedCoffeePos, RuntimeErrorInfo> {
+    if !project_root.is_absolute() || !runtime_manifest_path.is_absolute() {
+        return Err(provisioning_error(
+            "resolve CoffeePOS baseline",
+            "Project root and runtime manifest path must both be absolute.",
+            "Resolve development paths from the Cargo manifest directory before provisioning.",
+        ));
+    }
+    let development_root =
+        fs::canonicalize(project_root.join("runtime/development")).map_err(|error| {
+            provisioning_error(
+                "resolve CoffeePOS baseline",
+                format!("Cannot resolve runtime/development: {error}."),
+                "Run the CoffeePOS development staging script and retry.",
+            )
+        })?;
+    let runtime_manifest = fs::canonicalize(runtime_manifest_path).map_err(|error| {
+        provisioning_error(
+            "resolve CoffeePOS baseline",
+            format!("Cannot resolve runtime manifest: {error}."),
+            "Stage the pinned development runtime before provisioning.",
+        )
+    })?;
+    if !runtime_manifest.starts_with(&development_root) {
+        return Err(provisioning_error(
+            "resolve CoffeePOS baseline",
+            "Runtime manifest resolves outside runtime/development.",
+            "Use only the pinned project development runtime.",
+        ));
+    }
+    let target_root = runtime_manifest.parent().ok_or_else(|| {
+        provisioning_error(
+            "resolve CoffeePOS baseline",
+            "Runtime manifest does not have a target directory.",
+            "Restage the pinned development runtime.",
+        )
+    })?;
+    let manifest_path = target_root.join("coffeepos-manifest.json");
+    let manifest: CoffeePosDevelopmentManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).map_err(|error| {
+            provisioning_error(
+                "resolve CoffeePOS baseline",
+                format!("Cannot read CoffeePOS manifest: {error}."),
+                "Run scripts/stage-coffeepos-development.ps1 and retry.",
+            )
+        })?)
+        .map_err(|error| {
+            provisioning_error(
+                "resolve CoffeePOS baseline",
+                format!("CoffeePOS manifest is invalid JSON: {error}."),
+                "Restore the checked-in manifest template and restage the artifact.",
+            )
+        })?;
+    validate_coffeepos_manifest(&manifest)?;
+
+    let plugin_root =
+        fs::canonicalize(target_root.join(&manifest.coffeepos.plugin_root)).map_err(|error| {
+            provisioning_error(
+                "resolve CoffeePOS baseline",
+                format!("Cannot resolve staged CoffeePOS plugin: {error}."),
+                "Run scripts/stage-coffeepos-development.ps1 and retry.",
+            )
+        })?;
+    if !plugin_root.starts_with(target_root) || !plugin_root.is_dir() {
+        return Err(provisioning_error(
+            "resolve CoffeePOS baseline",
+            "CoffeePOS plugin root resolves outside the current development target or is not a directory.",
+            "Restage the pinned CoffeePOS artifact from the checked-in manifest.",
+        ));
+    }
+    if let Some(issue) = coffeepos_tree_issue(&plugin_root) {
+        return Err(provisioning_error(
+            "resolve CoffeePOS baseline",
+            format!("Staged CoffeePOS plugin layout is invalid: {issue}."),
+            "Restage the pinned CoffeePOS archive and retry.",
+        ));
+    }
+    let entry_file = plugin_root.join("coffeepos.php");
+    let actual_version = read_coffeepos_plugin_header_version(&entry_file)?;
+    if actual_version != manifest.coffeepos.version {
+        return Err(provisioning_error(
+            "resolve CoffeePOS baseline",
+            format!(
+                "Staged CoffeePOS plugin version is {actual_version}, expected {}.",
+                manifest.coffeepos.version
+            ),
+            "Restage the exact pinned CoffeePOS artifact and retry.",
+        ));
+    }
+    for (field, expected) in [
+        (
+            "Requires at least",
+            manifest.compatibility.minimum_wordpress.as_str(),
+        ),
+        ("Requires PHP", manifest.compatibility.minimum_php.as_str()),
+    ] {
+        let actual =
+            read_plugin_header_value(&entry_file, field, "CoffeePOS")?.ok_or_else(|| {
+                provisioning_error(
+                    "resolve CoffeePOS baseline",
+                    format!("Staged CoffeePOS plugin is missing the '{field}' header."),
+                    "Restore the pinned CoffeePOS artifact and retry.",
+                )
+            })?;
+        if actual != expected {
+            return Err(provisioning_error(
+                "resolve CoffeePOS baseline",
+                format!(
+                    "Staged CoffeePOS '{field}' header is {actual}, expected {expected} from the pinned manifest."
+                ),
+                "Restage the exact pinned CoffeePOS artifact and retry.",
+            ));
+        }
+    }
+    let requires_plugins = read_plugin_header_value(&entry_file, "Requires Plugins", "CoffeePOS")?
+        .ok_or_else(|| {
+            provisioning_error(
+                "resolve CoffeePOS baseline",
+                "Staged CoffeePOS plugin does not declare its required plugin dependency.",
+                "Restore the pinned CoffeePOS artifact and retry.",
+            )
+        })?;
+    let dependency_present = requires_plugins
+        .split(',')
+        .map(|value| value.trim())
+        .any(|value| value.eq_ignore_ascii_case(&manifest.coffeepos.requires_plugin));
+    if !dependency_present {
+        return Err(provisioning_error(
+            "resolve CoffeePOS baseline",
+            format!(
+                "Staged CoffeePOS plugin does not require the pinned '{}' dependency.",
+                manifest.coffeepos.requires_plugin
+            ),
+            "Restore the pinned CoffeePOS artifact and retry.",
+        ));
+    }
+
+    Ok(ResolvedCoffeePos {
+        version: manifest.coffeepos.version,
+        plugin_root,
+        archive_sha256: manifest.coffeepos.archive_sha256,
+        required_wordpress_version: manifest.compatibility.development_wordpress,
+        required_php_version: manifest.compatibility.development_php,
+        required_mariadb_version: manifest.compatibility.development_mariadb,
+        required_woocommerce_version: manifest.compatibility.development_woocommerce,
+    })
+}
+
+fn validate_coffeepos_manifest(
+    manifest: &CoffeePosDevelopmentManifest,
+) -> Result<(), RuntimeErrorInfo> {
+    if manifest.schema_version != COFFEEPOS_MANIFEST_SCHEMA_VERSION {
+        return Err(provisioning_error(
+            "validate CoffeePOS manifest",
+            format!(
+                "Unsupported CoffeePOS manifest schema {}.",
+                manifest.schema_version
+            ),
+            "Use the CoffeePOS manifest schema shipped with this CoffeePOS Desktop version.",
+        ));
+    }
+    if manifest.target != expected_target()? {
+        return Err(provisioning_error(
+            "validate CoffeePOS manifest",
+            format!(
+                "CoffeePOS manifest target '{}' does not match '{}'.",
+                manifest.target,
+                expected_target()?
+            ),
+            "Stage the CoffeePOS artifact for the current platform target.",
+        ));
+    }
+    for (label, value) in [
+        ("version", manifest.coffeepos.version.as_str()),
+        ("archive", manifest.coffeepos.archive.as_str()),
+        (
+            "archive_sha256_source",
+            manifest.coffeepos.archive_sha256_source.as_str(),
+        ),
+        ("source_kind", manifest.coffeepos.source_kind.as_str()),
+        (
+            "source_git_commit",
+            manifest.coffeepos.source_git_commit.as_str(),
+        ),
+        ("build_script", manifest.coffeepos.build_script.as_str()),
+        (
+            "composer_version",
+            manifest.coffeepos.composer_version.as_str(),
+        ),
+        (
+            "build_php_version",
+            manifest.coffeepos.build_php_version.as_str(),
+        ),
+        ("license", manifest.coffeepos.license.as_str()),
+        (
+            "requires_plugin",
+            manifest.coffeepos.requires_plugin.as_str(),
+        ),
+        (
+            "compatibility.minimum_wordpress",
+            manifest.compatibility.minimum_wordpress.as_str(),
+        ),
+        (
+            "compatibility.tested_wordpress",
+            manifest.compatibility.tested_wordpress.as_str(),
+        ),
+        (
+            "compatibility.minimum_php",
+            manifest.compatibility.minimum_php.as_str(),
+        ),
+        (
+            "compatibility.development_wordpress",
+            manifest.compatibility.development_wordpress.as_str(),
+        ),
+        (
+            "compatibility.development_php",
+            manifest.compatibility.development_php.as_str(),
+        ),
+        (
+            "compatibility.development_mariadb",
+            manifest.compatibility.development_mariadb.as_str(),
+        ),
+        (
+            "compatibility.development_woocommerce",
+            manifest.compatibility.development_woocommerce.as_str(),
+        ),
+    ] {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(provisioning_error(
+                "validate CoffeePOS manifest",
+                format!("CoffeePOS manifest field '{label}' is invalid."),
+                "Restore the checked-in CoffeePOS manifest template and restage the artifact.",
+            ));
+        }
+    }
+    if manifest.coffeepos.archive_sha256.len() != 64
+        || !manifest
+            .coffeepos
+            .archive_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(provisioning_error(
+            "validate CoffeePOS manifest",
+            "CoffeePOS archive SHA256 must contain 64 hexadecimal characters.",
+            "Restore the pinned checksum and restage the artifact.",
+        ));
+    }
+    if manifest.coffeepos.source_git_commit.len() != 40
+        || !manifest
+            .coffeepos
+            .source_git_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(provisioning_error(
+            "validate CoffeePOS manifest",
+            "CoffeePOS source Git commit must contain 40 hexadecimal characters.",
+            "Restore the pinned CoffeePOS source provenance and restage the artifact.",
+        ));
+    }
+    if !manifest
+        .coffeepos
+        .requires_plugin
+        .eq_ignore_ascii_case(WOOCOMMERCE_PLUGIN_SLUG)
+    {
+        return Err(provisioning_error(
+            "validate CoffeePOS manifest",
+            "CoffeePOS manifest dependency must be WooCommerce.",
+            "Restore the checked-in CoffeePOS manifest template and restage the artifact.",
+        ));
+    }
+    for relative in [
+        &manifest.coffeepos.plugin_root,
+        &manifest.coffeepos.entry_file,
+        &manifest.coffeepos.readme_file,
+        &manifest.coffeepos.license_file,
+        &manifest.coffeepos.autoload_file,
+    ] {
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(provisioning_error(
+                "validate CoffeePOS manifest",
+                "CoffeePOS manifest paths must be relative and may not escape the target root.",
+                "Restore the checked-in CoffeePOS manifest template and restage the artifact.",
+            ));
+        }
+    }
+    let expected_plugin_root = PathBuf::from("coffeepos/coffeepos");
+    if manifest.coffeepos.plugin_root != expected_plugin_root
+        || manifest.coffeepos.entry_file != expected_plugin_root.join("coffeepos.php")
+        || manifest.coffeepos.readme_file != expected_plugin_root.join("readme.txt")
+        || manifest.coffeepos.license_file != expected_plugin_root.join("LICENSE")
+        || manifest.coffeepos.autoload_file != expected_plugin_root.join("vendor/autoload.php")
+    {
+        return Err(provisioning_error(
+            "validate CoffeePOS manifest",
+            "CoffeePOS manifest layout does not match the pinned plugin root contract.",
+            "Restore the checked-in CoffeePOS manifest template and restage the artifact.",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_wordpress_manifest(
     manifest: &WordPressDevelopmentManifest,
 ) -> Result<(), RuntimeErrorInfo> {
@@ -1736,7 +2882,7 @@ fn woocommerce_installation_ready(data_root: &Path, woocommerce: &ResolvedWooCom
     let destination = data_root
         .join("site/wp-content/plugins")
         .join(WOOCOMMERCE_PLUGIN_SLUG);
-    let ownership = fs::read(destination.join(WOOCOMMERCE_OWNERSHIP_FILE))
+    let ownership = fs::read(destination.join(MANAGED_PLUGIN_OWNERSHIP_FILE))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<ManagedPluginOwnership>(&bytes).ok());
     let Some(ownership) = ownership else {
@@ -1767,13 +2913,13 @@ fn ensure_woocommerce_plugin(
                 "Preserve the existing path and remove or adopt it explicitly before retrying. CoffeePOS will not overwrite it automatically.",
             ));
         }
-        let ownership_path = destination.join(WOOCOMMERCE_OWNERSHIP_FILE);
+        let ownership_path = destination.join(MANAGED_PLUGIN_OWNERSHIP_FILE);
         let bytes = fs::read(&ownership_path).map_err(|error| {
             provisioning_error(
                 "provision WooCommerce",
                 format!(
                     "An existing WooCommerce directory is not proven CoffeePOS-managed: cannot read {}: {error}.",
-                    WOOCOMMERCE_OWNERSHIP_FILE
+                    MANAGED_PLUGIN_OWNERSHIP_FILE
                 ),
                 "Preserve the existing WooCommerce directory and use an explicit adoption/repair flow. CoffeePOS will not overwrite an unmanaged plugin.",
             )
@@ -1863,7 +3009,7 @@ fn ensure_woocommerce_plugin(
     })?;
     ownership_bytes.push(b'\n');
     atomic_write(
-        &staging.join(WOOCOMMERCE_OWNERSHIP_FILE),
+        &staging.join(MANAGED_PLUGIN_OWNERSHIP_FILE),
         &ownership_bytes,
         "WooCommerce ownership metadata",
     )?;
@@ -1877,32 +3023,372 @@ fn ensure_woocommerce_plugin(
     Ok(())
 }
 
-fn read_plugin_header_version(path: &Path) -> Result<String, RuntimeErrorInfo> {
-    let text = fs::read_to_string(path).map_err(|error| {
+fn coffeepos_installation_ready(data_root: &Path, coffeepos: &ResolvedCoffeePos) -> bool {
+    let destination = data_root
+        .join("site/wp-content/plugins")
+        .join(COFFEEPOS_PLUGIN_SLUG);
+    if coffeepos_tree_issue(&destination).is_some() {
+        return false;
+    }
+    let ownership = fs::read(destination.join(MANAGED_PLUGIN_OWNERSHIP_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ManagedPluginOwnership>(&bytes).ok());
+    let Some(ownership) = ownership else {
+        return false;
+    };
+    ownership.schema_version == COFFEEPOS_OWNERSHIP_SCHEMA_VERSION
+        && ownership.plugin == COFFEEPOS_PLUGIN_SLUG
+        && ownership.version == coffeepos.version
+        && ownership
+            .archive_sha256
+            .eq_ignore_ascii_case(&coffeepos.archive_sha256)
+        && read_coffeepos_plugin_header_version(&destination.join("coffeepos.php"))
+            .map(|version| version == coffeepos.version)
+            .unwrap_or(false)
+}
+
+fn ensure_coffeepos_plugin(
+    data_root: &Path,
+    coffeepos: &ResolvedCoffeePos,
+    woocommerce: &ResolvedWooCommerce,
+) -> Result<(), RuntimeErrorInfo> {
+    if woocommerce.version != coffeepos.required_woocommerce_version
+        || !woocommerce_installation_ready(data_root, woocommerce)
+    {
+        return Err(provisioning_error(
+            "provision CoffeePOS",
+            format!(
+                "CoffeePOS {} requires the managed WooCommerce {} baseline before its files can be provisioned.",
+                coffeepos.version, coffeepos.required_woocommerce_version
+            ),
+            "Provision and verify the pinned WooCommerce dependency first, then retry CoffeePOS provisioning.",
+        ));
+    }
+
+    let plugins_root = data_root.join("site/wp-content/plugins");
+    let destination = plugins_root.join(COFFEEPOS_PLUGIN_SLUG);
+    recover_coffeepos_upgrade_backup(data_root, coffeepos, &destination)?;
+    if destination.exists() {
+        if !destination.is_dir() {
+            return Err(provisioning_error(
+                "provision CoffeePOS",
+                "The CoffeePOS plugin destination exists but is not a directory.",
+                "Preserve the existing path and remove or adopt it explicitly before retrying. CoffeePOS Desktop will not overwrite it automatically.",
+            ));
+        }
+        let ownership_path = destination.join(MANAGED_PLUGIN_OWNERSHIP_FILE);
+        let bytes = fs::read(&ownership_path).map_err(|error| {
+            provisioning_error(
+                "provision CoffeePOS",
+                format!(
+                    "An existing CoffeePOS directory is not proven Desktop-managed: cannot read {}: {error}.",
+                    MANAGED_PLUGIN_OWNERSHIP_FILE
+                ),
+                "Preserve the existing CoffeePOS directory and use an explicit adoption/repair flow. Provisioning will not overwrite an unmanaged plugin.",
+            )
+        })?;
+        let ownership: ManagedPluginOwnership = serde_json::from_slice(&bytes).map_err(|error| {
+            provisioning_error(
+                "provision CoffeePOS",
+                format!("CoffeePOS ownership metadata is invalid and was preserved: {error}."),
+                "Repair or restore the ownership metadata explicitly before retrying; provisioning will not replace the existing plugin automatically.",
+            )
+        })?;
+        if ownership.schema_version != COFFEEPOS_OWNERSHIP_SCHEMA_VERSION
+            || ownership.plugin != COFFEEPOS_PLUGIN_SLUG
+        {
+            return Err(provisioning_error(
+                "provision CoffeePOS",
+                "Existing CoffeePOS ownership metadata is not compatible with this CoffeePOS Desktop version.",
+                "Preserve the plugin and use an explicit adoption/upgrade flow instead of overwriting it during provisioning.",
+            ));
+        }
+        if ownership.version != coffeepos.version
+            || !ownership
+                .archive_sha256
+                .eq_ignore_ascii_case(&coffeepos.archive_sha256)
+        {
+            if ownership.version == COFFEEPOS_PHASE_4_9_VERSION
+                && ownership
+                    .archive_sha256
+                    .eq_ignore_ascii_case(COFFEEPOS_PHASE_4_9_SHA256)
+                && coffeepos.version == COFFEEPOS_PHASE_4_10_VERSION
+                && coffeepos
+                    .archive_sha256
+                    .eq_ignore_ascii_case(COFFEEPOS_PHASE_4_10_SHA256)
+            {
+                return upgrade_managed_coffeepos_plugin(
+                    data_root,
+                    coffeepos,
+                    &destination,
+                    &ownership,
+                );
+            }
+            return Err(provisioning_error(
+                "provision CoffeePOS",
+                format!(
+                    "Managed CoffeePOS {} does not match the pinned {} artifact.",
+                    ownership.version, coffeepos.version
+                ),
+                "Run an explicit CoffeePOS upgrade flow; provisioning will not overwrite an existing managed plugin version.",
+            ));
+        }
+        let installed_version =
+            read_coffeepos_plugin_header_version(&destination.join("coffeepos.php"))?;
+        if installed_version != coffeepos.version {
+            return Err(provisioning_error(
+                "provision CoffeePOS",
+                format!(
+                    "Managed CoffeePOS files report version {installed_version}, expected {}.",
+                    coffeepos.version
+                ),
+                "Preserve the plugin directory and repair it explicitly; provisioning will not overwrite a modified/corrupt managed plugin.",
+            ));
+        }
+        if let Some(issue) = coffeepos_tree_issue(&destination) {
+            return Err(provisioning_error(
+                "provision CoffeePOS",
+                format!("Managed CoffeePOS plugin layout is incomplete/corrupt: {issue}."),
+                "Preserve the existing managed plugin and repair it explicitly; provisioning will not overwrite missing or modified plugin files automatically.",
+            ));
+        }
+        return Ok(());
+    }
+
+    fs::create_dir_all(&plugins_root).map_err(|error| {
         provisioning_error(
-            "inspect WooCommerce version",
-            format!("Cannot read WooCommerce entry file: {error}."),
-            "Restage or repair the WooCommerce plugin files, then retry.",
+            "provision CoffeePOS",
+            format!("Cannot create the WordPress plugins directory: {error}."),
+            "Check site permissions and free disk space, then retry.",
         )
     })?;
-    for line in text.lines().take(40) {
+    let staging = stage_coffeepos_artifact(data_root, coffeepos)?;
+    fs::rename(&staging, &destination).map_err(|error| {
+        provisioning_error(
+            "provision CoffeePOS",
+            format!("Cannot atomically install the staged CoffeePOS plugin: {error}."),
+            "Preserve the existing site. Only the owned coffeepos.provisioning staging directory may be retried automatically.",
+        )
+    })?;
+    Ok(())
+}
+
+fn stage_coffeepos_artifact(
+    data_root: &Path,
+    coffeepos: &ResolvedCoffeePos,
+) -> Result<PathBuf, RuntimeErrorInfo> {
+    let staging = data_root.join("coffeepos.provisioning");
+    reset_owned_staging_dir(data_root, &staging)?;
+    copy_tree(
+        &coffeepos.plugin_root,
+        &staging,
+        "CoffeePOS plugin",
+        "Restage the exact pinned CoffeePOS artifact and retry.",
+    )?;
+    let staged_version = read_coffeepos_plugin_header_version(&staging.join("coffeepos.php"))?;
+    if staged_version != coffeepos.version {
+        return Err(provisioning_error(
+            "provision CoffeePOS",
+            format!(
+                "Copied CoffeePOS files report version {staged_version}, expected {}.",
+                coffeepos.version
+            ),
+            "Restage the exact pinned CoffeePOS artifact and retry.",
+        ));
+    }
+    if let Some(issue) = coffeepos_tree_issue(&staging) {
+        return Err(provisioning_error(
+            "provision CoffeePOS",
+            format!("Copied CoffeePOS plugin layout is incomplete: {issue}."),
+            "Restage the exact pinned CoffeePOS artifact and retry.",
+        ));
+    }
+    let ownership = ManagedPluginOwnership {
+        schema_version: COFFEEPOS_OWNERSHIP_SCHEMA_VERSION,
+        plugin: COFFEEPOS_PLUGIN_SLUG.into(),
+        version: coffeepos.version.clone(),
+        archive_sha256: coffeepos.archive_sha256.clone(),
+    };
+    let mut ownership_bytes = serde_json::to_vec_pretty(&ownership).map_err(|error| {
+        provisioning_error(
+            "provision CoffeePOS",
+            format!("Cannot serialize CoffeePOS ownership metadata: {error}."),
+            "Retry after checking application-data storage.",
+        )
+    })?;
+    ownership_bytes.push(b'\n');
+    atomic_write(
+        &staging.join(MANAGED_PLUGIN_OWNERSHIP_FILE),
+        &ownership_bytes,
+        "CoffeePOS ownership metadata",
+    )?;
+    Ok(staging)
+}
+
+fn upgrade_managed_coffeepos_plugin(
+    data_root: &Path,
+    coffeepos: &ResolvedCoffeePos,
+    destination: &Path,
+    ownership: &ManagedPluginOwnership,
+) -> Result<(), RuntimeErrorInfo> {
+    let installed_version =
+        read_coffeepos_plugin_header_version(&destination.join("coffeepos.php"))?;
+    if installed_version != ownership.version {
+        return Err(provisioning_error(
+            "upgrade CoffeePOS",
+            format!(
+                "Managed CoffeePOS ownership says {}, but installed files report {installed_version}.",
+                ownership.version
+            ),
+            "Preserve the plugin directory and repair the managed installation explicitly before retrying the Phase 4.10 upgrade.",
+        ));
+    }
+    if let Some(issue) = coffeepos_tree_issue(destination) {
+        return Err(provisioning_error(
+            "upgrade CoffeePOS",
+            format!("Managed CoffeePOS 1.0.0 layout is incomplete/corrupt: {issue}."),
+            "Preserve the existing plugin and repair it explicitly; the health-endpoint upgrade will not overwrite a corrupt managed plugin.",
+        ));
+    }
+
+    let staging = stage_coffeepos_artifact(data_root, coffeepos)?;
+    let backup = data_root.join(COFFEEPOS_UPGRADE_BACKUP);
+    if backup.exists() {
+        return Err(provisioning_error(
+            "upgrade CoffeePOS",
+            "A previous CoffeePOS upgrade backup still exists.",
+            "Retry after CoffeePOS Desktop recovers the managed backup, or use the explicit repair flow if both old and new plugin trees are present.",
+        ));
+    }
+    fs::rename(destination, &backup).map_err(|error| {
+        provisioning_error(
+            "upgrade CoffeePOS",
+            format!("Cannot move managed CoffeePOS 1.0.0 into the upgrade backup: {error}."),
+            "Close processes using plugin files and retry. The existing plugin directory has not been overwritten.",
+        )
+    })?;
+    if let Err(error) = fs::rename(&staging, destination) {
+        let _ = fs::rename(&backup, destination);
+        return Err(provisioning_error(
+            "upgrade CoffeePOS",
+            format!("Cannot atomically activate CoffeePOS {}: {error}.", coffeepos.version),
+            "The old managed plugin was restored when possible. Inspect the site and retry the Phase 4.10 upgrade.",
+        ));
+    }
+    if let Err(error) = fs::remove_dir_all(&backup) {
+        return Err(provisioning_error(
+            "upgrade CoffeePOS",
+            format!("CoffeePOS {} is installed, but the old managed plugin backup could not be removed: {error}.", coffeepos.version),
+            "Retry provisioning; CoffeePOS Desktop will verify the new plugin before removing the owned backup.",
+        ));
+    }
+    Ok(())
+}
+
+fn recover_coffeepos_upgrade_backup(
+    data_root: &Path,
+    coffeepos: &ResolvedCoffeePos,
+    destination: &Path,
+) -> Result<(), RuntimeErrorInfo> {
+    let backup = data_root.join(COFFEEPOS_UPGRADE_BACKUP);
+    if !backup.exists() {
+        return Ok(());
+    }
+    if !backup.is_dir() {
+        return Err(provisioning_error(
+            "recover CoffeePOS upgrade",
+            "The owned CoffeePOS upgrade backup path exists but is not a directory.",
+            "Preserve the path and use explicit repair before retrying.",
+        ));
+    }
+    if !destination.exists() {
+        fs::rename(&backup, destination).map_err(|error| {
+            provisioning_error(
+                "recover CoffeePOS upgrade",
+                format!("Cannot restore the previous managed CoffeePOS plugin after an interrupted upgrade: {error}."),
+                "Close processes using the site and retry. The backup is preserved.",
+            )
+        })?;
+        return Ok(());
+    }
+    if coffeepos_installation_ready(data_root, coffeepos) {
+        fs::remove_dir_all(&backup).map_err(|error| {
+            provisioning_error(
+                "recover CoffeePOS upgrade",
+                format!("The new CoffeePOS plugin is ready, but the old owned upgrade backup cannot be removed: {error}."),
+                "Close processes using the backup and retry provisioning.",
+            )
+        })?;
+        return Ok(());
+    }
+    Err(provisioning_error(
+        "recover CoffeePOS upgrade",
+        "Both a CoffeePOS upgrade backup and a non-ready destination exist.",
+        "Preserve both plugin trees and use explicit repair; CoffeePOS Desktop will not guess which tree is authoritative.",
+    ))
+}
+
+fn coffeepos_tree_issue(root: &Path) -> Option<String> {
+    for relative in COFFEEPOS_REQUIRED_FILES {
+        if !root.join(relative).is_file() {
+            return Some(format!(
+                "required file '{relative}' is missing or is not a file"
+            ));
+        }
+    }
+    for relative in COFFEEPOS_REQUIRED_DIRECTORIES {
+        if !root.join(relative).is_dir() {
+            return Some(format!(
+                "required directory '{relative}' is missing or is not a directory"
+            ));
+        }
+    }
+    None
+}
+
+fn read_plugin_header_version(path: &Path) -> Result<String, RuntimeErrorInfo> {
+    read_plugin_header_value(path, "Version", "WooCommerce")?.ok_or_else(|| {
+        provisioning_error(
+            "inspect WooCommerce version",
+            "WooCommerce entry file does not contain a valid Version header.",
+            "Restage the exact pinned WooCommerce artifact and retry.",
+        )
+    })
+}
+
+fn read_coffeepos_plugin_header_version(path: &Path) -> Result<String, RuntimeErrorInfo> {
+    read_plugin_header_value(path, "Version", "CoffeePOS")?.ok_or_else(|| {
+        provisioning_error(
+            "inspect CoffeePOS version",
+            "CoffeePOS entry file does not contain a valid Version header.",
+            "Restage the exact pinned CoffeePOS artifact and retry.",
+        )
+    })
+}
+
+fn read_plugin_header_value(
+    path: &Path,
+    field: &str,
+    plugin_name: &str,
+) -> Result<Option<String>, RuntimeErrorInfo> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        provisioning_error(
+            format!("inspect {plugin_name} metadata"),
+            format!("Cannot read {plugin_name} entry file: {error}."),
+            format!("Restage or repair the {plugin_name} plugin files, then retry."),
+        )
+    })?;
+    let prefix = format!("{field}:");
+    Ok(text.lines().take(40).find_map(|line| {
         let candidate = line
             .trim()
             .trim_start_matches('*')
             .trim()
-            .strip_prefix("Version:")
-            .map(str::trim);
-        if let Some(version) = candidate {
-            if !version.is_empty() && !version.chars().any(char::is_control) {
-                return Ok(version.to_string());
-            }
-        }
-    }
-    Err(provisioning_error(
-        "inspect WooCommerce version",
-        "WooCommerce entry file does not contain a valid Version header.",
-        "Restage the exact pinned WooCommerce artifact and retry.",
-    ))
+            .strip_prefix(&prefix)
+            .map(str::trim)?;
+        (!candidate.is_empty() && !candidate.chars().any(char::is_control))
+            .then(|| candidate.to_string())
+    }))
 }
 
 fn reset_owned_staging_dir(data_root: &Path, staging: &Path) -> Result<(), RuntimeErrorInfo> {
@@ -1916,7 +3402,12 @@ fn reset_owned_staging_dir(data_root: &Path, staging: &Path) -> Result<(), Runti
     if parent != data_root
         || !matches!(
             staging.file_name().and_then(|value| value.to_str()),
-            Some("database.provisioning" | "site.provisioning" | "woocommerce.provisioning")
+            Some(
+                "database.provisioning"
+                    | "site.provisioning"
+                    | "woocommerce.provisioning"
+                    | "coffeepos.provisioning"
+            )
         )
     {
         return Err(provisioning_error(
@@ -2348,6 +3839,353 @@ fwrite(STDOUT, "WooCommerce {$expectedVersion} active; schema/pages/Action Sched
 exit(0);
 "#;
 
+const COFFEEPOS_ACTIVATION_BOOTSTRAP: &str = r#"<?php
+declare(strict_types=1);
+
+$siteRoot = getenv('COFFEEPOS_SITE_ROOT');
+$expectedVersion = getenv('COFFEEPOS_EXPECTED_VERSION');
+$expectedWooCommerceVersion = getenv('COFFEEPOS_EXPECTED_WOOCOMMERCE_VERSION');
+$applyBaseline = getenv('COFFEEPOS_APPLY_ACTIVATION_BASELINE') === '1';
+
+if (!$siteRoot || !$expectedVersion || !$expectedWooCommerceVersion) {
+    fwrite(STDERR, "CoffeePOS activation environment is incomplete.\n");
+    exit(2);
+}
+
+require_once $siteRoot . '/wp-load.php';
+require_once ABSPATH . 'wp-admin/includes/plugin.php';
+
+$wooCommercePlugin = 'woocommerce/woocommerce.php';
+$wooCommerceFile = WP_PLUGIN_DIR . '/woocommerce/woocommerce.php';
+$coffeePosPlugin = 'coffeepos/coffeepos.php';
+$coffeePosFile = WP_PLUGIN_DIR . '/coffeepos/coffeepos.php';
+
+if (!is_file($wooCommerceFile) || !is_plugin_active($wooCommercePlugin)) {
+    fwrite(STDERR, "CoffeePOS requires the managed WooCommerce plugin to be installed and active before activation.\n");
+    exit(3);
+}
+$wooCommerceData = get_plugin_data($wooCommerceFile, false, false);
+$wooCommerceVersion = isset($wooCommerceData['Version']) ? trim((string) $wooCommerceData['Version']) : '';
+if ($wooCommerceVersion !== $expectedWooCommerceVersion) {
+    fwrite(STDERR, "WooCommerce plugin header version mismatch: {$wooCommerceVersion}; expected {$expectedWooCommerceVersion}.\n");
+    exit(4);
+}
+if (!defined('WC_VERSION') || (string) WC_VERSION !== $expectedWooCommerceVersion || !class_exists('WooCommerce')) {
+    fwrite(STDERR, "The active WooCommerce runtime does not match the pinned dependency.\n");
+    exit(5);
+}
+
+if (!is_file($coffeePosFile)) {
+    fwrite(STDERR, "Managed CoffeePOS entry file is missing.\n");
+    exit(6);
+}
+$coffeePosData = get_plugin_data($coffeePosFile, false, false);
+$coffeePosVersion = isset($coffeePosData['Version']) ? trim((string) $coffeePosData['Version']) : '';
+if ($coffeePosVersion !== $expectedVersion) {
+    fwrite(STDERR, "CoffeePOS plugin header version mismatch: {$coffeePosVersion}; expected {$expectedVersion}.\n");
+    exit(7);
+}
+
+$wasActive = is_plugin_active($coffeePosPlugin);
+if (!$wasActive) {
+    $result = activate_plugin($coffeePosPlugin, '', false, false);
+    if (is_wp_error($result)) {
+        fwrite(STDERR, "CoffeePOS activation failed: " . $result->get_error_message() . "\n");
+        exit(8);
+    }
+}
+if (!is_plugin_active($coffeePosPlugin)) {
+    fwrite(STDERR, "CoffeePOS is not listed as an active WordPress plugin after activation.\n");
+    exit(9);
+}
+if (!defined('COFFEEPOS_VERSION') || (string) COFFEEPOS_VERSION !== $expectedVersion) {
+    fwrite(STDERR, "Loaded CoffeePOS version does not match the pinned artifact.\n");
+    exit(10);
+}
+if (!class_exists('\\CoffeePOS\\Core\\Lifecycle')) {
+    fwrite(STDERR, "CoffeePOS lifecycle class is unavailable after activation.\n");
+    exit(11);
+}
+if ($wasActive && $applyBaseline) {
+    \CoffeePOS\Core\Lifecycle::activate();
+}
+
+fwrite(STDOUT, "CoffeePOS {$expectedVersion} activation lifecycle completed.\n");
+exit(0);
+"#;
+
+const COFFEEPOS_ACTIVATION_VERIFY_BOOTSTRAP: &str = r#"<?php
+declare(strict_types=1);
+
+$siteRoot = getenv('COFFEEPOS_SITE_ROOT');
+$expectedVersion = getenv('COFFEEPOS_EXPECTED_VERSION');
+$expectedWooCommerceVersion = getenv('COFFEEPOS_EXPECTED_WOOCOMMERCE_VERSION');
+
+if (!$siteRoot || !$expectedVersion || !$expectedWooCommerceVersion) {
+    fwrite(STDERR, "CoffeePOS activation verification environment is incomplete.\n");
+    exit(2);
+}
+
+require_once $siteRoot . '/wp-load.php';
+require_once ABSPATH . 'wp-admin/includes/plugin.php';
+
+$wooCommercePlugin = 'woocommerce/woocommerce.php';
+$wooCommerceFile = WP_PLUGIN_DIR . '/woocommerce/woocommerce.php';
+$coffeePosPlugin = 'coffeepos/coffeepos.php';
+$coffeePosFile = WP_PLUGIN_DIR . '/coffeepos/coffeepos.php';
+
+if (!is_file($wooCommerceFile) || !is_plugin_active($wooCommercePlugin)) {
+    fwrite(STDERR, "CoffeePOS verification requires the managed WooCommerce plugin to remain active.\n");
+    exit(3);
+}
+$wooCommerceData = get_plugin_data($wooCommerceFile, false, false);
+$wooCommerceVersion = isset($wooCommerceData['Version']) ? trim((string) $wooCommerceData['Version']) : '';
+if ($wooCommerceVersion !== $expectedWooCommerceVersion) {
+    fwrite(STDERR, "WooCommerce plugin header version mismatch during CoffeePOS verification.\n");
+    exit(4);
+}
+if (!defined('WC_VERSION') || (string) WC_VERSION !== $expectedWooCommerceVersion || !class_exists('WooCommerce')) {
+    fwrite(STDERR, "The fresh WordPress process did not load the pinned WooCommerce dependency.\n");
+    exit(5);
+}
+if (!is_file($coffeePosFile) || !is_plugin_active($coffeePosPlugin)) {
+    fwrite(STDERR, "CoffeePOS is not active in the fresh WordPress verification process.\n");
+    exit(6);
+}
+$coffeePosData = get_plugin_data($coffeePosFile, false, false);
+$coffeePosVersion = isset($coffeePosData['Version']) ? trim((string) $coffeePosData['Version']) : '';
+if ($coffeePosVersion !== $expectedVersion) {
+    fwrite(STDERR, "CoffeePOS plugin header version mismatch during verification.\n");
+    exit(7);
+}
+if (!defined('COFFEEPOS_VERSION') || (string) COFFEEPOS_VERSION !== $expectedVersion) {
+    fwrite(STDERR, "The fresh WordPress process did not load the pinned CoffeePOS version.\n");
+    exit(8);
+}
+
+$requiredClasses = array(
+    '\\CoffeePOS\\Core\\Lifecycle',
+    '\\CoffeePOS\\Core\\Bootstrap',
+    '\\CoffeePOS\\Infrastructure\\Database\\Migrator',
+    '\\CoffeePOS\\Infrastructure\\Database\\Schema',
+    '\\CoffeePOS\\Infrastructure\\Settings\\Settings',
+    '\\CoffeePOS\\POS\\Router',
+    '\\CoffeePOS\\REST\\RouteRegistrar',
+    '\\CoffeePOS\\Support\\Capabilities',
+);
+foreach ($requiredClasses as $requiredClass) {
+    if (!class_exists($requiredClass)) {
+        fwrite(STDERR, "CoffeePOS runtime class is unavailable in the fresh process: {$requiredClass}.\n");
+        exit(9);
+    }
+}
+
+$server = rest_get_server();
+$routes = $server->get_routes();
+
+global $wpdb;
+$tableExists = static function (string $table) use ($wpdb): bool {
+    $found = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($table)));
+    return $found === $table;
+};
+$baselineIssues = static function () use ($expectedVersion, $tableExists, $routes): array {
+    $issues = array();
+    if ((string) get_option('coffeepos_installed_version', '') !== $expectedVersion) {
+        $issues[] = 'installed_version=' . (string) get_option('coffeepos_installed_version', '');
+    }
+    if ((string) get_option(\CoffeePOS\Infrastructure\Database\Migrator::OPTION_DB_VERSION, '') !== \CoffeePOS\Infrastructure\Database\Migrator::SCHEMA_VERSION) {
+        $issues[] = 'db_schema=' . (string) get_option(\CoffeePOS\Infrastructure\Database\Migrator::OPTION_DB_VERSION, '');
+    }
+    foreach (\CoffeePOS\Infrastructure\Database\Schema::tableNames($GLOBALS['wpdb']->prefix) as $table) {
+        if (!$tableExists($table)) {
+            $issues[] = 'missing_table:' . $table;
+        }
+    }
+    $missingOption = new stdClass();
+    foreach (\CoffeePOS\Infrastructure\Settings\Settings::optionNames() as $optionName) {
+        if (get_option($optionName, $missingOption) === $missingOption) {
+            $issues[] = 'missing_setting:' . $optionName;
+        }
+    }
+    $pluginCapabilities = \CoffeePOS\Support\Capabilities::all();
+    foreach (array('coffeepos_cashier', 'coffeepos_kitchen', 'coffeepos_supervisor', 'coffeepos_manager') as $roleName) {
+        $role = get_role($roleName);
+        if ($role === null) {
+            $issues[] = 'missing_role:' . $roleName;
+            continue;
+        }
+        if (!$role->has_cap('read')) {
+            $issues[] = 'missing_capability:' . $roleName . ':read';
+        }
+        $hasCoffeePosCapability = false;
+        foreach ($pluginCapabilities as $capability) {
+            if ($role->has_cap($capability)) {
+                $hasCoffeePosCapability = true;
+                break;
+            }
+        }
+        if (!$hasCoffeePosCapability) {
+            $issues[] = 'missing_coffeepos_capability:' . $roleName;
+        }
+    }
+    foreach (array('administrator', 'shop_manager') as $roleName) {
+        $role = get_role($roleName);
+        if ($role === null) {
+            $issues[] = 'missing_role:' . $roleName;
+            continue;
+        }
+        foreach ($pluginCapabilities as $capability) {
+            if (!$role->has_cap($capability)) {
+                $issues[] = 'missing_capability:' . $roleName . ':' . $capability;
+            }
+        }
+    }
+    if ((string) get_option('coffeepos_rewrite_version', '') !== \CoffeePOS\POS\Router::rewriteVersion()) {
+        $issues[] = 'rewrite_version=' . (string) get_option('coffeepos_rewrite_version', '');
+    }
+    $rewriteRules = get_option('rewrite_rules', array());
+    $hasPosRewrite = false;
+    foreach (is_array($rewriteRules) ? $rewriteRules : array() as $rewriteTarget) {
+        if (is_string($rewriteTarget) && str_contains($rewriteTarget, 'coffeepos_screen=entry')) {
+            $hasPosRewrite = true;
+            break;
+        }
+    }
+    if (!$hasPosRewrite) {
+        $issues[] = 'missing_pos_rewrite';
+    }
+    if (!isset($routes['/coffeepos/v1/health'])) {
+        $issues[] = 'missing_rest_route:/coffeepos/v1/health';
+    }
+    $declaredRoutes = \CoffeePOS\REST\RouteRegistrar::registeredRoutes();
+    if ($declaredRoutes === []) {
+        $issues[] = 'empty_declared_rest_routes';
+    }
+    foreach ($declaredRoutes as $declaredRoute) {
+        $routeKey = '/' . ltrim((string) $declaredRoute, '/');
+        if (!isset($routes[$routeKey])) {
+            $issues[] = 'missing_declared_rest_route:' . $routeKey;
+        }
+    }
+    return $issues;
+};
+
+$issues = $baselineIssues();
+if ($issues !== []) {
+    fwrite(STDERR, "CoffeePOS fresh-process activation baseline is not ready: " . implode(', ', $issues) . "\n");
+    exit(10);
+}
+
+fwrite(
+    STDOUT,
+    "CoffeePOS {$expectedVersion} active; plugin-owned schema/settings/capabilities/rewrite/REST baseline verified.\n"
+);
+exit(0);
+"#;
+
+const COFFEEPOS_MACHINE_HEALTH_BOOTSTRAP: &str = r#"<?php
+declare(strict_types=1);
+
+$siteRoot = getenv('COFFEEPOS_SITE_ROOT');
+if (!$siteRoot) {
+    fwrite(STDERR, "CoffeePOS machine-health bootstrap environment is incomplete.\n");
+    exit(2);
+}
+$token = trim((string) stream_get_contents(STDIN));
+if (strlen($token) !== 64 || !preg_match('/^[0-9a-f]{64}$/', $token)) {
+    fwrite(STDERR, "CoffeePOS machine credential format is invalid.\n");
+    exit(3);
+}
+
+require_once $siteRoot . '/wp-load.php';
+
+if (!defined('COFFEEPOS_VERSION') || !class_exists('\\CoffeePOS\\REST\\SystemStatusController')) {
+    fwrite(STDERR, "CoffeePOS machine-health controller is unavailable.\n");
+    exit(4);
+}
+
+$hash = hash('sha256', $token);
+$token = '';
+$option = \CoffeePOS\REST\SystemStatusController::OPTION_MACHINE_TOKEN_HASH;
+$stored = strtolower(trim((string) get_option($option, '')));
+if ($stored === '') {
+    if (!update_option($option, $hash, false)) {
+        $stored = strtolower(trim((string) get_option($option, '')));
+        if (!hash_equals($stored, $hash)) {
+            fwrite(STDERR, "CoffeePOS machine credential hash could not be persisted.\n");
+            exit(5);
+        }
+    }
+} elseif (!preg_match('/^[0-9a-f]{64}$/', $stored)) {
+    fwrite(STDERR, "Stored CoffeePOS machine credential hash is invalid; refusing implicit reset.\n");
+    exit(6);
+} elseif (!hash_equals($stored, $hash)) {
+    fwrite(STDERR, "Stored CoffeePOS machine credential differs; explicit rotation/repair is required.\n");
+    exit(7);
+}
+$hash = '';
+fwrite(STDOUT, "CoffeePOS machine credential hash persisted.\n");
+exit(0);
+"#;
+
+const COFFEEPOS_MACHINE_TOKEN_SWITCH_BOOTSTRAP: &str = r#"<?php
+declare(strict_types=1);
+
+$siteRoot = getenv('COFFEEPOS_SITE_ROOT');
+if (!$siteRoot) {
+    fwrite(STDERR, "CoffeePOS machine-credential rotation environment is incomplete.\n");
+    exit(2);
+}
+$input = (string) stream_get_contents(STDIN);
+$lines = preg_split('/\R/', trim($input));
+$input = '';
+if (!is_array($lines) || count($lines) < 2) {
+    fwrite(STDERR, "CoffeePOS machine-credential rotation input is incomplete.\n");
+    exit(3);
+}
+$expected = trim((string) $lines[0]);
+$replacement = trim((string) $lines[1]);
+$lines = array();
+foreach (array($expected, $replacement) as $token) {
+    if (strlen($token) !== 64 || !preg_match('/^[0-9a-f]{64}$/', $token)) {
+        fwrite(STDERR, "CoffeePOS machine-credential rotation token format is invalid.\n");
+        exit(4);
+    }
+}
+
+require_once $siteRoot . '/wp-load.php';
+if (!class_exists('\\CoffeePOS\\REST\\SystemStatusController')) {
+    fwrite(STDERR, "CoffeePOS machine-health controller is unavailable.\n");
+    exit(5);
+}
+
+$expectedHash = hash('sha256', $expected);
+$replacementHash = hash('sha256', $replacement);
+$expected = '';
+$replacement = '';
+$option = \CoffeePOS\REST\SystemStatusController::OPTION_MACHINE_TOKEN_HASH;
+$stored = strtolower(trim((string) get_option($option, '')));
+if (hash_equals($stored, $replacementHash)) {
+    fwrite(STDOUT, "CoffeePOS machine credential already switched.\n");
+    exit(0);
+}
+if (!preg_match('/^[0-9a-f]{64}$/', $stored) || !hash_equals($stored, $expectedHash)) {
+    fwrite(STDERR, "Stored CoffeePOS machine credential does not match the expected active credential.\n");
+    exit(6);
+}
+if (!update_option($option, $replacementHash, false)) {
+    $stored = strtolower(trim((string) get_option($option, '')));
+    if (!hash_equals($stored, $replacementHash)) {
+        fwrite(STDERR, "CoffeePOS machine credential could not be switched.\n");
+        exit(7);
+    }
+}
+$expectedHash = '';
+$replacementHash = '';
+fwrite(STDOUT, "CoffeePOS machine credential switched.\n");
+exit(0);
+"#;
+
 const WORDPRESS_ROUTER: &str = r#"<?php
 // CoffeePOS Desktop managed router.
 declare(strict_types=1);
@@ -2423,7 +4261,8 @@ mod tests {
 
     #[cfg(windows)]
     use crate::runtime::{
-        resolve_development_manifest, RuntimeManager, RuntimeState, WordPressHealthState,
+        resolve_development_manifest, CoffeePosHealthFailureKind, CoffeePosHealthState,
+        RuntimeManager, RuntimeState, WordPressHealthState,
     };
 
     #[test]
@@ -2437,16 +4276,137 @@ mod tests {
         let data = temp.path();
         assert!(reset_owned_staging_dir(data, &data.join("database")).is_err());
         assert!(reset_owned_staging_dir(data, &data.join("site.provisioning")).is_ok());
+        assert!(reset_owned_staging_dir(data, &data.join("coffeepos.provisioning")).is_ok());
+    }
+
+    #[test]
+    fn phase_4_6_journal_remains_backward_compatible_and_incomplete_for_phase_4_8() {
+        let bytes = br#"{
+  "schema_version": 1,
+  "wordpress_version": "7.1",
+  "woocommerce_version": "11.1.0",
+  "stage": "woo_commerce_activated",
+  "admin_username": "coffeepos_admin"
+}"#;
+        let journal: ProvisioningJournal = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(journal.stage, ProvisioningStage::WooCommerceActivated);
+        assert_eq!(journal.woocommerce_version.as_deref(), Some("11.1.0"));
+        assert!(journal.coffeepos_version.is_none());
+        assert!(journal.stage < ProvisioningStage::CoffeePosProvisioned);
+    }
+
+    #[test]
+    fn phase_4_8_journal_remains_backward_compatible_and_incomplete_for_phase_4_9() {
+        let bytes = br#"{
+  "schema_version": 1,
+  "wordpress_version": "7.1",
+  "woocommerce_version": "11.1.0",
+  "coffeepos_version": "1.0.0",
+  "stage": "coffee_pos_provisioned",
+  "admin_username": "coffeepos_admin"
+}"#;
+        let journal: ProvisioningJournal = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(journal.stage, ProvisioningStage::CoffeePosProvisioned);
+        assert_eq!(journal.coffeepos_version.as_deref(), Some("1.0.0"));
+        assert!(journal.stage < ProvisioningStage::CoffeePosActivated);
+    }
+
+    #[test]
+    fn phase_4_9_journal_remains_backward_compatible_and_incomplete_for_phase_4_10() {
+        let bytes = br#"{
+  "schema_version": 1,
+  "wordpress_version": "7.1",
+  "woocommerce_version": "11.1.0",
+  "coffeepos_version": "1.0.0",
+  "stage": "coffee_pos_activated",
+  "admin_username": "coffeepos_admin"
+}"#;
+        let journal: ProvisioningJournal = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(journal.stage, ProvisioningStage::CoffeePosActivated);
+        assert_eq!(journal.coffeepos_version.as_deref(), Some("1.0.0"));
+        assert!(journal.stage < ProvisioningStage::MachineHealthBootstrapped);
+    }
+
+    #[cfg(windows)]
+    fn query_wordpress_option(
+        provisioner: &Provisioner,
+        database_port: u16,
+        option_name: &str,
+    ) -> String {
+        let password =
+            secret::load(&provisioner.data_root.join(DATABASE_WORDPRESS_SECRET)).unwrap();
+        let endpoint = DatabaseEndpoint::Tcp(database_port);
+        let mut command =
+            provisioner.database_client_command(&endpoint, DATABASE_WORDPRESS_USER, &password);
+        command
+            .arg(format!("--database={DATABASE_NAME}"))
+            .arg(format!(
+                "--execute=SELECT option_value FROM wp_options WHERE option_name = '{}' LIMIT 1",
+                sql_literal(option_name)
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_child_command(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "database option query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[cfg(windows)]
+    fn update_wordpress_option(
+        provisioner: &Provisioner,
+        database_port: u16,
+        option_name: &str,
+        option_value: &str,
+    ) {
+        let password =
+            secret::load(&provisioner.data_root.join(DATABASE_WORDPRESS_SECRET)).unwrap();
+        let endpoint = DatabaseEndpoint::Tcp(database_port);
+        let mut command =
+            provisioner.database_client_command(&endpoint, DATABASE_WORDPRESS_USER, &password);
+        command
+            .arg(format!("--database={DATABASE_NAME}"))
+            .arg(format!(
+                "--execute=UPDATE wp_options SET option_value = '{}' WHERE option_name = '{}'",
+                sql_literal(option_value),
+                sql_literal(option_name)
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_child_command(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "database option update failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(windows)]
     fn http_get(port: u16, path: &str) -> String {
+        http_get_with_headers(port, path, &[])
+    }
+
+    #[cfg(windows)]
+    fn http_get_with_headers(port: u16, path: &str, headers: &[(&str, &str)]) -> String {
         let mut stream = std::net::TcpStream::connect((LOOPBACK, port)).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        let request =
-            format!("GET {path} HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nConnection: close\r\n\r\n");
+        let mut request = format!("GET {path} HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\n");
+        for (name, value) in headers {
+            request.push_str(name);
+            request.push_str(": ");
+            request.push_str(value);
+            request.push_str("\r\n");
+        }
+        request.push_str("Connection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = Vec::new();
         let mut chunk = [0_u8; 8192];
@@ -2570,7 +4530,278 @@ mod tests {
         let error = ensure_woocommerce_plugin(&data_root, &artifact).unwrap_err();
         assert_eq!(error.operation, "provision WooCommerce");
         assert_eq!(fs::read(&sentinel).unwrap(), b"do not overwrite");
-        assert!(!destination.join(WOOCOMMERCE_OWNERSHIP_FILE).exists());
+        assert!(!destination.join(MANAGED_PLUGIN_OWNERSHIP_FILE).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn checked_in_coffeepos_manifest_matches_native_schema() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let project_root = manifest_dir.parent().unwrap();
+        let bytes = fs::read(
+            project_root.join("scripts/coffeepos-development/coffeepos-1.0.1.manifest.json"),
+        )
+        .unwrap();
+        let manifest: CoffeePosDevelopmentManifest = serde_json::from_slice(&bytes).unwrap();
+        validate_coffeepos_manifest(&manifest).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn coffeepos_manifest_rejects_path_escape() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let project_root = manifest_dir.parent().unwrap();
+        let bytes = fs::read(
+            project_root.join("scripts/coffeepos-development/coffeepos-1.0.1.manifest.json"),
+        )
+        .unwrap();
+        let mut manifest: CoffeePosDevelopmentManifest = serde_json::from_slice(&bytes).unwrap();
+        manifest.coffeepos.plugin_root = PathBuf::from("../escape");
+        assert!(validate_coffeepos_manifest(&manifest).is_err());
+    }
+
+    fn create_test_coffeepos_source(root: &Path) {
+        create_test_coffeepos_source_version(root, "1.0.0");
+    }
+
+    fn create_test_coffeepos_source_version(root: &Path, version: &str) {
+        for directory in ["assets", "includes", "languages", "templates", "vendor"] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        fs::write(
+            root.join("coffeepos.php"),
+            format!(
+                "<?php\n/**\n * Plugin Name: CoffeePOS\n * Version: {version}\n * Requires at least: 6.4\n * Requires PHP: 7.4\n * Requires Plugins: woocommerce\n */\n"
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("readme.txt"), format!("Stable tag: {version}\n")).unwrap();
+        fs::write(root.join("LICENSE"), b"GPL-2.0-or-later\n").unwrap();
+        fs::write(root.join("vendor/autoload.php"), b"<?php\n").unwrap();
+    }
+
+    #[test]
+    fn coffeepos_phase_4_10_upgrades_only_exact_managed_phase_4_9_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let woocommerce_source = temp.path().join("woocommerce-source");
+        fs::create_dir_all(&woocommerce_source).unwrap();
+        fs::write(
+            woocommerce_source.join("woocommerce.php"),
+            b"<?php\n/**\n * Plugin Name: WooCommerce\n * Version: 11.1.0\n */\n",
+        )
+        .unwrap();
+        let old_source = temp.path().join("coffeepos-old");
+        let new_source = temp.path().join("coffeepos-new");
+        create_test_coffeepos_source_version(&old_source, COFFEEPOS_PHASE_4_9_VERSION);
+        create_test_coffeepos_source_version(&new_source, COFFEEPOS_PHASE_4_10_VERSION);
+        let data_root = temp.path().join("store");
+        fs::create_dir_all(&data_root).unwrap();
+        let woocommerce = ResolvedWooCommerce {
+            version: "11.1.0".into(),
+            plugin_root: woocommerce_source,
+            archive_sha256: "6bae9bf74d722b6deb15f049687c311cfafc26e3a5d8fa55ac6ea4b9a3a8df19"
+                .into(),
+        };
+        let old = ResolvedCoffeePos {
+            version: COFFEEPOS_PHASE_4_9_VERSION.into(),
+            plugin_root: old_source,
+            archive_sha256: COFFEEPOS_PHASE_4_9_SHA256.into(),
+            required_wordpress_version: "7.1".into(),
+            required_php_version: "8.4.25".into(),
+            required_mariadb_version: "11.4.13".into(),
+            required_woocommerce_version: "11.1.0".into(),
+        };
+        let new = ResolvedCoffeePos {
+            version: COFFEEPOS_PHASE_4_10_VERSION.into(),
+            plugin_root: new_source,
+            archive_sha256: COFFEEPOS_PHASE_4_10_SHA256.into(),
+            required_wordpress_version: "7.1".into(),
+            required_php_version: "8.4.25".into(),
+            required_mariadb_version: "11.4.13".into(),
+            required_woocommerce_version: "11.1.0".into(),
+        };
+        ensure_woocommerce_plugin(&data_root, &woocommerce).unwrap();
+        ensure_coffeepos_plugin(&data_root, &old, &woocommerce).unwrap();
+        let site_sentinel = data_root.join("site/keep-store-data.txt");
+        fs::write(&site_sentinel, b"preserve store data").unwrap();
+
+        ensure_coffeepos_plugin(&data_root, &new, &woocommerce).unwrap();
+
+        let destination = data_root.join("site/wp-content/plugins/coffeepos");
+        assert!(coffeepos_installation_ready(&data_root, &new));
+        assert_eq!(
+            read_coffeepos_plugin_header_version(&destination.join("coffeepos.php")).unwrap(),
+            COFFEEPOS_PHASE_4_10_VERSION
+        );
+        assert_eq!(fs::read(site_sentinel).unwrap(), b"preserve store data");
+        assert!(!data_root.join(COFFEEPOS_UPGRADE_BACKUP).exists());
+        assert!(!data_root.join("coffeepos.provisioning").exists());
+    }
+
+    #[test]
+    fn coffeepos_provisioning_preserves_owned_plugin_on_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let woocommerce_source = temp.path().join("woocommerce-source");
+        fs::create_dir_all(&woocommerce_source).unwrap();
+        fs::write(
+            woocommerce_source.join("woocommerce.php"),
+            b"<?php\n/**\n * Plugin Name: WooCommerce\n * Version: 11.1.0\n */\n",
+        )
+        .unwrap();
+        let coffeepos_source = temp.path().join("coffeepos-source");
+        create_test_coffeepos_source(&coffeepos_source);
+        let data_root = temp.path().join("store");
+        fs::create_dir_all(&data_root).unwrap();
+        let woocommerce = ResolvedWooCommerce {
+            version: "11.1.0".into(),
+            plugin_root: woocommerce_source,
+            archive_sha256: "6bae9bf74d722b6deb15f049687c311cfafc26e3a5d8fa55ac6ea4b9a3a8df19"
+                .into(),
+        };
+        let coffeepos = ResolvedCoffeePos {
+            version: "1.0.0".into(),
+            plugin_root: coffeepos_source,
+            archive_sha256: "ee9f241a516e7c6ddddc6e84ad26515d0a9cd9ccd5d6fd101d078a738e598f2a"
+                .into(),
+            required_wordpress_version: "7.1".into(),
+            required_php_version: "8.4.25".into(),
+            required_mariadb_version: "11.4.13".into(),
+            required_woocommerce_version: "11.1.0".into(),
+        };
+        ensure_woocommerce_plugin(&data_root, &woocommerce).unwrap();
+        ensure_coffeepos_plugin(&data_root, &coffeepos, &woocommerce).unwrap();
+        let destination = data_root.join("site/wp-content/plugins/coffeepos");
+        assert!(coffeepos_installation_ready(&data_root, &coffeepos));
+        let sentinel = destination.join("preserve-user-file.txt");
+        fs::write(&sentinel, b"preserve me").unwrap();
+
+        ensure_coffeepos_plugin(&data_root, &coffeepos, &woocommerce).unwrap();
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve me");
+    }
+
+    #[test]
+    fn coffeepos_provisioning_refuses_corrupt_managed_plugin_without_recopy() {
+        let temp = tempfile::tempdir().unwrap();
+        let woocommerce_source = temp.path().join("woocommerce-source");
+        fs::create_dir_all(&woocommerce_source).unwrap();
+        fs::write(
+            woocommerce_source.join("woocommerce.php"),
+            b"<?php\n/**\n * Plugin Name: WooCommerce\n * Version: 11.1.0\n */\n",
+        )
+        .unwrap();
+        let coffeepos_source = temp.path().join("coffeepos-source");
+        create_test_coffeepos_source(&coffeepos_source);
+        let data_root = temp.path().join("store");
+        fs::create_dir_all(&data_root).unwrap();
+        let woocommerce = ResolvedWooCommerce {
+            version: "11.1.0".into(),
+            plugin_root: woocommerce_source,
+            archive_sha256: "6bae9bf74d722b6deb15f049687c311cfafc26e3a5d8fa55ac6ea4b9a3a8df19"
+                .into(),
+        };
+        let coffeepos = ResolvedCoffeePos {
+            version: "1.0.0".into(),
+            plugin_root: coffeepos_source,
+            archive_sha256: "ee9f241a516e7c6ddddc6e84ad26515d0a9cd9ccd5d6fd101d078a738e598f2a"
+                .into(),
+            required_wordpress_version: "7.1".into(),
+            required_php_version: "8.4.25".into(),
+            required_mariadb_version: "11.4.13".into(),
+            required_woocommerce_version: "11.1.0".into(),
+        };
+        ensure_woocommerce_plugin(&data_root, &woocommerce).unwrap();
+        ensure_coffeepos_plugin(&data_root, &coffeepos, &woocommerce).unwrap();
+        let destination = data_root.join("site/wp-content/plugins/coffeepos");
+        let sentinel = destination.join("preserve-user-file.txt");
+        fs::write(&sentinel, b"preserve me").unwrap();
+        fs::remove_file(destination.join("vendor/autoload.php")).unwrap();
+
+        assert!(!coffeepos_installation_ready(&data_root, &coffeepos));
+        let error = ensure_coffeepos_plugin(&data_root, &coffeepos, &woocommerce).unwrap_err();
+        assert_eq!(error.operation, "provision CoffeePOS");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve me");
+        assert!(!destination.join("vendor/autoload.php").exists());
+    }
+
+    #[test]
+    fn coffeepos_provisioning_refuses_unmanaged_existing_plugin() {
+        let temp = tempfile::tempdir().unwrap();
+        let woocommerce_source = temp.path().join("woocommerce-source");
+        fs::create_dir_all(&woocommerce_source).unwrap();
+        fs::write(
+            woocommerce_source.join("woocommerce.php"),
+            b"<?php\n/**\n * Plugin Name: WooCommerce\n * Version: 11.1.0\n */\n",
+        )
+        .unwrap();
+        let coffeepos_source = temp.path().join("coffeepos-source");
+        fs::create_dir_all(&coffeepos_source).unwrap();
+        fs::write(
+            coffeepos_source.join("coffeepos.php"),
+            b"<?php\n/**\n * Plugin Name: CoffeePOS\n * Version: 1.0.0\n * Requires Plugins: woocommerce\n */\n",
+        )
+        .unwrap();
+        let data_root = temp.path().join("store");
+        fs::create_dir_all(&data_root).unwrap();
+        let woocommerce = ResolvedWooCommerce {
+            version: "11.1.0".into(),
+            plugin_root: woocommerce_source,
+            archive_sha256: "6bae9bf74d722b6deb15f049687c311cfafc26e3a5d8fa55ac6ea4b9a3a8df19"
+                .into(),
+        };
+        let coffeepos = ResolvedCoffeePos {
+            version: "1.0.0".into(),
+            plugin_root: coffeepos_source,
+            archive_sha256: "ee9f241a516e7c6ddddc6e84ad26515d0a9cd9ccd5d6fd101d078a738e598f2a"
+                .into(),
+            required_wordpress_version: "7.1".into(),
+            required_php_version: "8.4.25".into(),
+            required_mariadb_version: "11.4.13".into(),
+            required_woocommerce_version: "11.1.0".into(),
+        };
+        ensure_woocommerce_plugin(&data_root, &woocommerce).unwrap();
+        let destination = data_root.join("site/wp-content/plugins/coffeepos");
+        fs::create_dir_all(&destination).unwrap();
+        let sentinel = destination.join("unmanaged.txt");
+        fs::write(&sentinel, b"do not overwrite").unwrap();
+
+        let error = ensure_coffeepos_plugin(&data_root, &coffeepos, &woocommerce).unwrap_err();
+        assert_eq!(error.operation, "provision CoffeePOS");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"do not overwrite");
+        assert!(!destination.join(MANAGED_PLUGIN_OWNERSHIP_FILE).exists());
+    }
+
+    #[test]
+    fn coffeepos_provisioning_requires_managed_woocommerce_dependency() {
+        let temp = tempfile::tempdir().unwrap();
+        let coffeepos_source = temp.path().join("coffeepos-source");
+        fs::create_dir_all(&coffeepos_source).unwrap();
+        fs::write(
+            coffeepos_source.join("coffeepos.php"),
+            b"<?php\n/**\n * Plugin Name: CoffeePOS\n * Version: 1.0.0\n * Requires Plugins: woocommerce\n */\n",
+        )
+        .unwrap();
+        let woocommerce = ResolvedWooCommerce {
+            version: "11.1.0".into(),
+            plugin_root: temp.path().join("unused-woocommerce-source"),
+            archive_sha256: "6bae9bf74d722b6deb15f049687c311cfafc26e3a5d8fa55ac6ea4b9a3a8df19"
+                .into(),
+        };
+        let coffeepos = ResolvedCoffeePos {
+            version: "1.0.0".into(),
+            plugin_root: coffeepos_source,
+            archive_sha256: "ee9f241a516e7c6ddddc6e84ad26515d0a9cd9ccd5d6fd101d078a738e598f2a"
+                .into(),
+            required_wordpress_version: "7.1".into(),
+            required_php_version: "8.4.25".into(),
+            required_mariadb_version: "11.4.13".into(),
+            required_woocommerce_version: "11.1.0".into(),
+        };
+        let data_root = temp.path().join("store");
+        fs::create_dir_all(&data_root).unwrap();
+
+        let error = ensure_coffeepos_plugin(&data_root, &coffeepos, &woocommerce).unwrap_err();
+        assert_eq!(error.operation, "provision CoffeePOS");
+        assert!(!data_root.join("site/wp-content/plugins/coffeepos").exists());
     }
 
     #[test]
@@ -2580,6 +4811,8 @@ mod tests {
             wordpress_version: "7.1".into(),
             woocommerce_version: "11.1.0".into(),
             woocommerce_active: false,
+            coffeepos_version: "1.0.0".into(),
+            coffeepos_active: false,
             admin_username: Some(WORDPRESS_ADMIN_USER.into()),
             can_retry: false,
             last_error: Some(provisioning_error(
@@ -2592,6 +4825,8 @@ mod tests {
         assert_eq!(value["state"], "needs_repair");
         assert_eq!(value["woocommerce_version"], "11.1.0");
         assert_eq!(value["woocommerce_active"], false);
+        assert_eq!(value["coffeepos_version"], "1.0.0");
+        assert_eq!(value["coffeepos_active"], false);
         assert_eq!(value["can_retry"], false);
         assert_eq!(value["last_error"]["operation"], "read journal");
     }
@@ -2653,17 +4888,19 @@ mod tests {
                         |read_error| format!("<cannot read provisioning.log: {read_error}>"),
                     );
                 panic!(
-                    "install WordPress/WooCommerce failed: {error}\n--- woocommerce.log ---\n{woocommerce_log}\n--- provisioning.log ---\n{provisioning_log}"
+                    "install WordPress/WooCommerce/CoffeePOS failed: {error}\n--- woocommerce.log ---\n{woocommerce_log}\n--- provisioning.log ---\n{provisioning_log}"
                 );
             });
         assert_eq!(installed.state, ProvisioningState::Ready);
         assert!(installed.woocommerce_active);
+        assert!(installed.coffeepos_active);
         let inspected = provisioner.inspect();
         assert_eq!(inspected.state, ProvisioningState::Ready);
         assert!(inspected.woocommerce_active);
+        assert!(inspected.coffeepos_active);
         assert_eq!(
             provisioner.load_journal().unwrap().unwrap().stage,
-            ProvisioningStage::WooCommerceActivated
+            ProvisioningStage::MachineHealthBootstrapped
         );
         assert!(fs::read_to_string(data_root.join("site/wp-config.php"))
             .unwrap()
@@ -2673,15 +4910,98 @@ mod tests {
             read_plugin_header_version(&woocommerce.join("woocommerce.php")).unwrap(),
             "11.1.0"
         );
-        assert!(woocommerce.join(WOOCOMMERCE_OWNERSHIP_FILE).is_file());
+        assert!(woocommerce.join(MANAGED_PLUGIN_OWNERSHIP_FILE).is_file());
         assert!(!data_root.join("woocommerce.provisioning").exists());
+        let coffeepos = data_root.join("site/wp-content/plugins/coffeepos");
+        assert_eq!(
+            read_coffeepos_plugin_header_version(&coffeepos.join("coffeepos.php")).unwrap(),
+            "1.0.1"
+        );
+        assert!(coffeepos.join(MANAGED_PLUGIN_OWNERSHIP_FILE).is_file());
+        assert!(!data_root.join("coffeepos.provisioning").exists());
+        let active_plugins = query_wordpress_option(
+            &provisioner,
+            running.database_port.unwrap(),
+            "active_plugins",
+        );
+        assert!(
+            active_plugins.contains("woocommerce/woocommerce.php"),
+            "WooCommerce is not active after Phase 4.6 baseline: {active_plugins}"
+        );
+        assert!(
+            active_plugins.contains("coffeepos/coffeepos.php"),
+            "CoffeePOS is not active after Phase 4.9 activation: {active_plugins}"
+        );
+        assert_eq!(
+            query_wordpress_option(
+                &provisioner,
+                running.database_port.unwrap(),
+                "coffeepos_installed_version",
+            ),
+            "1.0.1"
+        );
+        assert_eq!(
+            query_wordpress_option(
+                &provisioner,
+                running.database_port.unwrap(),
+                "coffeepos_db_version",
+            ),
+            "0.0.1"
+        );
+        assert_eq!(
+            query_wordpress_option(
+                &provisioner,
+                running.database_port.unwrap(),
+                "coffeepos_rewrite_version",
+            ),
+            "1.0.1:3"
+        );
+        let machine_token_path = data_root.join(MACHINE_TOKEN_SECRET);
+        let machine_token = secret::load(&machine_token_path).unwrap();
+        assert_eq!(machine_token.len(), 64);
+        assert_eq!(machine_token.to_ascii_lowercase(), machine_token);
+        let protected_machine_token = fs::read(&machine_token_path).unwrap();
+        assert!(!protected_machine_token
+            .windows(machine_token.len())
+            .any(|window| window == machine_token.as_bytes()));
 
         let post_install_health = manager.refresh_wordpress_health();
-        assert_eq!(
-            post_install_health.wordpress_health,
-            WordPressHealthState::Healthy
-        );
+        if post_install_health.wordpress_health != WordPressHealthState::Healthy {
+            let php_log = fs::read_to_string(data_root.join("logs/php.log"))
+                .unwrap_or_else(|error| format!("<cannot read php.log: {error}>"));
+            let database_log = fs::read_to_string(data_root.join("logs/database.log"))
+                .unwrap_or_else(|error| format!("<cannot read database.log: {error}>"));
+            let runtime_log = fs::read_to_string(data_root.join("logs/runtime.log"))
+                .unwrap_or_else(|error| format!("<cannot read runtime.log: {error}>"));
+            panic!(
+                "WordPress health after CoffeePOS provisioning was {:?}: {:?}\n--- php.log ---\n{}\n--- database.log ---\n{}\n--- runtime.log ---\n{}",
+                post_install_health.wordpress_health,
+                post_install_health.wordpress_error,
+                php_log,
+                database_log,
+                runtime_log
+            );
+        }
         assert!(post_install_health.wordpress_error.is_none());
+        assert_eq!(
+            post_install_health.coffeepos_health.state,
+            CoffeePosHealthState::Healthy
+        );
+        let app_health = post_install_health
+            .coffeepos_health
+            .payload
+            .as_ref()
+            .unwrap();
+        assert_eq!(app_health.schema_version, 1);
+        assert_eq!(app_health.versions.wordpress, "7.1");
+        assert_eq!(app_health.versions.woocommerce, "11.1.0");
+        assert_eq!(app_health.versions.coffeepos, "1.0.1");
+        assert_eq!(app_health.versions.coffeepos_schema, "0.0.1");
+        assert!(app_health.wordpress);
+        assert!(app_health.woocommerce);
+        assert!(app_health.coffeepos);
+        assert!(app_health.database);
+        assert!(app_health.pos_path.starts_with('/'));
         let rest_response = http_get(
             post_install_health.http_port.unwrap(),
             "/wp-json/wc/store/v1/products?per_page=1",
@@ -2690,6 +5010,134 @@ mod tests {
             rest_response.starts_with("HTTP/1.0 200 ")
                 || rest_response.starts_with("HTTP/1.1 200 "),
             "WooCommerce Store API did not return HTTP 200 after activation:\n{rest_response}"
+        );
+        let coffeepos_health_response = http_get(
+            post_install_health.http_port.unwrap(),
+            "/wp-json/coffeepos/v1/health",
+        );
+        assert!(
+            coffeepos_health_response.starts_with("HTTP/1.0 401 ")
+                || coffeepos_health_response.starts_with("HTTP/1.1 401 ")
+                || coffeepos_health_response.starts_with("HTTP/1.0 403 ")
+                || coffeepos_health_response.starts_with("HTTP/1.1 403 "),
+            "CoffeePOS health route did not enforce its normal permission contract after activation:\n{coffeepos_health_response}"
+        );
+        assert!(
+            coffeepos_health_response.contains("coffeepos_rest_forbidden"),
+            "CoffeePOS health route did not return the plugin-owned permission error:\n{coffeepos_health_response}"
+        );
+        let machine_health_without_token = http_get(
+            post_install_health.http_port.unwrap(),
+            "/wp-json/coffeepos/v1/system/status",
+        );
+        assert!(
+            machine_health_without_token.starts_with("HTTP/1.0 401 ")
+                || machine_health_without_token.starts_with("HTTP/1.1 401 "),
+            "Machine-health request without token did not return HTTP 401:\n{machine_health_without_token}"
+        );
+        let wrong_token = "0".repeat(64);
+        let machine_health_wrong_token = http_get_with_headers(
+            post_install_health.http_port.unwrap(),
+            "/wp-json/coffeepos/v1/system/status",
+            &[("X-CoffeePOS-Machine-Token", wrong_token.as_str())],
+        );
+        assert!(
+            machine_health_wrong_token.starts_with("HTTP/1.0 401 ")
+                || machine_health_wrong_token.starts_with("HTTP/1.1 401 "),
+            "Machine-health request with wrong token did not return HTTP 401:\n{machine_health_wrong_token}"
+        );
+        let machine_health_authenticated = http_get_with_headers(
+            post_install_health.http_port.unwrap(),
+            "/wp-json/coffeepos/v1/system/status",
+            &[("X-CoffeePOS-Machine-Token", machine_token.as_str())],
+        );
+        assert!(
+            machine_health_authenticated.starts_with("HTTP/1.0 200 ")
+                || machine_health_authenticated.starts_with("HTTP/1.1 200 "),
+            "Authenticated machine-health request did not return HTTP 200:\n{machine_health_authenticated}"
+        );
+        assert!(machine_health_authenticated.contains(r#""schema_version":1"#));
+        assert!(machine_health_authenticated.contains(r#""status":"healthy""#));
+
+        update_wordpress_option(
+            &provisioner,
+            post_install_health.database_port.unwrap(),
+            "coffeepos_installed_version",
+            "stale-for-health-test",
+        );
+        let degraded = manager.refresh_coffeepos_health();
+        assert_eq!(
+            degraded.coffeepos_health.state,
+            CoffeePosHealthState::Degraded
+        );
+        assert!(
+            !degraded
+                .coffeepos_health
+                .payload
+                .as_ref()
+                .unwrap()
+                .coffeepos
+        );
+        let degraded_http = http_get_with_headers(
+            degraded.http_port.unwrap(),
+            "/wp-json/coffeepos/v1/system/status",
+            &[("X-CoffeePOS-Machine-Token", machine_token.as_str())],
+        );
+        assert!(
+            degraded_http.starts_with("HTTP/1.0 503 ")
+                || degraded_http.starts_with("HTTP/1.1 503 "),
+            "CoffeePOS plugin invariant failure did not return machine-health HTTP 503:\n{degraded_http}"
+        );
+        update_wordpress_option(
+            &provisioner,
+            post_install_health.database_port.unwrap(),
+            "coffeepos_installed_version",
+            "1.0.1",
+        );
+        assert_eq!(
+            manager.refresh_coffeepos_health().coffeepos_health.state,
+            CoffeePosHealthState::Healthy
+        );
+
+        let woocommerce_unavailable =
+            data_root.join("site/wp-content/plugins/woocommerce.health-unavailable");
+        fs::rename(&woocommerce, &woocommerce_unavailable).unwrap();
+        let unavailable = manager.refresh_coffeepos_health();
+        assert_eq!(
+            unavailable.coffeepos_health.state,
+            CoffeePosHealthState::Degraded
+        );
+        assert!(
+            !unavailable
+                .coffeepos_health
+                .payload
+                .as_ref()
+                .unwrap()
+                .woocommerce
+        );
+        fs::rename(&woocommerce_unavailable, &woocommerce).unwrap();
+        assert_eq!(
+            manager.refresh_coffeepos_health().coffeepos_health.state,
+            CoffeePosHealthState::Healthy
+        );
+
+        let coffeepos_unavailable =
+            data_root.join("site/wp-content/plugins/coffeepos.health-unavailable");
+        fs::rename(&coffeepos, &coffeepos_unavailable).unwrap();
+        let plugin_unavailable = manager.refresh_coffeepos_health();
+        assert_eq!(
+            plugin_unavailable.coffeepos_health.state,
+            CoffeePosHealthState::Failed
+        );
+        assert_eq!(
+            plugin_unavailable.coffeepos_health.failure_kind,
+            Some(CoffeePosHealthFailureKind::TransportBootstrap)
+        );
+        assert!(plugin_unavailable.coffeepos_health.payload.is_none());
+        fs::rename(&coffeepos_unavailable, &coffeepos).unwrap();
+        assert_eq!(
+            manager.refresh_coffeepos_health().coffeepos_health.state,
+            CoffeePosHealthState::Healthy
         );
 
         let healthy = manager.restart().unwrap();
@@ -2705,6 +5153,20 @@ mod tests {
             );
         }
         assert!(healthy.wordpress_error.is_none());
+        assert_eq!(
+            healthy.coffeepos_health.state,
+            CoffeePosHealthState::Healthy
+        );
+        assert_eq!(secret::load(&machine_token_path).unwrap(), machine_token);
+        let active_plugins_after_restart = query_wordpress_option(
+            &provisioner,
+            healthy.database_port.unwrap(),
+            "active_plugins",
+        );
+        assert!(
+            active_plugins_after_restart.contains("coffeepos/coffeepos.php"),
+            "CoffeePOS activation did not persist across runtime restart: {active_plugins_after_restart}"
+        );
 
         manager.kill_php_for_test();
         let child_failed = manager.refresh();
@@ -2713,6 +5175,10 @@ mod tests {
             child_failed.wordpress_health,
             WordPressHealthState::Unavailable
         );
+        assert_eq!(
+            child_failed.coffeepos_health.state,
+            CoffeePosHealthState::Unavailable
+        );
         assert!(child_failed.last_error.is_some());
 
         let recovered_after_child_exit = manager.start().unwrap();
@@ -2720,6 +5186,10 @@ mod tests {
         assert_eq!(
             recovered_after_child_exit.wordpress_health,
             WordPressHealthState::Healthy
+        );
+        assert_eq!(
+            recovered_after_child_exit.coffeepos_health.state,
+            CoffeePosHealthState::Healthy
         );
 
         manager.stop().unwrap();
@@ -2732,12 +5202,20 @@ mod tests {
             failed_start.wordpress_health,
             WordPressHealthState::Unavailable
         );
+        assert_eq!(
+            failed_start.coffeepos_health.state,
+            CoffeePosHealthState::Unavailable
+        );
         manager.replace_php_executable_for_test(original_php);
         let retried_start = manager.start().unwrap();
         assert_eq!(retried_start.state, RuntimeState::Running);
         assert_eq!(
             retried_start.wordpress_health,
             WordPressHealthState::Healthy
+        );
+        assert_eq!(
+            retried_start.coffeepos_health.state,
+            CoffeePosHealthState::Healthy
         );
 
         let old_http_port = retried_start.http_port.unwrap();
@@ -2754,6 +5232,10 @@ mod tests {
         assert_eq!(
             moved_runtime.wordpress_health,
             WordPressHealthState::Healthy
+        );
+        assert_eq!(
+            moved_runtime.coffeepos_health.state,
+            CoffeePosHealthState::Healthy
         );
         assert_eq!(
             manager.wordpress_url().unwrap(),
@@ -2787,6 +5269,8 @@ mod tests {
         fs::write(&sentinel, b"preserve me").unwrap();
         let woocommerce_sentinel = woocommerce.join("coffeepos-phase4-5-sentinel.txt");
         fs::write(&woocommerce_sentinel, b"preserve plugin data").unwrap();
+        let coffeepos_sentinel = coffeepos.join("coffeepos-phase4-8-sentinel.txt");
+        fs::write(&coffeepos_sentinel, b"preserve coffeepos plugin data").unwrap();
         let unrelated_plugin = data_root.join("site/wp-content/plugins/existing-plugin");
         fs::create_dir_all(&unrelated_plugin).unwrap();
         let unrelated_sentinel = unrelated_plugin.join("keep.txt");
@@ -2795,6 +5279,10 @@ mod tests {
         let stopped = manager.stop().unwrap();
         assert_eq!(stopped.state, RuntimeState::Stopped);
         assert_eq!(stopped.wordpress_health, WordPressHealthState::Unavailable);
+        assert_eq!(
+            stopped.coffeepos_health.state,
+            CoffeePosHealthState::Unavailable
+        );
         assert!(stopped.database_pid.is_none());
         assert!(stopped.php_pid.is_none());
         assert!(stopped.database_port.is_none());
@@ -2815,10 +5303,16 @@ mod tests {
             .unwrap();
         assert_eq!(installed_again.state, ProvisioningState::Ready);
         assert!(installed_again.woocommerce_active);
+        assert!(installed_again.coffeepos_active);
+        assert_eq!(secret::load(&machine_token_path).unwrap(), machine_token);
         assert!(sentinel.is_file());
         assert_eq!(
             fs::read(&woocommerce_sentinel).unwrap(),
             b"preserve plugin data"
+        );
+        assert_eq!(
+            fs::read(&coffeepos_sentinel).unwrap(),
+            b"preserve coffeepos plugin data"
         );
         assert_eq!(
             fs::read(&unrelated_sentinel).unwrap(),
@@ -2827,6 +5321,7 @@ mod tests {
         let inspected_again = provisioner.inspect();
         assert_eq!(inspected_again.state, ProvisioningState::Ready);
         assert!(inspected_again.woocommerce_active);
+        assert!(inspected_again.coffeepos_active);
 
         let stopped_again = manager.stop().unwrap();
         assert_eq!(stopped_again.state, RuntimeState::Stopped);

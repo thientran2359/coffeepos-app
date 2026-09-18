@@ -7,7 +7,7 @@
   </head>
   <body>
     <main>
-      <header><span class="mark" aria-hidden="true">C</span><div><h1>CoffeePOS</h1><p>Môi trường bán hàng tại cửa hàng</p></div><span class="phase">Phase 4.6</span></header>
+      <header><span class="mark" aria-hidden="true">C</span><div><h1>CoffeePOS</h1><p>Môi trường bán hàng tại cửa hàng</p></div><span class="phase">Phase 4.10</span></header>
       <section class="card" aria-labelledby="status-title">
         <span class="eyebrow">COFFEEPOS DESKTOP</span>
         <h2 id="status-title">Đang đọc cấu hình…</h2>
@@ -24,14 +24,15 @@
           <p id="provisioning-status" role="status" aria-live="polite">Đang kiểm tra trạng thái cài đặt…</p>
           <p id="provisioning-error" class="error" role="alert" hidden></p>
           <div class="actions">
-            <button id="provision-wordpress" type="button" disabled>Cài WordPress + WooCommerce</button>
+            <button id="provision-wordpress" type="button" disabled>Cài CoffeePOS</button>
           </div>
           <dl id="provisioning-details" hidden>
             <dt>WordPress</dt><dd id="provisioning-wordpress">—</dd>
             <dt>WooCommerce</dt><dd id="provisioning-woocommerce">—</dd>
+            <dt>CoffeePOS</dt><dd id="provisioning-coffeepos">—</dd>
             <dt>Tài khoản quản trị</dt><dd id="provisioning-admin">—</dd>
           </dl>
-          <p class="hint">WooCommerce được provision và activate từ artifact đã pin. CoffeePOS plugin bắt đầu ở Phase 4.7.</p>
+          <p class="hint">CoffeePOS được provision từ exact artifact đã pin ở Phase 4.7 và activate bằng plugin-owned lifecycle sau khi WooCommerce dependency được xác minh.</p>
         </div>
       </section>
       <section class="card" id="runtime" hidden aria-labelledby="runtime-title">
@@ -46,7 +47,9 @@
         </div>
         <p id="open-wordpress-status" class="hint" role="status" aria-live="polite"></p>
         <p id="wordpress-health-error" class="error" role="alert" hidden></p>
-        <dl><dt>Runtime</dt><dd id="runtime-state">—</dd><dt>WordPress health</dt><dd id="wordpress-health">—</dd><dt>PHP</dt><dd id="runtime-php">—</dd><dt>MariaDB</dt><dd id="runtime-mariadb">—</dd><dt>HTTP</dt><dd id="runtime-http">—</dd><dt>Database</dt><dd id="runtime-database">—</dd></dl>
+        <p id="coffeepos-health-error" class="error" role="alert" hidden></p>
+        <p id="coffeepos-health-details" class="hint"></p>
+        <dl><dt>Runtime</dt><dd id="runtime-state">—</dd><dt>WordPress health</dt><dd id="wordpress-health">—</dd><dt>CoffeePOS health</dt><dd id="coffeepos-health">—</dd><dt>PHP</dt><dd id="runtime-php">—</dd><dt>MariaDB</dt><dd id="runtime-mariadb">—</dd><dt>HTTP</dt><dd id="runtime-http">—</dd><dt>Database</dt><dd id="runtime-database">—</dd></dl>
       </section>
       <section class="card" id="settings" hidden aria-labelledby="settings-title">
         <h2 id="settings-title">Cấu hình ứng dụng</h2>

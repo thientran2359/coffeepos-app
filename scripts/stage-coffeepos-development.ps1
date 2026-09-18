@@ -8,7 +8,7 @@ $scriptRoot = Split-Path -Parent $PSCommandPath
 $projectRoot = Split-Path -Parent $scriptRoot
 $runtimeRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot 'runtime/development'))
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $scriptRoot 'coffeepos-development'))
-$manifestTemplate = Join-Path $artifactRoot 'coffeepos-1.0.0.manifest.json'
+$manifestTemplate = Join-Path $artifactRoot 'coffeepos-1.0.1.manifest.json'
 $manifest = Get-Content -LiteralPath $manifestTemplate -Raw | ConvertFrom-Json
 
 if ($manifest.schema_version -ne 1) {

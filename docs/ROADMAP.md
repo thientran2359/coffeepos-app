@@ -41,7 +41,9 @@ Giữ nguyên số phase. Các mốc artifact/install/activation là checkpoint 
 | 4.5 — WooCommerce provisioning | ✅ Hoàn thành Windows-first | Ownership-safe atomic install, journal stage, retry preserves plugin/data, unmanaged conflict refusal |
 | 4.6 — WooCommerce activation | ✅ Hoàn thành Windows-first | Active 11.1.0, DB schema 11.1.0-1, setup/onboarding verified, managed CLI cron/background worker |
 | 4.7 — CoffeePOS artifact | ✅ Hoàn thành Windows-first | CoffeePOS 1.0.0 immutable checked-in ZIP + SHA256 + source provenance + deterministic staging |
-| 4.8+ | ⏳ Chưa bắt đầu | Mốc tiếp theo: CoffeePOS provisioning |
+| 4.8 — CoffeePOS provisioning | ✅ Hoàn thành Windows-first | Ownership-safe install 1.0.0, dependency preflight, journal stage, retry/data preservation |
+| 4.9 — CoffeePOS activation | ✅ Hoàn thành Windows-first | Exact 1.0.0 active, Woo 11.1.0 preflight, fresh-process plugin baseline verification, restart/retry persistence |
+| 4.10+ | ⏳ Chưa bắt đầu | Mốc tiếp theo: CoffeePOS health endpoint |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -131,6 +133,8 @@ Schema/auth/version/POS-route của machine-health phải được chốt trư�
 
 **Definition of Done:** fresh site có CoffeePOS đúng version; retry giữ nguyên site/plugin data.
 
+**Hoàn thành Windows-first 2026-09-18:** native provisioning consume exact staged CoffeePOS 1.0.0, validate target/layout/header/dependency + full WordPress/PHP/MariaDB/WooCommerce compatibility baseline, ensure vào wp-content/plugins/coffeepos qua owned coffeepos.provisioning + atomic rename và .coffeepos-managed.json. Existing unmanaged/mismatched/corrupt destination được preserve/refuse; exact managed retry là no-op. Journal append coffee_pos_provisioned + optional coffeepos_version, nên Phase 4.6 store deserialize an toàn và chuyển needs_repair cho tới retry. E2E xác nhận Woo active nhưng CoffeePOS chưa active, fresh/retry giữ WordPress/Woo/CoffeePOS/unrelated sentinels. Acceptance cũng phát hiện Woo-active WordPress first request có thể vượt 10s; runtime tách WordPress readiness 45s khỏi PHP HTTP readiness 10s. Xem docs/PHASE-04.8.md.
+
 ### Phase 4.9 — CoffeePOS activation
 
 **Mục tiêu:** activate CoffeePOS sau khi WooCommerce đã sẵn sàng.
@@ -138,6 +142,8 @@ Schema/auth/version/POS-route của machine-health phải được chốt trư�
 **Definition of Done:** CoffeePOS active, dependency lỗi được báo rõ, restart runtime không làm mất trạng thái activation.
 
 Xác minh migrations, roles/capabilities, settings và route cần thiết bằng cơ chế của plugin. Activation không thay nghiệm thu health/POS, và Desktop không tự tạo lại schema hoặc business defaults của CoffeePOS.
+
+**Hoàn thành Windows-first 2026-09-18:** existing provisioning orchestration activate exact managed CoffeePOS 1.0.0 qua bounded pinned-PHP CLI sau explicit exact WooCommerce 11.1.0 active/header/runtime preflight. Activation và verification tách thành hai PHP process: process đầu chỉ chạy plugin activation/lifecycle; process thứ hai load WordPress mới hoàn toàn rồi verify active version/autoload, plugin-owned Migrator schema + physical tables, Settings options, roles/capabilities, rewrite version/rules và actual REST registry (bao gồm toàn bộ route mà RouteRegistrar::registeredRoutes() công bố). Chỉ sau fresh-process verifier pass mới persist journal coffee_pos_activated và báo Ready/coffeepos_active=true. Failure giữ journal ở coffee_pos_provisioned để retry replay plugin lifecycle mà không reset site/database/plugin data. Real staged E2E pass fresh activation, REST permission contract, runtime restart/process-death/port recovery và second provisioning. Xem docs/PHASE-04.9.md.
 
 ### Phase 4.10 — CoffeePOS health endpoint
 
@@ -277,4 +283,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.7 đã pass Windows-first. Mốc tiếp theo là **Phase 4.8 — CoffeePOS provisioning**; phải consume exact staged CoffeePOS `1.0.0` artifact đã pin ở 4.7 bằng ownership-safe ensure semantics, không đọc sibling checkout hoặc LocalWP plugin directory.
+Phase 4.1–4.8 đã pass Windows-first. Mốc tiếp theo là **Phase 4.9 — CoffeePOS activation**; phải activate đúng managed CoffeePOS 1.0.0, kiểm WooCommerce dependency/version và plugin-owned migrations/capabilities/settings/routes trước khi coi CoffeePOS usable.

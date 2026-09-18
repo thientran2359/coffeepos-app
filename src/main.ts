@@ -14,6 +14,30 @@ interface RuntimeErrorInfo {
   recovery: string;
 }
 
+interface CoffeePosHealthPayload {
+  schema_version: number;
+  status: "healthy" | "degraded";
+  wordpress: boolean;
+  woocommerce: boolean;
+  coffeepos: boolean;
+  database: boolean;
+  versions: {
+    wordpress: string;
+    woocommerce: string;
+    coffeepos: string;
+    coffeepos_schema: string;
+  };
+  store: { name: string };
+  pos_path: string;
+}
+
+interface CoffeePosHealthInfo {
+  state: "unavailable" | "checking" | "healthy" | "degraded" | "failed";
+  failure_kind: "transport_bootstrap" | "authentication" | "contract" | null;
+  payload: CoffeePosHealthPayload | null;
+  error: RuntimeErrorInfo | null;
+}
+
 interface RuntimeInfo {
   state: "not_installed" | "installing" | "stopped" | "starting" | "running" | "stopping";
   runtime_version: string | null;
@@ -25,6 +49,7 @@ interface RuntimeInfo {
   php_pid: number | null;
   wordpress_health: "unavailable" | "checking" | "healthy" | "unhealthy";
   wordpress_error: RuntimeErrorInfo | null;
+  coffeepos_health: CoffeePosHealthInfo;
   last_error: RuntimeErrorInfo | null;
 }
 
@@ -35,6 +60,8 @@ interface ProvisioningInfo {
   wordpress_version: string;
   woocommerce_version: string;
   woocommerce_active: boolean;
+  coffeepos_version: string;
+  coffeepos_active: boolean;
   admin_username: string | null;
   can_retry: boolean;
   last_error: RuntimeErrorInfo | null;
@@ -59,6 +86,7 @@ const provisioningError = element("provisioning-error");
 const provisioningDetails = element("provisioning-details");
 const provisioningWordPress = element("provisioning-wordpress");
 const provisioningWooCommerce = element("provisioning-woocommerce");
+const provisioningCoffeePos = element("provisioning-coffeepos");
 const provisioningAdmin = element("provisioning-admin");
 const provisionWordPress = element<HTMLButtonElement>("provision-wordpress");
 const runtimeSection = element("runtime");
@@ -70,6 +98,9 @@ const openWordPress = element<HTMLButtonElement>("open-wordpress");
 const openWordPressStatus = element("open-wordpress-status");
 const wordpressHealth = element("wordpress-health");
 const wordpressHealthError = element("wordpress-health-error");
+const coffeeposHealth = element("coffeepos-health");
+const coffeeposHealthError = element("coffeepos-health-error");
+const coffeeposHealthDetails = element("coffeepos-health-details");
 
 let provisioningBusy = false;
 let runtimeBusy = false;
@@ -124,6 +155,15 @@ function renderRuntime(info: RuntimeInfo): void {
   wordpressHealth.textContent = info.wordpress_health;
   wordpressHealthError.hidden = !info.wordpress_error;
   wordpressHealthError.textContent = info.wordpress_error ? structuredErrorText(info.wordpress_error) : "";
+  coffeeposHealth.textContent = info.coffeepos_health.state;
+  coffeeposHealthError.hidden = !info.coffeepos_health.error;
+  coffeeposHealthError.textContent = info.coffeepos_health.error
+    ? `${info.coffeepos_health.failure_kind ? `${info.coffeepos_health.failure_kind}: ` : ""}${structuredErrorText(info.coffeepos_health.error)}`
+    : "";
+  const appHealth = info.coffeepos_health.payload;
+  coffeeposHealthDetails.textContent = appHealth
+    ? `${appHealth.store.name} · WP ${appHealth.versions.wordpress} [${appHealth.wordpress ? "ready" : "not ready"}] · Woo ${appHealth.versions.woocommerce} [${appHealth.woocommerce ? "ready" : "not ready"}] · CoffeePOS ${appHealth.versions.coffeepos} [${appHealth.coffeepos ? "ready" : "not ready"}] · schema ${appHealth.versions.coffeepos_schema} · DB ${appHealth.database ? "ready" : "not ready"} · POS ${appHealth.pos_path}`
+    : "";
   setRuntimeControls(info);
   if (provisioningBusy) {
     runtimeDescription.textContent = "Runtime controls tạm khóa trong khi WordPress đang được provision.";
@@ -135,7 +175,15 @@ function renderRuntime(info: RuntimeInfo): void {
     runtimeDescription.textContent = "Runtime bundle đã sẵn sàng; WordPress/database chưa được provision.";
   } else if (info.state === "running") {
     if (info.wordpress_health === "healthy") {
-      runtimeDescription.textContent = "MariaDB, PHP và WordPress đã vượt qua readiness checks.";
+      if (info.coffeepos_health.state === "healthy") {
+        runtimeDescription.textContent = "MariaDB, PHP, WordPress và CoffeePOS application health đều healthy.";
+      } else if (info.coffeepos_health.state === "degraded") {
+        runtimeDescription.textContent = "Runtime và WordPress đang chạy, nhưng CoffeePOS báo dependency/application state degraded.";
+      } else if (info.coffeepos_health.state === "failed") {
+        runtimeDescription.textContent = "WordPress đang healthy nhưng CoffeePOS machine-health probe thất bại. Xem phân loại lỗi bên dưới.";
+      } else {
+        runtimeDescription.textContent = "MariaDB, PHP và WordPress đã vượt qua readiness checks; CoffeePOS application health chưa được xác minh.";
+      }
     } else if (info.wordpress_health === "unhealthy") {
       runtimeDescription.textContent = "MariaDB và PHP đang chạy, nhưng WordPress chưa healthy. Có thể khởi động lại runtime để thử lại; không cần cài lại WordPress.";
     } else {
@@ -156,6 +204,9 @@ function renderProvisioning(info: ProvisioningInfo, commandError?: string): void
   provisioningWooCommerce.textContent = info.woocommerce_version
     ? `${info.woocommerce_version} · ${info.woocommerce_active ? "active" : "not active"}`
     : "—";
+  provisioningCoffeePos.textContent = info.coffeepos_version
+    ? `${info.coffeepos_version} · ${info.coffeepos_active ? "active" : "not active"}`
+    : "—";
   provisioningAdmin.textContent = info.admin_username ?? "—";
   provisioningDetails.hidden = false;
   provisioningError.hidden = true;
@@ -171,17 +222,17 @@ function renderProvisioning(info: ProvisioningInfo, commandError?: string): void
 
   if (provisioningBusy || info.state === "installing") {
     provisioningState.textContent = "installing";
-    provisioningStatus.textContent = "Đang đảm bảo database, WordPress, WooCommerce activation và schema. Không đóng app hoặc điều khiển runtime trong lúc này.";
+    provisioningStatus.textContent = "Đang đảm bảo database, WordPress, WooCommerce và activate exact CoffeePOS artifact. Không đóng app hoặc điều khiển runtime trong lúc này.";
     provisionWordPress.textContent = "Đang cài đặt…";
     provisionWordPress.hidden = false;
     provisionWordPress.disabled = true;
   } else if (info.state === "not_installed") {
-    provisioningStatus.textContent = "WordPress/WooCommerce chưa được provision. Thao tác này sẽ tạo local store và cài exact WooCommerce artifact đã pin.";
-    provisionWordPress.textContent = "Cài WordPress + WooCommerce";
+    provisioningStatus.textContent = "Local store chưa được provision. Thao tác này sẽ tạo WordPress, chuẩn bị WooCommerce, cài và activate exact CoffeePOS artifact đã pin.";
+    provisionWordPress.textContent = "Cài CoffeePOS";
     provisionWordPress.hidden = false;
     provisionWordPress.disabled = false;
   } else if (info.state === "ready") {
-    provisioningStatus.textContent = `WordPress ${info.wordpress_version} + WooCommerce ${info.woocommerce_version} đã active, schema/setup baseline đã được xác minh và native provisioning báo Ready.`;
+    provisioningStatus.textContent = `WordPress ${info.wordpress_version} + WooCommerce ${info.woocommerce_version} + CoffeePOS ${info.coffeepos_version} đã active và vượt qua activation baseline.`;
     provisionWordPress.hidden = true;
     provisionWordPress.disabled = true;
   } else if (info.can_retry) {
@@ -250,6 +301,8 @@ async function provision(): Promise<void> {
     wordpress_version: "",
     woocommerce_version: "",
     woocommerce_active: false,
+    coffeepos_version: "",
+    coffeepos_active: false,
     admin_username: null,
     can_retry: false,
     last_error: null,
@@ -285,6 +338,10 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
   wordpressHealth.textContent = "unavailable";
   wordpressHealthError.hidden = true;
   wordpressHealthError.textContent = "";
+  coffeeposHealth.textContent = "unavailable";
+  coffeeposHealthError.hidden = true;
+  coffeeposHealthError.textContent = "";
+  coffeeposHealthDetails.textContent = "";
   openWordPressStatus.textContent = "";
   runtimeDescription.textContent = command === "stop_runtime" ? "Đang dừng PHP và MariaDB…" : "Đang khởi động runtime và kiểm tra WordPress…";
   try {
@@ -329,7 +386,7 @@ async function bootstrap(): Promise<void> {
     element("version").textContent = info.version;
     element("settings").hidden = false;
     title.textContent = "Desktop shell đã sẵn sàng";
-    description.textContent = "Phase 4.6 activate WooCommerce 11.1.0, verify schema/setup và chạy WordPress cron/background jobs bằng native PHP CLI thay vì nested loopback self-request.";
+    description.textContent = "Phase 4.10 dùng authenticated CoffeePOS machine-health endpoint để phân biệt application healthy, degraded và transport/auth/contract failure.";
     await refreshProvisioning();
     await refreshRuntime();
   } catch (error) {

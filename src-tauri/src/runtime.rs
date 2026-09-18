@@ -21,6 +21,10 @@ pub(crate) const DATABASE_WORDPRESS_USER: &str = "coffeepos_wp";
 pub(crate) const DATABASE_NAME: &str = "coffeepos";
 pub(crate) const DATABASE_RUNTIME_SECRET: &str = "config/database-runtime.secret";
 pub(crate) const DATABASE_WORDPRESS_SECRET: &str = "config/database-wordpress.secret";
+pub(crate) const MACHINE_TOKEN_SECRET: &str = "config/machine-token.secret";
+pub(crate) const MACHINE_TOKEN_PENDING_SECRET: &str = "config/machine-token.pending.secret";
+const COFFEEPOS_HEALTH_SCHEMA_VERSION: u32 = 1;
+const COFFEEPOS_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +44,70 @@ pub enum WordPressHealthState {
     Checking,
     Healthy,
     Unhealthy,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoffeePosHealthState {
+    Unavailable,
+    Checking,
+    Healthy,
+    Degraded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoffeePosHealthFailureKind {
+    TransportBootstrap,
+    Authentication,
+    Contract,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoffeePosHealthVersions {
+    pub wordpress: String,
+    pub woocommerce: String,
+    pub coffeepos: String,
+    pub coffeepos_schema: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoffeePosHealthStore {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CoffeePosHealthPayload {
+    pub schema_version: u32,
+    pub status: String,
+    pub wordpress: bool,
+    pub woocommerce: bool,
+    pub coffeepos: bool,
+    pub database: bool,
+    pub versions: CoffeePosHealthVersions,
+    pub store: CoffeePosHealthStore,
+    pub pos_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CoffeePosHealthInfo {
+    pub state: CoffeePosHealthState,
+    pub failure_kind: Option<CoffeePosHealthFailureKind>,
+    pub payload: Option<CoffeePosHealthPayload>,
+    pub error: Option<RuntimeErrorInfo>,
+}
+
+impl CoffeePosHealthInfo {
+    fn unavailable() -> Self {
+        Self {
+            state: CoffeePosHealthState::Unavailable,
+            failure_kind: None,
+            payload: None,
+            error: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -74,6 +142,7 @@ pub struct RuntimeInfo {
     pub php_pid: Option<u32>,
     pub wordpress_health: WordPressHealthState,
     pub wordpress_error: Option<RuntimeErrorInfo>,
+    pub coffeepos_health: CoffeePosHealthInfo,
     pub last_error: Option<RuntimeErrorInfo>,
 }
 
@@ -150,6 +219,7 @@ struct RuntimeSettings {
 pub struct RuntimeTimeouts {
     pub database_readiness: Duration,
     pub http_readiness: Duration,
+    pub wordpress_readiness: Duration,
     pub probe_command: Duration,
     pub stop: Duration,
 }
@@ -159,6 +229,7 @@ impl Default for RuntimeTimeouts {
         Self {
             database_readiness: Duration::from_secs(15),
             http_readiness: Duration::from_secs(10),
+            wordpress_readiness: Duration::from_secs(45),
             probe_command: Duration::from_secs(3),
             stop: Duration::from_secs(5),
         }
@@ -215,6 +286,8 @@ pub struct RuntimeManager {
     php_probe: Option<PathBuf>,
     wordpress_health: WordPressHealthState,
     wordpress_error: Option<RuntimeErrorInfo>,
+    coffeepos_health: CoffeePosHealthInfo,
+    last_coffeepos_probe: Option<Instant>,
     log_lock: Arc<Mutex<()>>,
     last_error: Option<RuntimeErrorInfo>,
     timeouts: RuntimeTimeouts,
@@ -259,6 +332,8 @@ impl RuntimeManager {
             php_probe: None,
             wordpress_health: WordPressHealthState::Unavailable,
             wordpress_error: None,
+            coffeepos_health: CoffeePosHealthInfo::unavailable(),
+            last_coffeepos_probe: None,
             log_lock: Arc::new(Mutex::new(())),
             last_error: None,
             timeouts: RuntimeTimeouts::default(),
@@ -295,6 +370,7 @@ impl RuntimeManager {
             php_pid: self.php.as_ref().map(ManagedChild::id),
             wordpress_health: self.wordpress_health.clone(),
             wordpress_error: self.wordpress_error.clone(),
+            coffeepos_health: self.coffeepos_health.clone(),
             last_error: self.last_error.clone(),
         }
     }
@@ -324,11 +400,20 @@ impl RuntimeManager {
                 self.last_error = Some(cleanup_error.unwrap_or(error));
                 self.wordpress_health = WordPressHealthState::Unavailable;
                 self.wordpress_error = None;
+                self.clear_coffeepos_health();
                 self.log_event("runtime child exited unexpectedly");
             }
             if self.state == RuntimeState::Running {
                 if let Err(error) = self.maybe_spawn_wordpress_cron(false) {
                     self.log_event(&format!("wordpress cron spawn failed: {error}"));
+                }
+                if self.wordpress_health == WordPressHealthState::Healthy
+                    && self
+                        .last_coffeepos_probe
+                        .map(|instant| instant.elapsed() >= COFFEEPOS_HEALTH_INTERVAL)
+                        .unwrap_or(true)
+                {
+                    self.refresh_coffeepos_health();
                 }
             }
         } else if self.database.is_none() && self.php.is_none() {
@@ -339,6 +424,7 @@ impl RuntimeManager {
             };
             self.wordpress_health = WordPressHealthState::Unavailable;
             self.wordpress_error = None;
+            self.clear_coffeepos_health();
         }
         self.info()
     }
@@ -390,6 +476,7 @@ impl RuntimeManager {
         self.state = RuntimeState::Starting;
         self.wordpress_health = WordPressHealthState::Checking;
         self.wordpress_error = None;
+        self.clear_coffeepos_health();
         self.last_error = None;
         self.log_event("runtime start requested");
 
@@ -441,6 +528,7 @@ impl RuntimeManager {
                     } else {
                         self.wordpress_health = WordPressHealthState::Unavailable;
                         self.wordpress_error = None;
+                        self.clear_coffeepos_health();
                     }
                     self.log_event("runtime ready");
                     return Ok(self.info());
@@ -483,6 +571,7 @@ impl RuntimeManager {
         self.last_error = Some(error.clone());
         self.wordpress_health = WordPressHealthState::Unavailable;
         self.wordpress_error = None;
+        self.clear_coffeepos_health();
         self.log_event("runtime start failed");
         Err(error)
     }
@@ -491,11 +580,13 @@ impl RuntimeManager {
         if self.state != RuntimeState::Running || self.php.is_none() || self.database.is_none() {
             self.wordpress_health = WordPressHealthState::Unavailable;
             self.wordpress_error = None;
+            self.clear_coffeepos_health();
             return self.info();
         }
         let Some(http_port) = self.http_port else {
             self.wordpress_health = WordPressHealthState::Unavailable;
             self.wordpress_error = None;
+            self.clear_coffeepos_health();
             return self.info();
         };
         self.wordpress_health = WordPressHealthState::Checking;
@@ -507,14 +598,51 @@ impl RuntimeManager {
                 if let Err(error) = self.maybe_spawn_wordpress_cron(true) {
                     self.log_event(&format!("wordpress cron spawn failed: {error}"));
                 }
+                self.refresh_coffeepos_health();
             }
             Err(error) => {
                 self.wordpress_health = WordPressHealthState::Unhealthy;
                 self.wordpress_error = Some(error);
+                self.clear_coffeepos_health();
                 self.log_event("wordpress health check failed");
             }
         }
         self.info()
+    }
+
+    pub(crate) fn refresh_coffeepos_health(&mut self) -> RuntimeInfo {
+        if self.state != RuntimeState::Running
+            || self.wordpress_health != WordPressHealthState::Healthy
+            || self.php.is_none()
+            || self.database.is_none()
+        {
+            self.clear_coffeepos_health();
+            return self.info();
+        }
+        let Some(http_port) = self.http_port else {
+            self.clear_coffeepos_health();
+            return self.info();
+        };
+        self.coffeepos_health = CoffeePosHealthInfo {
+            state: CoffeePosHealthState::Checking,
+            failure_kind: None,
+            payload: None,
+            error: None,
+        };
+        self.last_coffeepos_probe = Some(Instant::now());
+        self.coffeepos_health = probe_coffeepos_health(&self.data_root, http_port);
+        match self.coffeepos_health.state {
+            CoffeePosHealthState::Healthy => self.log_event("coffeepos application healthy"),
+            CoffeePosHealthState::Degraded => self.log_event("coffeepos application degraded"),
+            CoffeePosHealthState::Failed => self.log_event("coffeepos application health failed"),
+            CoffeePosHealthState::Unavailable | CoffeePosHealthState::Checking => {}
+        }
+        self.info()
+    }
+
+    fn clear_coffeepos_health(&mut self) {
+        self.coffeepos_health = CoffeePosHealthInfo::unavailable();
+        self.last_coffeepos_probe = None;
     }
 
     pub fn wordpress_url(&self) -> Result<String, RuntimeErrorInfo> {
@@ -565,6 +693,7 @@ impl RuntimeManager {
         self.state = RuntimeState::Stopping;
         self.wordpress_health = WordPressHealthState::Unavailable;
         self.wordpress_error = None;
+        self.clear_coffeepos_health();
         self.log_event("runtime stop requested");
         let mut failure = None;
 
@@ -623,7 +752,7 @@ impl RuntimeManager {
     }
 
     fn wait_wordpress_ready(&mut self, port: u16) -> Result<(), RuntimeErrorInfo> {
-        let deadline = Instant::now() + self.timeouts.http_readiness;
+        let deadline = Instant::now() + self.timeouts.wordpress_readiness;
         loop {
             if child_finished(&mut self.php, "php", "WordPress health")? {
                 return Err(error_info(
@@ -1780,6 +1909,314 @@ fn wordpress_probe_response_healthy(response: &[u8]) -> bool {
         && text.contains("loginform")
 }
 
+pub(crate) fn probe_coffeepos_health(data_root: &Path, port: u16) -> CoffeePosHealthInfo {
+    let token_path = data_root.join(MACHINE_TOKEN_SECRET);
+    let pending_path = data_root.join(MACHINE_TOKEN_PENDING_SECRET);
+    let active_health = if token_path.is_file() {
+        match secret::load(&token_path) {
+            Ok(token) => probe_coffeepos_health_with_token(port, &token),
+            Err(error) => coffeepos_health_failure(
+                CoffeePosHealthFailureKind::Authentication,
+                "read machine credential",
+                error,
+                "Retry with the same Windows user profile. Do not reset the machine credential automatically.",
+            ),
+        }
+    } else {
+        CoffeePosHealthInfo::unavailable()
+    };
+
+    if !pending_path.is_file() {
+        return active_health;
+    }
+    if coffeepos_health_accepts_credential(&active_health) {
+        if let Err(error) = fs::remove_file(&pending_path) {
+            return coffeepos_health_failure(
+                CoffeePosHealthFailureKind::Authentication,
+                "recover machine credential",
+                format!(
+                    "The active CoffeePOS machine credential is valid, but the stale pending credential cannot be removed: {error}."
+                ),
+                "Close processes using protected application data and retry. The active credential remains authoritative.",
+            );
+        }
+        return active_health;
+    }
+
+    let pending = match secret::load(&pending_path) {
+        Ok(token) => token,
+        Err(error) => {
+            return coffeepos_health_failure(
+                CoffeePosHealthFailureKind::Authentication,
+                "recover machine credential",
+                format!("Pending CoffeePOS machine credential cannot be read: {error}"),
+                "Preserve both protected credential files and use explicit machine-credential repair.",
+            );
+        }
+    };
+    let pending_health = probe_coffeepos_health_with_token(port, &pending);
+    if !coffeepos_health_accepts_credential(&pending_health) {
+        return if active_health.state == CoffeePosHealthState::Unavailable {
+            pending_health
+        } else {
+            active_health
+        };
+    }
+
+    if let Err(error) = secret::store_machine_token(&token_path, &pending) {
+        return coffeepos_health_failure(
+            CoffeePosHealthFailureKind::Authentication,
+            "recover machine credential",
+            format!(
+                "Pending CoffeePOS machine credential is accepted by WordPress but cannot be promoted to active protected storage: {error}"
+            ),
+            "Preserve the pending credential and retry recovery; do not rotate again.",
+        );
+    }
+    if let Err(error) = fs::remove_file(&pending_path) {
+        return coffeepos_health_failure(
+            CoffeePosHealthFailureKind::Authentication,
+            "recover machine credential",
+            format!(
+                "Pending CoffeePOS machine credential was promoted but the pending file cannot be removed: {error}."
+            ),
+            "Retry recovery. The active protected credential now matches WordPress.",
+        );
+    }
+    pending_health
+}
+
+pub(crate) fn probe_coffeepos_health_with_token(port: u16, token: &str) -> CoffeePosHealthInfo {
+    if token.len() != 64
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return coffeepos_health_failure(
+            CoffeePosHealthFailureKind::Authentication,
+            "read machine credential",
+            "Protected CoffeePOS machine credential has an invalid format.",
+            "Preserve the protected credential and use an explicit repair/rotation flow.",
+        );
+    }
+
+    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(500)) {
+        Ok(stream) => stream,
+        Err(error) => {
+            return coffeepos_health_failure(
+                CoffeePosHealthFailureKind::TransportBootstrap,
+                "health",
+                format!("Cannot connect to the managed CoffeePOS endpoint: {error}."),
+                "Keep the store installed and restart the local runtime. If WordPress is healthy but this persists, inspect plugin/bootstrap logs.",
+            );
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let request = format!(
+        "GET /wp-json/coffeepos/v1/system/status HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nX-CoffeePOS-Machine-Token: {token}\r\nConnection: close\r\n\r\n"
+    );
+    if let Err(error) = stream.write_all(request.as_bytes()) {
+        return coffeepos_health_failure(
+            CoffeePosHealthFailureKind::TransportBootstrap,
+            "health",
+            format!("Cannot send the CoffeePOS health request: {error}."),
+            "Restart the local runtime and retry.",
+        );
+    }
+    let mut response = Vec::with_capacity(8192);
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                response.extend_from_slice(&chunk[..count]);
+                if response.len() > 256 * 1024 {
+                    return coffeepos_health_failure(
+                        CoffeePosHealthFailureKind::Contract,
+                        "health",
+                        "CoffeePOS health response exceeded the 256 KiB contract limit.",
+                        "Inspect the CoffeePOS plugin response and restore the supported schema.",
+                    );
+                }
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                return coffeepos_health_failure(
+                    CoffeePosHealthFailureKind::TransportBootstrap,
+                    "health",
+                    "CoffeePOS health endpoint timed out.",
+                    "Restart the local runtime and inspect WordPress/PHP/plugin logs if the endpoint remains unavailable.",
+                );
+            }
+            Err(error) => {
+                return coffeepos_health_failure(
+                    CoffeePosHealthFailureKind::TransportBootstrap,
+                    "health",
+                    format!("Cannot read the CoffeePOS health response: {error}."),
+                    "Restart the local runtime and retry.",
+                );
+            }
+        }
+    }
+    parse_coffeepos_health_response(&response)
+}
+
+fn parse_coffeepos_health_response(response: &[u8]) -> CoffeePosHealthInfo {
+    let text = match std::str::from_utf8(response) {
+        Ok(text) => text,
+        Err(_) => {
+            return coffeepos_health_failure(
+                CoffeePosHealthFailureKind::Contract,
+                "health",
+                "CoffeePOS health response is not valid UTF-8.",
+                "Restore a compatible CoffeePOS plugin build and retry.",
+            );
+        }
+    };
+    let Some((headers, body)) = text.split_once("\r\n\r\n") else {
+        return coffeepos_health_failure(
+            CoffeePosHealthFailureKind::TransportBootstrap,
+            "health",
+            "CoffeePOS health endpoint returned an incomplete HTTP response.",
+            "Restart the local runtime and retry.",
+        );
+    };
+    let status_code = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok());
+    let Some(status_code) = status_code else {
+        return coffeepos_health_failure(
+            CoffeePosHealthFailureKind::TransportBootstrap,
+            "health",
+            "CoffeePOS health endpoint returned an invalid HTTP status line.",
+            "Restart the local runtime and retry.",
+        );
+    };
+    if status_code == 401 {
+        return coffeepos_health_failure(
+            CoffeePosHealthFailureKind::Authentication,
+            "health",
+            "CoffeePOS rejected the protected machine credential.",
+            "Do not reinstall the store or rotate automatically. Use the explicit machine-credential repair/rotation flow.",
+        );
+    }
+    if status_code != 200 && status_code != 503 {
+        return coffeepos_health_failure(
+            CoffeePosHealthFailureKind::TransportBootstrap,
+            "health",
+            format!("CoffeePOS machine-health endpoint returned HTTP {status_code}."),
+            "Keep the store installed. Verify that CoffeePOS is active and the system/status route is registered, then retry.",
+        );
+    }
+    let payload: CoffeePosHealthPayload = match serde_json::from_str(body.trim()) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return coffeepos_health_failure(
+                CoffeePosHealthFailureKind::Contract,
+                "health",
+                format!(
+                    "CoffeePOS health payload does not match the expected JSON schema: {error}."
+                ),
+                "Use a CoffeePOS plugin build compatible with machine-health schema version 1.",
+            );
+        }
+    };
+    if payload.schema_version != COFFEEPOS_HEALTH_SCHEMA_VERSION {
+        return coffeepos_health_failure(
+            CoffeePosHealthFailureKind::Contract,
+            "health",
+            format!(
+                "CoffeePOS health schema {} is unsupported; expected {}.",
+                payload.schema_version, COFFEEPOS_HEALTH_SCHEMA_VERSION
+            ),
+            "Use a compatible CoffeePOS Desktop/plugin pair.",
+        );
+    }
+    if (payload.wordpress && payload.versions.wordpress.trim().is_empty())
+        || (payload.woocommerce && payload.versions.woocommerce.trim().is_empty())
+        || (payload.coffeepos && payload.versions.coffeepos.trim().is_empty())
+        || payload.versions.coffeepos_schema.trim().is_empty()
+        || payload.store.name.trim().is_empty()
+    {
+        return coffeepos_health_failure(
+            CoffeePosHealthFailureKind::Contract,
+            "health",
+            "CoffeePOS health payload is missing required version or store identity fields.",
+            "Use a CoffeePOS plugin build compatible with the schema-version-1 health contract.",
+        );
+    }
+    if !safe_pos_path(&payload.pos_path) {
+        return coffeepos_health_failure(
+            CoffeePosHealthFailureKind::Contract,
+            "health",
+            "CoffeePOS health payload contains an unsafe POS path.",
+            "Restore a compatible CoffeePOS router/settings configuration.",
+        );
+    }
+    let all_ready =
+        payload.wordpress && payload.woocommerce && payload.coffeepos && payload.database;
+    match (status_code, payload.status.as_str(), all_ready) {
+        (200, "healthy", true) => CoffeePosHealthInfo {
+            state: CoffeePosHealthState::Healthy,
+            failure_kind: None,
+            payload: Some(payload),
+            error: None,
+        },
+        (503, "degraded", false) => CoffeePosHealthInfo {
+            state: CoffeePosHealthState::Degraded,
+            failure_kind: None,
+            payload: Some(payload),
+            error: None,
+        },
+        _ => coffeepos_health_failure(
+            CoffeePosHealthFailureKind::Contract,
+            "health",
+            "CoffeePOS HTTP status, health status, and component readiness are inconsistent.",
+            "Use a CoffeePOS plugin build compatible with the schema-version-1 health contract.",
+        ),
+    }
+}
+
+fn safe_pos_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains("://")
+        && !path.contains('\\')
+        && !path.chars().any(char::is_control)
+}
+
+fn coffeepos_health_failure(
+    kind: CoffeePosHealthFailureKind,
+    operation: &str,
+    message: impl Into<String>,
+    recovery: impl Into<String>,
+) -> CoffeePosHealthInfo {
+    CoffeePosHealthInfo {
+        state: CoffeePosHealthState::Failed,
+        failure_kind: Some(kind),
+        payload: None,
+        error: Some(error_info(
+            "coffeepos",
+            operation,
+            message.into(),
+            recovery.into(),
+        )),
+    }
+}
+
+fn coffeepos_health_accepts_credential(health: &CoffeePosHealthInfo) -> bool {
+    matches!(
+        health.state,
+        CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+    )
+}
+
 fn probe_nonce() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2302,6 +2739,7 @@ mod tests {
         manager.set_timeouts(RuntimeTimeouts {
             database_readiness: Duration::from_millis(500),
             http_readiness: Duration::from_millis(500),
+            wordpress_readiness: Duration::from_millis(500),
             probe_command: Duration::from_millis(250),
             stop: Duration::from_millis(500),
         });
@@ -2338,6 +2776,7 @@ mod tests {
             php_pid: None,
             wordpress_health: WordPressHealthState::Checking,
             wordpress_error: None,
+            coffeepos_health: CoffeePosHealthInfo::unavailable(),
             last_error: None,
         };
         let value = serde_json::to_value(info).unwrap();
@@ -2345,6 +2784,90 @@ mod tests {
         assert_eq!(value["database_port"], 3307);
         assert_eq!(value["http_port"], 8081);
         assert_eq!(value["wordpress_health"], "checking");
+        assert_eq!(value["coffeepos_health"]["state"], "unavailable");
+    }
+
+    fn machine_health_response(status: u16, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+        )
+        .into_bytes()
+    }
+
+    const HEALTHY_MACHINE_BODY: &str = r#"{"schema_version":1,"status":"healthy","wordpress":true,"woocommerce":true,"coffeepos":true,"database":true,"versions":{"wordpress":"7.1","woocommerce":"11.1.0","coffeepos":"1.0.1","coffeepos_schema":"0.0.1"},"store":{"name":"CoffeePOS"},"pos_path":"/pos/"}"#;
+
+    #[test]
+    fn coffeepos_health_parser_accepts_healthy_and_degraded_contracts() {
+        let healthy =
+            parse_coffeepos_health_response(&machine_health_response(200, HEALTHY_MACHINE_BODY));
+        assert_eq!(healthy.state, CoffeePosHealthState::Healthy);
+        assert_eq!(
+            healthy.payload.as_ref().unwrap().versions.coffeepos,
+            "1.0.1"
+        );
+
+        let degraded_body = HEALTHY_MACHINE_BODY
+            .replace(r#""status":"healthy""#, r#""status":"degraded""#)
+            .replace(r#""woocommerce":true"#, r#""woocommerce":false"#);
+        let degraded =
+            parse_coffeepos_health_response(&machine_health_response(503, &degraded_body));
+        assert_eq!(degraded.state, CoffeePosHealthState::Degraded);
+        assert!(!degraded.payload.as_ref().unwrap().woocommerce);
+    }
+
+    #[test]
+    fn coffeepos_health_parser_classifies_auth_transport_and_contract_failures() {
+        let auth = parse_coffeepos_health_response(&machine_health_response(
+            401,
+            r#"{"code":"coffeepos_machine_auth_required"}"#,
+        ));
+        assert_eq!(auth.state, CoffeePosHealthState::Failed);
+        assert_eq!(
+            auth.failure_kind,
+            Some(CoffeePosHealthFailureKind::Authentication)
+        );
+
+        let missing = parse_coffeepos_health_response(&machine_health_response(
+            404,
+            r#"{"code":"rest_no_route"}"#,
+        ));
+        assert_eq!(
+            missing.failure_kind,
+            Some(CoffeePosHealthFailureKind::TransportBootstrap)
+        );
+
+        let malformed = parse_coffeepos_health_response(&machine_health_response(200, "{"));
+        assert_eq!(
+            malformed.failure_kind,
+            Some(CoffeePosHealthFailureKind::Contract)
+        );
+
+        let schema = parse_coffeepos_health_response(&machine_health_response(
+            200,
+            &HEALTHY_MACHINE_BODY.replace(r#""schema_version":1"#, r#""schema_version":2"#),
+        ));
+        assert_eq!(
+            schema.failure_kind,
+            Some(CoffeePosHealthFailureKind::Contract)
+        );
+
+        let inconsistent = parse_coffeepos_health_response(&machine_health_response(
+            200,
+            &HEALTHY_MACHINE_BODY.replace(r#""database":true"#, r#""database":false"#),
+        ));
+        assert_eq!(
+            inconsistent.failure_kind,
+            Some(CoffeePosHealthFailureKind::Contract)
+        );
+
+        let unsafe_path = parse_coffeepos_health_response(&machine_health_response(
+            200,
+            &HEALTHY_MACHINE_BODY.replace(r#""/pos/""#, r#""//evil/""#),
+        ));
+        assert_eq!(
+            unsafe_path.failure_kind,
+            Some(CoffeePosHealthFailureKind::Contract)
+        );
     }
 
     #[test]
