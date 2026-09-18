@@ -38,7 +38,10 @@ Giữ nguyên số phase. Các mốc artifact/install/activation là checkpoint 
 | 4.2 — WordPress runtime UX | ✅ Hoàn thành Windows-first | Runtime lifecycle + WordPress health + retry/process-death handling |
 | 4.3 — Open WordPress test | ✅ Hoàn thành Windows-first | Managed dynamic URL, occupied-port fallback, redirect/static assets và system-browser open đã pass |
 | 4.4 — WooCommerce artifact | ✅ Hoàn thành Windows-first | WooCommerce 11.1.0 exact archive + SHA256 + compatibility metadata + deterministic staging |
-| 4.5+ | ⏳ Chưa bắt đầu | Mốc tiếp theo: WooCommerce provisioning |
+| 4.5 — WooCommerce provisioning | ✅ Hoàn thành Windows-first | Ownership-safe atomic install, journal stage, retry preserves plugin/data, unmanaged conflict refusal |
+| 4.6 — WooCommerce activation | ✅ Hoàn thành Windows-first | Active 11.1.0, DB schema 11.1.0-1, setup/onboarding verified, managed CLI cron/background worker |
+| 4.7 — CoffeePOS artifact | ✅ Hoàn thành Windows-first | CoffeePOS 1.0.0 immutable checked-in ZIP + SHA256 + source provenance + deterministic staging |
+| 4.8+ | ⏳ Chưa bắt đầu | Mốc tiếp theo: CoffeePOS provisioning |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -94,6 +97,8 @@ Diễn tập port cũ bị chiếm: URL mới, redirect và static assets vẫn 
 
 **Definition of Done:** fresh site có plugin WooCommerce đúng version; chạy provisioning lần hai không phá plugin hoặc dữ liệu hiện có.
 
+**Hoàn thành Windows-first 2026-09-18:** native provisioning consume exact staged WooCommerce 11.1.0 artifact từ Phase 4.4, copy qua owned `woocommerce.provisioning` rồi atomic rename vào `wp-content/plugins/woocommerce`, ghi ownership metadata và journal `woocommerce_provisioned`. Existing unmanaged WooCommerce bị preserve/refuse; retry cùng managed version là no-op. Real E2E pass fresh install + second provisioning, giữ sentinel trong WooCommerce và unrelated plugin; existing development store migrate `needs_repair` → `ready`. Xem `docs/PHASE-04.5.md`.
+
 ### Phase 4.6 — WooCommerce activation
 
 **Mục tiêu:** activate WooCommerce và kiểm dependency/version trước khi tiếp tục.
@@ -104,6 +109,8 @@ Diễn tập port cũ bị chiếm: URL mới, redirect và static assets vẫn 
 
 Kiểm schema/setup bắt buộc và background jobs/loopback cần cho baseline đã chọn; plugin active chưa đủ chứng minh usable. Ghi rõ xử lý onboarding, WP-Cron và tác vụ nền khi app đóng; không yêu cầu người vận hành tự vào wp-admin để hoàn tất prerequisite. Nếu PHP self-request bị kẹt, giải quyết hoặc ghi blocker trước khi tiếp tục dependency đó.
 
+**Hoàn thành Windows-first 2026-09-18:** exact managed WooCommerce 11.1.0 được activate qua bounded pinned-PHP CLI bootstrap; baseline verify internal DB schema `11.1.0-1`, required tables/pages/role, Action Scheduler và onboarding không cần operator. Managed `wp-config.php` disable web-triggered WP-Cron; Runtime Manager chạy `wp-cron.php` bằng managed PHP CLI ngay khi healthy và định kỳ khi app/runtime chạy, tránh nested self-request của PHP built-in server. Activation failure giữ journal ở `woo_commerce_provisioned`; retry development store đã recover thành `woo_commerce_activated`. Real staged E2E pass activation/restart/retry + Store API HTTP 200. Xem `docs/PHASE-04.6.md`.
+
 ### Phase 4.7 — CoffeePOS artifact
 
 **Mục tiêu:** xác định và pin nguồn CoffeePOS plugin dùng cho desktop distribution.
@@ -112,7 +119,9 @@ Kiểm schema/setup bắt buộc và background jobs/loopback cần cho baseline
 
 **Definition of Done:** development staging tạo đúng plugin tree/version mà không copy ngẫu nhiên từ một LocalWP install đang chạy.
 
-Artifact được chọn phải khớp contract health đã thống nhất trước mốc này. Nếu 4.10 cần sửa plugin thì phải tạo artifact mới có version/hash mới và chạy lại acceptance 4.8–4.10; không sửa âm thầm plugin bên trong staged artifact cũ.
+Schema/auth/version/POS-route của machine-health phải được chốt trước khi pin artifact 4.7. Artifact 4.7 chưa bắt buộc implement endpoint mới vì implementation/nghiệm thu thuộc 4.10; nếu 4.10 sửa CoffeePOS code thì phải bump plugin version + artifact hash, repin manifest và chạy lại acceptance 4.8–4.10. Không sửa âm thầm plugin bên trong staged artifact cũ.
+
+**Hoàn thành Windows-first 2026-09-18:** pin CoffeePOS `1.0.0` release snapshot build từ clean Git commit `9473867c65f1409dbeeaa03a98daef564f620b8e`, checked-in ZIP SHA256 `ee9f241a516e7c6ddddc6e84ad26515d0a9cd9ccd5d6fd101d078a738e598f2a`. Development staging verify archive/path safety, plugin metadata/dependency/vendor autoload và repeated tree fingerprint. Machine-health contract schema/token/version/POS path được chốt trong `docs/PROVISIONING.md`; implementation endpoint vẫn thuộc 4.10 và phải repin artifact nếu code plugin thay đổi. Xem `docs/PHASE-04.7.md`.
 
 ### Phase 4.8 — CoffeePOS provisioning
 
@@ -268,4 +277,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.4 đã pass Windows-first. Mốc tiếp theo là **Phase 4.5 — WooCommerce provisioning**; phải dùng exact staged WooCommerce 11.1.0 artifact của Phase 4.4 và chưa activate plugin cho tới Phase 4.6.
+Phase 4.1–4.7 đã pass Windows-first. Mốc tiếp theo là **Phase 4.8 — CoffeePOS provisioning**; phải consume exact staged CoffeePOS `1.0.0` artifact đã pin ở 4.7 bằng ownership-safe ensure semantics, không đọc sibling checkout hoặc LocalWP plugin directory.

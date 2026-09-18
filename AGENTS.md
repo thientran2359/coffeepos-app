@@ -906,7 +906,10 @@ Current Windows-first status:
 - Phase 4.2 — WordPress runtime UX: complete.
 - Phase 4.3 — Open WordPress test: complete Windows-first.
 - Phase 4.4 — WooCommerce artifact: complete Windows-first.
-- Next milestone: Phase 4.5 — WooCommerce provisioning.
+- Phase 4.5 — WooCommerce provisioning: complete Windows-first.
+- Phase 4.6 — WooCommerce activation: complete Windows-first.
+- Phase 4.7 — CoffeePOS artifact: complete Windows-first.
+- Next milestone: Phase 4.8 — CoffeePOS provisioning.
 
 From Phase 4 onward, work is intentionally split into small independently verifiable milestones:
 

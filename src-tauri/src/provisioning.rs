@@ -25,6 +25,11 @@ const WORDPRESS_ADMIN_EMAIL: &str = "admin@coffeepos.local";
 const MANAGED_CONFIG_MARKER: &str = "CoffeePOS Desktop managed configuration";
 const MANAGED_ROUTER_MARKER: &str = "CoffeePOS Desktop managed router";
 const MANAGED_MU_PLUGIN_MARKER: &str = "CoffeePOS Desktop managed uploads bridge";
+const WOOCOMMERCE_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const WOOCOMMERCE_OWNERSHIP_SCHEMA_VERSION: u32 = 1;
+const WOOCOMMERCE_PLUGIN_SLUG: &str = "woocommerce";
+const WOOCOMMERCE_OWNERSHIP_FILE: &str = ".coffeepos-managed.json";
+const WOOCOMMERCE_DB_VERSION: &str = "11.1.0-1";
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +44,8 @@ pub enum ProvisioningState {
 pub struct ProvisioningInfo {
     pub state: ProvisioningState,
     pub wordpress_version: String,
+    pub woocommerce_version: String,
+    pub woocommerce_active: bool,
     pub admin_username: Option<String>,
     pub can_retry: bool,
     pub last_error: Option<RuntimeErrorInfo>,
@@ -81,10 +88,58 @@ struct CompatibilityManifest {
     development_mariadb: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WooCommerceDevelopmentManifest {
+    schema_version: u32,
+    target: String,
+    woocommerce: WooCommerceArtifactManifest,
+    compatibility: WooCommerceCompatibilityManifest,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WooCommerceArtifactManifest {
+    version: String,
+    archive: String,
+    source: String,
+    release_source: String,
+    plugin_directory_source: String,
+    archive_sha256: String,
+    archive_sha256_source: String,
+    license: String,
+    plugin_root: PathBuf,
+    entry_file: PathBuf,
+    license_file: PathBuf,
+    readme_file: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WooCommerceCompatibilityManifest {
+    plugin_metadata_source: String,
+    server_requirements_source: String,
+    minimum_wordpress: String,
+    tested_wordpress: String,
+    minimum_php: String,
+    recommended_php: String,
+    recommended_mariadb: String,
+    development_wordpress: String,
+    development_php: String,
+    development_mariadb: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ResolvedWordPress {
     pub version: String,
     pub core_root: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedWooCommerce {
+    pub version: String,
+    pub plugin_root: PathBuf,
+    pub archive_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -93,6 +148,8 @@ enum ProvisioningStage {
     DatabaseReady,
     SiteReady,
     WordPressInstalled,
+    WooCommerceProvisioned,
+    WooCommerceActivated,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,13 +157,25 @@ enum ProvisioningStage {
 struct ProvisioningJournal {
     schema_version: u32,
     wordpress_version: String,
+    #[serde(default)]
+    woocommerce_version: Option<String>,
     stage: ProvisioningStage,
     admin_username: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ManagedPluginOwnership {
+    schema_version: u32,
+    plugin: String,
+    version: String,
+    archive_sha256: String,
 }
 
 pub struct Provisioner {
     runtime: ResolvedRuntime,
     wordpress: ResolvedWordPress,
+    woocommerce: ResolvedWooCommerce,
     data_root: PathBuf,
     containment: ProcessContainment,
 }
@@ -133,6 +202,7 @@ impl Provisioner {
         Ok(Self {
             runtime,
             wordpress: resolve_development_wordpress(project_root, runtime_manifest_path)?,
+            woocommerce: resolve_development_woocommerce(project_root, runtime_manifest_path)?,
             data_root,
             containment: ProcessContainment::new()?,
         })
@@ -145,6 +215,8 @@ impl Provisioner {
                 return ProvisioningInfo {
                     state: ProvisioningState::NeedsRepair,
                     wordpress_version: self.wordpress.version.clone(),
+                    woocommerce_version: self.woocommerce.version.clone(),
+                    woocommerce_active: false,
                     admin_username: None,
                     can_retry: false,
                     last_error: Some(error),
@@ -157,20 +229,30 @@ impl Provisioner {
         let site_ready = self.data_root.join("site/wp-settings.php").is_file()
             && self.data_root.join("site/wp-config.php").is_file()
             && self.data_root.join("config/wordpress-router.php").is_file();
+        let woocommerce_ready = woocommerce_installation_ready(&self.data_root, &self.woocommerce);
+        let woocommerce_activated = journal
+            .as_ref()
+            .map(|value| value.stage >= ProvisioningStage::WooCommerceActivated)
+            .unwrap_or(false);
         let complete = journal
             .as_ref()
             .map(|value| {
                 value.schema_version == PROVISIONING_SCHEMA_VERSION
                     && value.wordpress_version == self.wordpress.version
-                    && value.stage == ProvisioningStage::WordPressInstalled
+                    && value.woocommerce_version.as_deref()
+                        == Some(self.woocommerce.version.as_str())
+                    && value.stage >= ProvisioningStage::WooCommerceActivated
             })
             .unwrap_or(false)
             && database_ready
-            && site_ready;
+            && site_ready
+            && woocommerce_ready;
         if complete {
             return ProvisioningInfo {
                 state: ProvisioningState::Ready,
                 wordpress_version: self.wordpress.version.clone(),
+                woocommerce_version: self.woocommerce.version.clone(),
+                woocommerce_active: true,
                 admin_username: Some(WORDPRESS_ADMIN_USER.into()),
                 can_retry: false,
                 last_error: None,
@@ -190,13 +272,15 @@ impl Provisioner {
         } else {
             Some(provisioning_error(
                 "inspect store",
-                "WordPress provisioning is incomplete or the managed store layout is inconsistent.",
-                "Retry provisioning. Existing site/database data is preserved; if retry is refused, use an explicit repair flow instead of deleting store data.",
+                "WordPress/WooCommerce provisioning is incomplete or the managed store layout is inconsistent.",
+                "Retry provisioning. Existing site/database/plugin data is preserved; if retry is refused, use an explicit repair flow instead of deleting store data.",
             ))
         };
         ProvisioningInfo {
             state,
             wordpress_version: self.wordpress.version.clone(),
+            woocommerce_version: self.woocommerce.version.clone(),
+            woocommerce_active: woocommerce_activated,
             admin_username: journal.map(|value| value.admin_username),
             can_retry: true,
             last_error,
@@ -207,6 +291,8 @@ impl Provisioner {
         ProvisioningInfo {
             state: ProvisioningState::Installing,
             wordpress_version: self.wordpress.version.clone(),
+            woocommerce_version: self.woocommerce.version.clone(),
+            woocommerce_active: false,
             admin_username: Some(WORDPRESS_ADMIN_USER.into()),
             can_retry: false,
             last_error: None,
@@ -225,6 +311,8 @@ impl Provisioner {
         Ok(ProvisioningInfo {
             state: ProvisioningState::Installing,
             wordpress_version: self.wordpress.version.clone(),
+            woocommerce_version: self.woocommerce.version.clone(),
+            woocommerce_active: false,
             admin_username: Some(WORDPRESS_ADMIN_USER.into()),
             can_retry: false,
             last_error: None,
@@ -313,14 +401,113 @@ impl Provisioner {
             ));
         }
         self.persist_stage(ProvisioningStage::WordPressInstalled)?;
-        self.log_event("wordpress provisioning ready");
+        ensure_woocommerce_plugin(&self.data_root, &self.woocommerce)?;
+        self.persist_stage(ProvisioningStage::WooCommerceProvisioned)?;
+        self.log_event("woocommerce plugin provisioned");
+        self.activate_woocommerce(runtime_info)?;
+        self.persist_stage(ProvisioningStage::WooCommerceActivated)?;
+        self.log_event("woocommerce plugin activated and verified");
+        self.log_event("wordpress + woocommerce provisioning ready");
         Ok(ProvisioningInfo {
             state: ProvisioningState::Ready,
             wordpress_version: self.wordpress.version.clone(),
+            woocommerce_version: self.woocommerce.version.clone(),
+            woocommerce_active: true,
             admin_username: Some(WORDPRESS_ADMIN_USER.into()),
             can_retry: false,
             last_error: None,
         })
+    }
+
+    fn activate_woocommerce(&self, runtime_info: &RuntimeInfo) -> Result<(), RuntimeErrorInfo> {
+        let database_port = runtime_info.database_port.ok_or_else(|| {
+            provisioning_error(
+                "activate WooCommerce",
+                "MariaDB port is unavailable while activating WooCommerce.",
+                "Keep the provisioned WordPress/plugin files, restart provisioning, and inspect runtime logs if MariaDB is not ready.",
+            )
+        })?;
+        let http_port = runtime_info.http_port.ok_or_else(|| {
+            provisioning_error(
+                "activate WooCommerce",
+                "HTTP port is unavailable while activating WooCommerce.",
+                "Keep the provisioned WordPress/plugin files, restart provisioning, and inspect runtime logs if PHP is not ready.",
+            )
+        })?;
+        let database_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+            .map_err(|error| {
+                provisioning_error(
+                    "activate WooCommerce",
+                    error,
+                    "Retry with the same Windows user profile. Existing WordPress/WooCommerce files and database data are preserved.",
+                )
+            })?;
+        let apply_baseline = self
+            .load_journal()?
+            .map(|journal| journal.stage < ProvisioningStage::WooCommerceActivated)
+            .unwrap_or(true);
+        let script = self.write_woocommerce_activation_script()?;
+        let log_path = self.data_root.join("logs/woocommerce.log");
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|error| {
+                provisioning_error(
+                    "activate WooCommerce",
+                    format!("Cannot open WooCommerce activation log: {error}."),
+                    "Check application-data permissions and retry.",
+                )
+            })?;
+        let mut command = Command::new(&self.runtime.php_executable);
+        command
+            .arg("-c")
+            .arg(&self.runtime.php_ini)
+            .arg(&script)
+            .env_remove("PHPRC")
+            .env("PHP_INI_SCAN_DIR", "")
+            .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
+            .env("COFFEEPOS_DB_PASSWORD", database_password)
+            .env(
+                "COFFEEPOS_SITE_URL",
+                format!("http://{LOOPBACK}:{http_port}"),
+            )
+            .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
+            .env("COFFEEPOS_SITE_ROOT", self.data_root.join("site"))
+            .env("COFFEEPOS_WOOCOMMERCE_VERSION", &self.woocommerce.version)
+            .env("COFFEEPOS_WOOCOMMERCE_DB_VERSION", WOOCOMMERCE_DB_VERSION)
+            .env(
+                "COFFEEPOS_WOOCOMMERCE_APPLY_BASELINE",
+                if apply_baseline { "1" } else { "0" },
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().map_err(|error| {
+                provisioning_error(
+                    "activate WooCommerce",
+                    format!("Cannot duplicate WooCommerce log handle: {error}."),
+                    "Check application-data permissions and retry.",
+                )
+            })?))
+            .stderr(Stdio::from(log))
+            .current_dir(self.data_root.join("site"));
+        configure_child_command(&mut command);
+        let status = run_command_bounded(
+            command,
+            Duration::from_secs(90),
+            "woocommerce",
+            "activate and verify",
+            &self.containment,
+        );
+        let _ = fs::remove_file(&script);
+        let status = status?;
+        if !status.success() {
+            return Err(provisioning_error(
+                "activate WooCommerce",
+                format!("WooCommerce activation/setup exited with status {status}."),
+                "Inspect logs/woocommerce.log and retry provisioning. WordPress, WooCommerce files, and existing database data are preserved.",
+            ));
+        }
+        Ok(())
     }
 
     fn ensure_database_initialized(&mut self) -> Result<(), RuntimeErrorInfo> {
@@ -778,7 +965,12 @@ impl Provisioner {
     fn copy_wordpress_core_atomically(&mut self, site: &Path) -> Result<(), RuntimeErrorInfo> {
         let staging = self.data_root.join("site.provisioning");
         reset_owned_staging_dir(&self.data_root, &staging)?;
-        copy_tree(&self.wordpress.core_root, &staging)?;
+        copy_tree(
+            &self.wordpress.core_root,
+            &staging,
+            "WordPress core",
+            "Restage the verified WordPress archive and retry.",
+        )?;
         if !staging.join("wp-settings.php").is_file()
             || !staging.join("wp-includes/version.php").is_file()
         {
@@ -819,6 +1011,20 @@ impl Provisioner {
                 )
             })?;
             if existing.contains(MANAGED_CONFIG_MARKER) {
+                if !existing.contains("define('DISABLE_WP_CRON', true);") {
+                    let anchor = "define('AUTOMATIC_UPDATER_DISABLED', true);\n";
+                    let Some(position) = existing.find(anchor) else {
+                        return Err(provisioning_error(
+                            "update wp-config",
+                            "CoffeePOS-managed wp-config.php is missing the expected updater anchor for the cron migration.",
+                            "Preserve the managed config and use an explicit repair flow instead of rewriting an unexpected wp-config.php layout.",
+                        ));
+                    };
+                    let insertion = position + anchor.len();
+                    let mut updated = existing;
+                    updated.insert_str(insertion, "define('DISABLE_WP_CRON', true);\n");
+                    atomic_write(&path, updated.as_bytes(), "wp-config.php")?;
+                }
                 return Ok(());
             }
             return Err(provisioning_error(
@@ -854,6 +1060,7 @@ $table_prefix = 'wp_';\n\
 define('WP_DEBUG', false);\n\
 define('DISALLOW_FILE_EDIT', true);\n\
 define('AUTOMATIC_UPDATER_DISABLED', true);\n\
+define('DISABLE_WP_CRON', true);\n\
 if (!defined('ABSPATH')) {{ define('ABSPATH', __DIR__ . '/'); }}\n\
 require_once ABSPATH . 'wp-settings.php';\n",
             salts[0], salts[1], salts[2], salts[3], salts[4], salts[5], salts[6], salts[7]
@@ -914,6 +1121,38 @@ require_once ABSPATH . 'wp-settings.php';\n",
             provisioning_error(
                 "prepare WordPress bootstrap",
                 format!("Cannot retain WordPress bootstrap script: {}.", error.error),
+                "Check application-data permissions and retry.",
+            )
+        })?;
+        Ok(path)
+    }
+
+    fn write_woocommerce_activation_script(&self) -> Result<PathBuf, RuntimeErrorInfo> {
+        let config = self.data_root.join("config");
+        let mut temporary = NamedTempFile::new_in(&config).map_err(|error| {
+            provisioning_error(
+                "prepare WooCommerce activation",
+                format!("Cannot create temporary WooCommerce activation script: {error}."),
+                "Check application-data permissions and free disk space, then retry.",
+            )
+        })?;
+        temporary
+            .write_all(WOOCOMMERCE_ACTIVATION_BOOTSTRAP.as_bytes())
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|error| {
+                provisioning_error(
+                    "prepare WooCommerce activation",
+                    format!("Cannot write WooCommerce activation script: {error}."),
+                    "Check application-data storage health and retry.",
+                )
+            })?;
+        let (_file, path) = temporary.keep().map_err(|error| {
+            provisioning_error(
+                "prepare WooCommerce activation",
+                format!(
+                    "Cannot retain WooCommerce activation script: {}.",
+                    error.error
+                ),
                 "Check application-data permissions and retry.",
             )
         })?;
@@ -996,6 +1235,8 @@ require_once ABSPATH . 'wp-settings.php';\n",
         let journal = ProvisioningJournal {
             schema_version: PROVISIONING_SCHEMA_VERSION,
             wordpress_version: self.wordpress.version.clone(),
+            woocommerce_version: (stage >= ProvisioningStage::WooCommerceProvisioned)
+                .then(|| self.woocommerce.version.clone()),
             stage,
             admin_username: WORDPRESS_ADMIN_USER.into(),
         };
@@ -1110,6 +1351,237 @@ pub fn resolve_development_wordpress(
         version: manifest.wordpress.version,
         core_root,
     })
+}
+
+pub fn resolve_development_woocommerce(
+    project_root: &Path,
+    runtime_manifest_path: &Path,
+) -> Result<ResolvedWooCommerce, RuntimeErrorInfo> {
+    if !project_root.is_absolute() || !runtime_manifest_path.is_absolute() {
+        return Err(provisioning_error(
+            "resolve WooCommerce baseline",
+            "Project root and runtime manifest path must both be absolute.",
+            "Resolve development paths from the Cargo manifest directory before provisioning.",
+        ));
+    }
+    let development_root =
+        fs::canonicalize(project_root.join("runtime/development")).map_err(|error| {
+            provisioning_error(
+                "resolve WooCommerce baseline",
+                format!("Cannot resolve runtime/development: {error}."),
+                "Run the WooCommerce development staging script and retry.",
+            )
+        })?;
+    let runtime_manifest = fs::canonicalize(runtime_manifest_path).map_err(|error| {
+        provisioning_error(
+            "resolve WooCommerce baseline",
+            format!("Cannot resolve runtime manifest: {error}."),
+            "Stage the pinned development runtime before provisioning.",
+        )
+    })?;
+    if !runtime_manifest.starts_with(&development_root) {
+        return Err(provisioning_error(
+            "resolve WooCommerce baseline",
+            "Runtime manifest resolves outside runtime/development.",
+            "Use only the pinned project development runtime.",
+        ));
+    }
+    let target_root = runtime_manifest.parent().ok_or_else(|| {
+        provisioning_error(
+            "resolve WooCommerce baseline",
+            "Runtime manifest does not have a target directory.",
+            "Restage the pinned development runtime.",
+        )
+    })?;
+    let manifest_path = target_root.join("woocommerce-manifest.json");
+    let manifest: WooCommerceDevelopmentManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).map_err(|error| {
+            provisioning_error(
+                "resolve WooCommerce baseline",
+                format!("Cannot read WooCommerce manifest: {error}."),
+                "Run scripts/stage-woocommerce-development.ps1 and retry.",
+            )
+        })?)
+        .map_err(|error| {
+            provisioning_error(
+                "resolve WooCommerce baseline",
+                format!("WooCommerce manifest is invalid JSON: {error}."),
+                "Restore the checked-in manifest template and restage the artifact.",
+            )
+        })?;
+    validate_woocommerce_manifest(&manifest)?;
+
+    let plugin_root = fs::canonicalize(target_root.join(&manifest.woocommerce.plugin_root))
+        .map_err(|error| {
+            provisioning_error(
+                "resolve WooCommerce baseline",
+                format!("Cannot resolve staged WooCommerce plugin: {error}."),
+                "Run scripts/stage-woocommerce-development.ps1 and retry.",
+            )
+        })?;
+    if !plugin_root.starts_with(&development_root) || !plugin_root.is_dir() {
+        return Err(provisioning_error(
+            "resolve WooCommerce baseline",
+            "WooCommerce plugin root resolves outside runtime/development or is not a directory.",
+            "Restage the pinned WooCommerce artifact from the checked-in manifest.",
+        ));
+    }
+    for required in [
+        "woocommerce.php",
+        "license.txt",
+        "readme.txt",
+        "includes",
+        "src",
+        "vendor",
+    ] {
+        if !plugin_root.join(required).exists() {
+            return Err(provisioning_error(
+                "resolve WooCommerce baseline",
+                format!("Staged WooCommerce plugin is missing required path '{required}'."),
+                "Restage the pinned WooCommerce archive and retry.",
+            ));
+        }
+    }
+    let actual_version = read_plugin_header_version(&plugin_root.join("woocommerce.php"))?;
+    if actual_version != manifest.woocommerce.version {
+        return Err(provisioning_error(
+            "resolve WooCommerce baseline",
+            format!(
+                "Staged WooCommerce plugin version is {actual_version}, expected {}.",
+                manifest.woocommerce.version
+            ),
+            "Restage the exact pinned WooCommerce artifact and retry.",
+        ));
+    }
+    Ok(ResolvedWooCommerce {
+        version: manifest.woocommerce.version,
+        plugin_root,
+        archive_sha256: manifest.woocommerce.archive_sha256,
+    })
+}
+
+fn validate_woocommerce_manifest(
+    manifest: &WooCommerceDevelopmentManifest,
+) -> Result<(), RuntimeErrorInfo> {
+    if manifest.schema_version != WOOCOMMERCE_MANIFEST_SCHEMA_VERSION {
+        return Err(provisioning_error(
+            "validate WooCommerce manifest",
+            format!(
+                "Unsupported WooCommerce manifest schema {}.",
+                manifest.schema_version
+            ),
+            "Use the WooCommerce manifest schema shipped with this CoffeePOS Desktop version.",
+        ));
+    }
+    if manifest.target != expected_target()? {
+        return Err(provisioning_error(
+            "validate WooCommerce manifest",
+            format!(
+                "WooCommerce manifest target '{}' does not match '{}'.",
+                manifest.target,
+                expected_target()?
+            ),
+            "Stage the WooCommerce artifact for the current platform target.",
+        ));
+    }
+    for (label, value) in [
+        ("version", manifest.woocommerce.version.as_str()),
+        ("archive", manifest.woocommerce.archive.as_str()),
+        ("source", manifest.woocommerce.source.as_str()),
+        (
+            "release_source",
+            manifest.woocommerce.release_source.as_str(),
+        ),
+        (
+            "plugin_directory_source",
+            manifest.woocommerce.plugin_directory_source.as_str(),
+        ),
+        (
+            "archive_sha256_source",
+            manifest.woocommerce.archive_sha256_source.as_str(),
+        ),
+        ("license", manifest.woocommerce.license.as_str()),
+        (
+            "compatibility.plugin_metadata_source",
+            manifest.compatibility.plugin_metadata_source.as_str(),
+        ),
+        (
+            "compatibility.server_requirements_source",
+            manifest.compatibility.server_requirements_source.as_str(),
+        ),
+        (
+            "compatibility.minimum_wordpress",
+            manifest.compatibility.minimum_wordpress.as_str(),
+        ),
+        (
+            "compatibility.tested_wordpress",
+            manifest.compatibility.tested_wordpress.as_str(),
+        ),
+        (
+            "compatibility.minimum_php",
+            manifest.compatibility.minimum_php.as_str(),
+        ),
+        (
+            "compatibility.recommended_php",
+            manifest.compatibility.recommended_php.as_str(),
+        ),
+        (
+            "compatibility.recommended_mariadb",
+            manifest.compatibility.recommended_mariadb.as_str(),
+        ),
+        (
+            "compatibility.development_wordpress",
+            manifest.compatibility.development_wordpress.as_str(),
+        ),
+        (
+            "compatibility.development_php",
+            manifest.compatibility.development_php.as_str(),
+        ),
+        (
+            "compatibility.development_mariadb",
+            manifest.compatibility.development_mariadb.as_str(),
+        ),
+    ] {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(provisioning_error(
+                "validate WooCommerce manifest",
+                format!("WooCommerce manifest field '{label}' is invalid."),
+                "Restore the checked-in WooCommerce manifest template and restage the artifact.",
+            ));
+        }
+    }
+    if manifest.woocommerce.archive_sha256.len() != 64
+        || !manifest
+            .woocommerce
+            .archive_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(provisioning_error(
+            "validate WooCommerce manifest",
+            "WooCommerce archive SHA256 must contain 64 hexadecimal characters.",
+            "Restore the pinned checksum and restage the artifact.",
+        ));
+    }
+    for relative in [
+        &manifest.woocommerce.plugin_root,
+        &manifest.woocommerce.entry_file,
+        &manifest.woocommerce.license_file,
+        &manifest.woocommerce.readme_file,
+    ] {
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(provisioning_error(
+                "validate WooCommerce manifest",
+                "WooCommerce manifest paths must be relative and may not escape the target root.",
+                "Restore the checked-in WooCommerce manifest template and restage the artifact.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_wordpress_manifest(
@@ -1260,6 +1732,179 @@ fn directory_is_empty_or_missing(path: &Path) -> bool {
     }
 }
 
+fn woocommerce_installation_ready(data_root: &Path, woocommerce: &ResolvedWooCommerce) -> bool {
+    let destination = data_root
+        .join("site/wp-content/plugins")
+        .join(WOOCOMMERCE_PLUGIN_SLUG);
+    let ownership = fs::read(destination.join(WOOCOMMERCE_OWNERSHIP_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ManagedPluginOwnership>(&bytes).ok());
+    let Some(ownership) = ownership else {
+        return false;
+    };
+    ownership.schema_version == WOOCOMMERCE_OWNERSHIP_SCHEMA_VERSION
+        && ownership.plugin == WOOCOMMERCE_PLUGIN_SLUG
+        && ownership.version == woocommerce.version
+        && ownership
+            .archive_sha256
+            .eq_ignore_ascii_case(&woocommerce.archive_sha256)
+        && read_plugin_header_version(&destination.join("woocommerce.php"))
+            .map(|version| version == woocommerce.version)
+            .unwrap_or(false)
+}
+
+fn ensure_woocommerce_plugin(
+    data_root: &Path,
+    woocommerce: &ResolvedWooCommerce,
+) -> Result<(), RuntimeErrorInfo> {
+    let plugins_root = data_root.join("site/wp-content/plugins");
+    let destination = plugins_root.join(WOOCOMMERCE_PLUGIN_SLUG);
+    if destination.exists() {
+        if !destination.is_dir() {
+            return Err(provisioning_error(
+                "provision WooCommerce",
+                "The WooCommerce plugin destination exists but is not a directory.",
+                "Preserve the existing path and remove or adopt it explicitly before retrying. CoffeePOS will not overwrite it automatically.",
+            ));
+        }
+        let ownership_path = destination.join(WOOCOMMERCE_OWNERSHIP_FILE);
+        let bytes = fs::read(&ownership_path).map_err(|error| {
+            provisioning_error(
+                "provision WooCommerce",
+                format!(
+                    "An existing WooCommerce directory is not proven CoffeePOS-managed: cannot read {}: {error}.",
+                    WOOCOMMERCE_OWNERSHIP_FILE
+                ),
+                "Preserve the existing WooCommerce directory and use an explicit adoption/repair flow. CoffeePOS will not overwrite an unmanaged plugin.",
+            )
+        })?;
+        let ownership: ManagedPluginOwnership = serde_json::from_slice(&bytes).map_err(|error| {
+            provisioning_error(
+                "provision WooCommerce",
+                format!("WooCommerce ownership metadata is invalid and was preserved: {error}."),
+                "Repair or restore the ownership metadata explicitly before retrying; CoffeePOS will not replace the existing plugin automatically.",
+            )
+        })?;
+        if ownership.schema_version != WOOCOMMERCE_OWNERSHIP_SCHEMA_VERSION
+            || ownership.plugin != WOOCOMMERCE_PLUGIN_SLUG
+        {
+            return Err(provisioning_error(
+                "provision WooCommerce",
+                "Existing WooCommerce ownership metadata is not compatible with this CoffeePOS Desktop version.",
+                "Preserve the plugin and use an explicit adoption/upgrade flow instead of overwriting it during provisioning.",
+            ));
+        }
+        if ownership.version != woocommerce.version
+            || !ownership
+                .archive_sha256
+                .eq_ignore_ascii_case(&woocommerce.archive_sha256)
+        {
+            return Err(provisioning_error(
+                "provision WooCommerce",
+                format!(
+                    "Managed WooCommerce {} does not match the pinned {} artifact.",
+                    ownership.version, woocommerce.version
+                ),
+                "Run an explicit WooCommerce upgrade flow; provisioning will not overwrite an existing managed plugin version.",
+            ));
+        }
+        let installed_version = read_plugin_header_version(&destination.join("woocommerce.php"))?;
+        if installed_version != woocommerce.version {
+            return Err(provisioning_error(
+                "provision WooCommerce",
+                format!(
+                    "Managed WooCommerce files report version {installed_version}, expected {}.",
+                    woocommerce.version
+                ),
+                "Preserve the plugin directory and repair it explicitly; provisioning will not overwrite a modified/corrupt managed plugin.",
+            ));
+        }
+        return Ok(());
+    }
+
+    fs::create_dir_all(&plugins_root).map_err(|error| {
+        provisioning_error(
+            "provision WooCommerce",
+            format!("Cannot create the WordPress plugins directory: {error}."),
+            "Check site permissions and free disk space, then retry.",
+        )
+    })?;
+    let staging = data_root.join("woocommerce.provisioning");
+    reset_owned_staging_dir(data_root, &staging)?;
+    copy_tree(
+        &woocommerce.plugin_root,
+        &staging,
+        "WooCommerce plugin",
+        "Restage the exact pinned WooCommerce artifact and retry.",
+    )?;
+    let staged_version = read_plugin_header_version(&staging.join("woocommerce.php"))?;
+    if staged_version != woocommerce.version {
+        return Err(provisioning_error(
+            "provision WooCommerce",
+            format!(
+                "Copied WooCommerce files report version {staged_version}, expected {}.",
+                woocommerce.version
+            ),
+            "Restage the exact pinned WooCommerce artifact and retry.",
+        ));
+    }
+    let ownership = ManagedPluginOwnership {
+        schema_version: WOOCOMMERCE_OWNERSHIP_SCHEMA_VERSION,
+        plugin: WOOCOMMERCE_PLUGIN_SLUG.into(),
+        version: woocommerce.version.clone(),
+        archive_sha256: woocommerce.archive_sha256.clone(),
+    };
+    let mut ownership_bytes = serde_json::to_vec_pretty(&ownership).map_err(|error| {
+        provisioning_error(
+            "provision WooCommerce",
+            format!("Cannot serialize WooCommerce ownership metadata: {error}."),
+            "Retry after checking application-data storage.",
+        )
+    })?;
+    ownership_bytes.push(b'\n');
+    atomic_write(
+        &staging.join(WOOCOMMERCE_OWNERSHIP_FILE),
+        &ownership_bytes,
+        "WooCommerce ownership metadata",
+    )?;
+    fs::rename(&staging, &destination).map_err(|error| {
+        provisioning_error(
+            "provision WooCommerce",
+            format!("Cannot atomically activate the staged WooCommerce plugin: {error}."),
+            "Preserve the existing site. Only the owned woocommerce.provisioning staging directory may be retried automatically.",
+        )
+    })?;
+    Ok(())
+}
+
+fn read_plugin_header_version(path: &Path) -> Result<String, RuntimeErrorInfo> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        provisioning_error(
+            "inspect WooCommerce version",
+            format!("Cannot read WooCommerce entry file: {error}."),
+            "Restage or repair the WooCommerce plugin files, then retry.",
+        )
+    })?;
+    for line in text.lines().take(40) {
+        let candidate = line
+            .trim()
+            .trim_start_matches('*')
+            .trim()
+            .strip_prefix("Version:")
+            .map(str::trim);
+        if let Some(version) = candidate {
+            if !version.is_empty() && !version.chars().any(char::is_control) {
+                return Ok(version.to_string());
+            }
+        }
+    }
+    Err(provisioning_error(
+        "inspect WooCommerce version",
+        "WooCommerce entry file does not contain a valid Version header.",
+        "Restage the exact pinned WooCommerce artifact and retry.",
+    ))
+}
+
 fn reset_owned_staging_dir(data_root: &Path, staging: &Path) -> Result<(), RuntimeErrorInfo> {
     let parent = staging.parent().ok_or_else(|| {
         provisioning_error(
@@ -1271,7 +1916,7 @@ fn reset_owned_staging_dir(data_root: &Path, staging: &Path) -> Result<(), Runti
     if parent != data_root
         || !matches!(
             staging.file_name().and_then(|value| value.to_str()),
-            Some("database.provisioning" | "site.provisioning")
+            Some("database.provisioning" | "site.provisioning" | "woocommerce.provisioning")
         )
     {
         return Err(provisioning_error(
@@ -1292,51 +1937,56 @@ fn reset_owned_staging_dir(data_root: &Path, staging: &Path) -> Result<(), Runti
     Ok(())
 }
 
-fn copy_tree(source: &Path, destination: &Path) -> Result<(), RuntimeErrorInfo> {
+fn copy_tree(
+    source: &Path,
+    destination: &Path,
+    label: &str,
+    recovery: &str,
+) -> Result<(), RuntimeErrorInfo> {
     fs::create_dir_all(destination).map_err(|error| {
         provisioning_error(
-            "copy WordPress core",
-            format!("Cannot create WordPress staging directory: {error}."),
+            format!("copy {label}"),
+            format!("Cannot create {label} staging directory: {error}."),
             "Check application-data permissions and free disk space, then retry.",
         )
     })?;
     for entry in fs::read_dir(source).map_err(|error| {
         provisioning_error(
-            "copy WordPress core",
-            format!("Cannot read staged WordPress baseline: {error}."),
-            "Restage the verified WordPress archive and retry.",
+            format!("copy {label}"),
+            format!("Cannot read staged {label} baseline: {error}."),
+            recovery,
         )
     })? {
         let entry = entry.map_err(|error| {
             provisioning_error(
-                "copy WordPress core",
-                format!("Cannot inspect WordPress baseline entry: {error}."),
-                "Restage the verified WordPress archive and retry.",
+                format!("copy {label}"),
+                format!("Cannot inspect {label} baseline entry: {error}."),
+                recovery,
             )
         })?;
         let file_type = entry.file_type().map_err(|error| {
             provisioning_error(
-                "copy WordPress core",
-                format!("Cannot inspect WordPress baseline file type: {error}."),
-                "Restage the verified WordPress archive and retry.",
+                format!("copy {label}"),
+                format!("Cannot inspect {label} baseline file type: {error}."),
+                recovery,
             )
         })?;
         let target = destination.join(entry.file_name());
         if file_type.is_dir() {
-            copy_tree(&entry.path(), &target)?;
+            copy_tree(&entry.path(), &target, label, recovery)?;
         } else if file_type.is_file() {
             fs::copy(entry.path(), target).map_err(|error| {
                 provisioning_error(
-                    "copy WordPress core",
-                    format!("Cannot copy WordPress baseline file: {error}."),
+                    format!("copy {label}"),
+                    format!("Cannot copy {label} baseline file: {error}."),
                     "Check application-data permissions/free disk space and retry.",
                 )
             })?;
         } else {
             return Err(provisioning_error(
-                "copy WordPress core",
-                "Pinned WordPress baseline contains an unsupported filesystem entry.",
-                "Restage the official WordPress archive; symlink/reparse entries are not accepted.",
+                format!("copy {label}"),
+                format!("Pinned {label} baseline contains an unsupported filesystem entry."),
+                recovery,
             ));
         }
     }
@@ -1450,6 +2100,19 @@ fn provisioning_pipe_name() -> String {
 }
 
 fn wordpress_http_ready(port: u16) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if wordpress_http_probe_once(port) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+}
+
+fn wordpress_http_probe_once(port: u16) -> bool {
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
     let Ok(mut stream) = TcpStream::connect_timeout(&address.into(), Duration::from_millis(500))
     else {
@@ -1529,6 +2192,160 @@ if (!$installed) {
 }
 
 exit(get_option('siteurl') ? 0 : 5);
+"#;
+
+const WOOCOMMERCE_ACTIVATION_BOOTSTRAP: &str = r#"<?php
+declare(strict_types=1);
+
+$siteRoot = getenv('COFFEEPOS_SITE_ROOT');
+$expectedVersion = getenv('COFFEEPOS_WOOCOMMERCE_VERSION');
+$expectedDbVersion = getenv('COFFEEPOS_WOOCOMMERCE_DB_VERSION');
+$applyBaseline = getenv('COFFEEPOS_WOOCOMMERCE_APPLY_BASELINE') === '1';
+
+if (!$siteRoot || !$expectedVersion || !$expectedDbVersion) {
+    fwrite(STDERR, "CoffeePOS WooCommerce activation environment is incomplete.\n");
+    exit(2);
+}
+
+require_once $siteRoot . '/wp-load.php';
+require_once ABSPATH . 'wp-admin/includes/plugin.php';
+
+$plugin = 'woocommerce/woocommerce.php';
+$pluginFile = WP_PLUGIN_DIR . '/woocommerce/woocommerce.php';
+if (!is_file($pluginFile)) {
+    fwrite(STDERR, "Managed WooCommerce entry file is missing.\n");
+    exit(3);
+}
+
+$pluginData = get_plugin_data($pluginFile, false, false);
+$pluginVersion = isset($pluginData['Version']) ? trim((string) $pluginData['Version']) : '';
+if ($pluginVersion !== $expectedVersion) {
+    fwrite(STDERR, "WooCommerce plugin header version mismatch: {$pluginVersion}; expected {$expectedVersion}.\n");
+    exit(4);
+}
+
+add_filter('woocommerce_enable_setup_wizard', '__return_false');
+add_filter('woocommerce_prevent_automatic_wizard_redirect', '__return_true');
+add_filter('woocommerce_enable_auto_update_db', '__return_true');
+
+if (!is_plugin_active($plugin)) {
+    $result = activate_plugin($plugin, '', false, false);
+    if (is_wp_error($result)) {
+        fwrite(STDERR, "WooCommerce activation failed: " . $result->get_error_message() . "\n");
+        exit(5);
+    }
+}
+
+if (!is_plugin_active($plugin)) {
+    fwrite(STDERR, "WooCommerce is not listed as an active WordPress plugin after activation.\n");
+    exit(6);
+}
+if (!function_exists('WC') || !class_exists('WooCommerce') || !class_exists('WC_Install')) {
+    fwrite(STDERR, "WooCommerce runtime classes are unavailable after activation.\n");
+    exit(7);
+}
+if ((string) WC()->version !== $expectedVersion) {
+    fwrite(STDERR, "Loaded WooCommerce version does not match the pinned artifact.\n");
+    exit(8);
+}
+
+global $wpdb;
+$requiredTables = array(
+    $wpdb->prefix . 'woocommerce_sessions',
+    $wpdb->prefix . 'woocommerce_order_items',
+    $wpdb->prefix . 'woocommerce_order_itemmeta',
+    $wpdb->prefix . 'wc_product_meta_lookup',
+    $wpdb->prefix . 'actionscheduler_actions',
+    $wpdb->prefix . 'actionscheduler_claims',
+    $wpdb->prefix . 'actionscheduler_groups',
+    $wpdb->prefix . 'actionscheduler_logs',
+);
+$requiredPages = array('shop', 'cart', 'checkout', 'myaccount');
+
+$tableExists = static function (string $table) use ($wpdb): bool {
+    $found = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($table)));
+    return $found === $table;
+};
+$baselineIssues = static function () use ($expectedVersion, $expectedDbVersion, $requiredTables, $requiredPages, $tableExists): array {
+    $issues = array();
+    if ((string) get_option('woocommerce_version', '') !== $expectedVersion) {
+        $issues[] = 'woocommerce_version=' . (string) get_option('woocommerce_version', '');
+    }
+    if ((string) get_option('woocommerce_db_version', '') !== $expectedDbVersion) {
+        $issues[] = 'woocommerce_db_version=' . (string) get_option('woocommerce_db_version', '');
+    }
+    if (WC_Install::needs_db_update()) {
+        $issues[] = 'woocommerce_db_update_pending';
+    }
+    foreach ($requiredTables as $table) {
+        if (!$tableExists($table)) {
+            $issues[] = 'missing_table:' . $table;
+        }
+    }
+    foreach ($requiredPages as $page) {
+        if (wc_get_page_id($page) <= 0) {
+            $issues[] = 'missing_page:' . $page;
+        }
+    }
+    if (get_role('shop_manager') === null) {
+        $issues[] = 'missing_role:shop_manager';
+    }
+    return $issues;
+};
+$baselineReady = static function () use ($baselineIssues): bool {
+    return count($baselineIssues()) === 0;
+};
+
+if (!$baselineReady()) {
+    WC_Install::install();
+}
+
+if (!$tableExists($wpdb->prefix . 'actionscheduler_actions') && class_exists('ActionScheduler_StoreSchema')) {
+    $schema = new ActionScheduler_StoreSchema();
+    $schema->init();
+    $schema->register_tables(true);
+}
+if (!$tableExists($wpdb->prefix . 'actionscheduler_logs') && class_exists('ActionScheduler_LoggerSchema')) {
+    $schema = new ActionScheduler_LoggerSchema();
+    $schema->init();
+    $schema->register_tables(true);
+}
+
+if ($applyBaseline) {
+    $profile = get_option('woocommerce_onboarding_profile', array());
+    if (!is_array($profile)) {
+        $profile = array();
+    }
+    if (empty($profile['completed'])) {
+        $profile['skipped'] = true;
+        update_option('woocommerce_onboarding_profile', $profile);
+    }
+    $hiddenLists = get_option('woocommerce_task_list_hidden_lists', array());
+    if (!is_array($hiddenLists)) {
+        $hiddenLists = array();
+    }
+    if (!in_array('setup', $hiddenLists, true)) {
+        $hiddenLists[] = 'setup';
+        update_option('woocommerce_task_list_hidden_lists', array_values(array_unique($hiddenLists)));
+    }
+    update_option('woocommerce_show_marketplace_suggestions', 'no');
+    update_option('woocommerce_allow_tracking', 'no');
+}
+delete_transient('_wc_activation_redirect');
+
+if (!$baselineReady()) {
+    fwrite(STDERR, "WooCommerce activation completed but required baseline is not ready: " . implode(', ', $baselineIssues()) . "\n");
+    exit(9);
+}
+
+$profile = get_option('woocommerce_onboarding_profile', array());
+if (!is_array($profile) || (empty($profile['completed']) && empty($profile['skipped']))) {
+    fwrite(STDERR, "WooCommerce onboarding still requires operator interaction.\n");
+    exit(10);
+}
+
+fwrite(STDOUT, "WooCommerce {$expectedVersion} active; schema/pages/Action Scheduler/onboarding baseline verified.\n");
+exit(0);
 "#;
 
 const WORDPRESS_ROUTER: &str = r#"<?php
@@ -1626,14 +2443,29 @@ mod tests {
     fn http_get(port: u16, path: &str) -> String {
         let mut stream = std::net::TcpStream::connect((LOOPBACK, port)).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let request =
             format!("GET {path} HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        response
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        while response.len() < 2 * 1024 * 1024 {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => response.extend_from_slice(&chunk[..count]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("HTTP acceptance read failed: {error}"),
+            }
+        }
+        String::from_utf8_lossy(&response).into_owned()
     }
 
     #[cfg(windows)]
@@ -1657,11 +2489,97 @@ mod tests {
         assert!(WORDPRESS_BOOTSTRAP.contains("COFFEEPOS_ADMIN_PASSWORD"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn checked_in_woocommerce_manifest_matches_native_schema() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let project_root = manifest_dir.parent().unwrap();
+        let bytes = fs::read(
+            project_root.join("scripts/woocommerce-development/woocommerce-11.1.0.manifest.json"),
+        )
+        .unwrap();
+        let manifest: WooCommerceDevelopmentManifest = serde_json::from_slice(&bytes).unwrap();
+        validate_woocommerce_manifest(&manifest).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn woocommerce_manifest_rejects_path_escape() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let project_root = manifest_dir.parent().unwrap();
+        let bytes = fs::read(
+            project_root.join("scripts/woocommerce-development/woocommerce-11.1.0.manifest.json"),
+        )
+        .unwrap();
+        let mut manifest: WooCommerceDevelopmentManifest = serde_json::from_slice(&bytes).unwrap();
+        manifest.woocommerce.plugin_root = PathBuf::from("../escape");
+        assert!(validate_woocommerce_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn woocommerce_provisioning_preserves_owned_plugin_on_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("woocommerce.php"),
+            b"<?php\n/**\n * Plugin Name: WooCommerce\n * Version: 11.1.0\n */\n",
+        )
+        .unwrap();
+        let data_root = temp.path().join("store");
+        fs::create_dir_all(&data_root).unwrap();
+        let artifact = ResolvedWooCommerce {
+            version: "11.1.0".into(),
+            plugin_root: source,
+            archive_sha256: "6bae9bf74d722b6deb15f049687c311cfafc26e3a5d8fa55ac6ea4b9a3a8df19"
+                .into(),
+        };
+
+        ensure_woocommerce_plugin(&data_root, &artifact).unwrap();
+        let destination = data_root.join("site/wp-content/plugins/woocommerce");
+        assert!(woocommerce_installation_ready(&data_root, &artifact));
+        let sentinel = destination.join("preserve-user-file.txt");
+        fs::write(&sentinel, b"preserve me").unwrap();
+
+        ensure_woocommerce_plugin(&data_root, &artifact).unwrap();
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve me");
+    }
+
+    #[test]
+    fn woocommerce_provisioning_refuses_unmanaged_existing_plugin() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("woocommerce.php"),
+            b"<?php\n/**\n * Plugin Name: WooCommerce\n * Version: 11.1.0\n */\n",
+        )
+        .unwrap();
+        let data_root = temp.path().join("store");
+        let destination = data_root.join("site/wp-content/plugins/woocommerce");
+        fs::create_dir_all(&destination).unwrap();
+        let sentinel = destination.join("unmanaged.txt");
+        fs::write(&sentinel, b"do not overwrite").unwrap();
+        let artifact = ResolvedWooCommerce {
+            version: "11.1.0".into(),
+            plugin_root: source,
+            archive_sha256: "6bae9bf74d722b6deb15f049687c311cfafc26e3a5d8fa55ac6ea4b9a3a8df19"
+                .into(),
+        };
+
+        let error = ensure_woocommerce_plugin(&data_root, &artifact).unwrap_err();
+        assert_eq!(error.operation, "provision WooCommerce");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"do not overwrite");
+        assert!(!destination.join(WOOCOMMERCE_OWNERSHIP_FILE).exists());
+    }
+
     #[test]
     fn provisioning_info_serializes_ui_state_and_retry_contract() {
         let value = serde_json::to_value(ProvisioningInfo {
             state: ProvisioningState::NeedsRepair,
             wordpress_version: "7.1".into(),
+            woocommerce_version: "11.1.0".into(),
+            woocommerce_active: false,
             admin_username: Some(WORDPRESS_ADMIN_USER.into()),
             can_retry: false,
             last_error: Some(provisioning_error(
@@ -1672,6 +2590,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(value["state"], "needs_repair");
+        assert_eq!(value["woocommerce_version"], "11.1.0");
+        assert_eq!(value["woocommerce_active"], false);
         assert_eq!(value["can_retry"], false);
         assert_eq!(value["last_error"]["operation"], "read journal");
     }
@@ -1723,9 +2643,38 @@ mod tests {
 
         let installed = provisioner
             .install_wordpress("CoffeePOS Phase 3 E2E", &running)
-            .unwrap();
+            .unwrap_or_else(|error| {
+                let woocommerce_log = fs::read_to_string(data_root.join("logs/woocommerce.log"))
+                    .unwrap_or_else(|read_error| {
+                        format!("<cannot read woocommerce.log: {read_error}>")
+                    });
+                let provisioning_log =
+                    fs::read_to_string(data_root.join("logs/provisioning.log")).unwrap_or_else(
+                        |read_error| format!("<cannot read provisioning.log: {read_error}>"),
+                    );
+                panic!(
+                    "install WordPress/WooCommerce failed: {error}\n--- woocommerce.log ---\n{woocommerce_log}\n--- provisioning.log ---\n{provisioning_log}"
+                );
+            });
         assert_eq!(installed.state, ProvisioningState::Ready);
-        assert_eq!(provisioner.inspect().state, ProvisioningState::Ready);
+        assert!(installed.woocommerce_active);
+        let inspected = provisioner.inspect();
+        assert_eq!(inspected.state, ProvisioningState::Ready);
+        assert!(inspected.woocommerce_active);
+        assert_eq!(
+            provisioner.load_journal().unwrap().unwrap().stage,
+            ProvisioningStage::WooCommerceActivated
+        );
+        assert!(fs::read_to_string(data_root.join("site/wp-config.php"))
+            .unwrap()
+            .contains("define('DISABLE_WP_CRON', true);"));
+        let woocommerce = data_root.join("site/wp-content/plugins/woocommerce");
+        assert_eq!(
+            read_plugin_header_version(&woocommerce.join("woocommerce.php")).unwrap(),
+            "11.1.0"
+        );
+        assert!(woocommerce.join(WOOCOMMERCE_OWNERSHIP_FILE).is_file());
+        assert!(!data_root.join("woocommerce.provisioning").exists());
 
         let post_install_health = manager.refresh_wordpress_health();
         assert_eq!(
@@ -1733,6 +2682,15 @@ mod tests {
             WordPressHealthState::Healthy
         );
         assert!(post_install_health.wordpress_error.is_none());
+        let rest_response = http_get(
+            post_install_health.http_port.unwrap(),
+            "/wp-json/wc/store/v1/products?per_page=1",
+        );
+        assert!(
+            rest_response.starts_with("HTTP/1.0 200 ")
+                || rest_response.starts_with("HTTP/1.1 200 "),
+            "WooCommerce Store API did not return HTTP 200 after activation:\n{rest_response}"
+        );
 
         let healthy = manager.restart().unwrap();
         assert_eq!(healthy.state, RuntimeState::Running);
@@ -1827,6 +2785,12 @@ mod tests {
 
         let sentinel = data_root.join("site/wp-content/coffeepos-phase3-e2e-sentinel.txt");
         fs::write(&sentinel, b"preserve me").unwrap();
+        let woocommerce_sentinel = woocommerce.join("coffeepos-phase4-5-sentinel.txt");
+        fs::write(&woocommerce_sentinel, b"preserve plugin data").unwrap();
+        let unrelated_plugin = data_root.join("site/wp-content/plugins/existing-plugin");
+        fs::create_dir_all(&unrelated_plugin).unwrap();
+        let unrelated_sentinel = unrelated_plugin.join("keep.txt");
+        fs::write(&unrelated_sentinel, b"keep unrelated plugin").unwrap();
 
         let stopped = manager.stop().unwrap();
         assert_eq!(stopped.state, RuntimeState::Stopped);
@@ -1850,7 +2814,19 @@ mod tests {
             .install_wordpress("CoffeePOS Phase 3 E2E", &running_again)
             .unwrap();
         assert_eq!(installed_again.state, ProvisioningState::Ready);
+        assert!(installed_again.woocommerce_active);
         assert!(sentinel.is_file());
+        assert_eq!(
+            fs::read(&woocommerce_sentinel).unwrap(),
+            b"preserve plugin data"
+        );
+        assert_eq!(
+            fs::read(&unrelated_sentinel).unwrap(),
+            b"keep unrelated plugin"
+        );
+        let inspected_again = provisioner.inspect();
+        assert_eq!(inspected_again.state, ProvisioningState::Ready);
+        assert!(inspected_again.woocommerce_active);
 
         let stopped_again = manager.stop().unwrap();
         assert_eq!(stopped_again.state, RuntimeState::Stopped);

@@ -7,7 +7,7 @@
   </head>
   <body>
     <main>
-      <header><span class="mark" aria-hidden="true">C</span><div><h1>CoffeePOS</h1><p>Môi trường bán hàng tại cửa hàng</p></div><span class="phase">Phase 4.3</span></header>
+      <header><span class="mark" aria-hidden="true">C</span><div><h1>CoffeePOS</h1><p>Môi trường bán hàng tại cửa hàng</p></div><span class="phase">Phase 4.6</span></header>
       <section class="card" aria-labelledby="status-title">
         <span class="eyebrow">COFFEEPOS DESKTOP</span>
         <h2 id="status-title">Đang đọc cấu hình…</h2>
@@ -24,13 +24,14 @@
           <p id="provisioning-status" role="status" aria-live="polite">Đang kiểm tra trạng thái cài đặt…</p>
           <p id="provisioning-error" class="error" role="alert" hidden></p>
           <div class="actions">
-            <button id="provision-wordpress" type="button" disabled>Cài đặt WordPress</button>
+            <button id="provision-wordpress" type="button" disabled>Cài WordPress + WooCommerce</button>
           </div>
           <dl id="provisioning-details" hidden>
             <dt>WordPress</dt><dd id="provisioning-wordpress">—</dd>
+            <dt>WooCommerce</dt><dd id="provisioning-woocommerce">—</dd>
             <dt>Tài khoản quản trị</dt><dd id="provisioning-admin">—</dd>
           </dl>
-          <p class="hint">WordPress provisioning và runtime lifecycle là hai trạng thái riêng. WooCommerce và CoffeePOS sẽ được thêm ở các phase tiếp theo.</p>
+          <p class="hint">WooCommerce được provision và activate từ artifact đã pin. CoffeePOS plugin bắt đầu ở Phase 4.7.</p>
         </div>
       </section>
       <section class="card" id="runtime" hidden aria-labelledby="runtime-title">

@@ -33,6 +33,8 @@ type ProvisioningState = "not_installed" | "installing" | "ready" | "needs_repai
 interface ProvisioningInfo {
   state: ProvisioningState;
   wordpress_version: string;
+  woocommerce_version: string;
+  woocommerce_active: boolean;
   admin_username: string | null;
   can_retry: boolean;
   last_error: RuntimeErrorInfo | null;
@@ -56,6 +58,7 @@ const provisioningStatus = element("provisioning-status");
 const provisioningError = element("provisioning-error");
 const provisioningDetails = element("provisioning-details");
 const provisioningWordPress = element("provisioning-wordpress");
+const provisioningWooCommerce = element("provisioning-woocommerce");
 const provisioningAdmin = element("provisioning-admin");
 const provisionWordPress = element<HTMLButtonElement>("provision-wordpress");
 const runtimeSection = element("runtime");
@@ -150,6 +153,9 @@ function renderProvisioning(info: ProvisioningInfo, commandError?: string): void
   setup.setAttribute("aria-busy", provisioningBusy ? "true" : "false");
   provisioningState.textContent = info.state;
   provisioningWordPress.textContent = info.wordpress_version || "—";
+  provisioningWooCommerce.textContent = info.woocommerce_version
+    ? `${info.woocommerce_version} · ${info.woocommerce_active ? "active" : "not active"}`
+    : "—";
   provisioningAdmin.textContent = info.admin_username ?? "—";
   provisioningDetails.hidden = false;
   provisioningError.hidden = true;
@@ -165,17 +171,17 @@ function renderProvisioning(info: ProvisioningInfo, commandError?: string): void
 
   if (provisioningBusy || info.state === "installing") {
     provisioningState.textContent = "installing";
-    provisioningStatus.textContent = "Đang tạo database và cài WordPress. Không đóng app hoặc điều khiển runtime trong lúc này.";
+    provisioningStatus.textContent = "Đang đảm bảo database, WordPress, WooCommerce activation và schema. Không đóng app hoặc điều khiển runtime trong lúc này.";
     provisionWordPress.textContent = "Đang cài đặt…";
     provisionWordPress.hidden = false;
     provisionWordPress.disabled = true;
   } else if (info.state === "not_installed") {
-    provisioningStatus.textContent = "WordPress chưa được cài. Thao tác này sẽ tạo database và WordPress store cục bộ trên máy này.";
-    provisionWordPress.textContent = "Cài đặt WordPress";
+    provisioningStatus.textContent = "WordPress/WooCommerce chưa được provision. Thao tác này sẽ tạo local store và cài exact WooCommerce artifact đã pin.";
+    provisionWordPress.textContent = "Cài WordPress + WooCommerce";
     provisionWordPress.hidden = false;
     provisionWordPress.disabled = false;
   } else if (info.state === "ready") {
-    provisioningStatus.textContent = `WordPress ${info.wordpress_version} đã được cài và native provisioning báo Ready.`;
+    provisioningStatus.textContent = `WordPress ${info.wordpress_version} + WooCommerce ${info.woocommerce_version} đã active, schema/setup baseline đã được xác minh và native provisioning báo Ready.`;
     provisionWordPress.hidden = true;
     provisionWordPress.disabled = true;
   } else if (info.can_retry) {
@@ -242,6 +248,8 @@ async function provision(): Promise<void> {
   const installingInfo: ProvisioningInfo = currentProvisioning ?? {
     state: "installing",
     wordpress_version: "",
+    woocommerce_version: "",
+    woocommerce_active: false,
     admin_username: null,
     can_retry: false,
     last_error: null,
@@ -321,7 +329,7 @@ async function bootstrap(): Promise<void> {
     element("version").textContent = info.version;
     element("settings").hidden = false;
     title.textContent = "Desktop shell đã sẵn sàng";
-    description.textContent = "Phase 4.3 mở WordPress bằng đúng dynamic loopback URL sau khi runtime và WordPress health đã sẵn sàng.";
+    description.textContent = "Phase 4.6 activate WooCommerce 11.1.0, verify schema/setup và chạy WordPress cron/background jobs bằng native PHP CLI thay vì nested loopback self-request.";
     await refreshProvisioning();
     await refreshRuntime();
   } catch (error) {

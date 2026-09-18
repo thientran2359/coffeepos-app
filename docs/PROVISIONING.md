@@ -24,29 +24,42 @@ cargo test --manifest-path .\src-tauri\Cargo.toml --locked provisioning::tests::
 
 Test tạo store tạm trong `src-tauri/target/phase3-e2e`, chạy fresh provisioning, start/install/stop, chạy provisioning lần hai, kiểm tra file sentinel vẫn còn và xác nhận PID/port/staging/probe được cleanup trước khi xóa store tạm.
 
-## Health API đề xuất — cần align plugin trước khi code
+## CoffeePOS machine-health contract
 
 `GET /wp-json/coffeepos/v1/system/status`
 
 ```json
 {
   "schema_version": 1,
+  "status": "healthy",
   "wordpress": true,
   "woocommerce": true,
   "coffeepos": true,
   "database": true,
+  "versions": {
+    "wordpress": "7.1",
+    "woocommerce": "11.1.0",
+    "coffeepos": "1.0.0",
+    "coffeepos_schema": "0.0.2"
+  },
   "store": { "name": "My Coffee" },
   "pos_path": "/pos/"
 }
 ```
 
-`pos_path` là ví dụ, plugin phải sinh từ router thật, desktop resolve tương đối theo origin đã kiểm chứng. Không hardcode POS path như domain contract.
+Schema version `1` là contract Desktop/Plugin cho Phase 4.10. `status` là `healthy` khi toàn bộ dependency bắt buộc ready và `degraded` khi endpoint vẫn chạy nhưng một dependency không ready. Các version phải phản ánh component đang load thật, không suy diễn từ filename/artifact metadata.
+
+`pos_path` phải là path tương đối cùng origin và được plugin sinh từ CoffeePOS Router/settings thật. Desktop chỉ chấp nhận path bắt đầu bằng `/`, không có scheme/host và resolve nó trên origin runtime đã kiểm chứng; không hardcode `/pos/` như domain contract.
 
 HTTP 200 chỉ khi required components ready, 503 khi endpoint còn chạy nhưng dependency lỗi, 401 khi thiếu/sai machine credential. Nếu PHP/WP/DB lỗi tới mức endpoint không chạy hoặc plugin bị inactive thì desktop phân loại transport/bootstrap failure; không giả health OK.
 
-Request dùng header machine token riêng, so sánh constant-time trong plugin, token truyền qua native HTTP client và giữ trong protected storage; không đưa token vào WebView, query string hoặc log. Không dùng quyền admin để auth health. Khi LAN bật, endpoint phải có auth dù caller cùng LAN; không public store info. Response không chứa secret, filesystem paths hay dữ liệu khách.
+Request dùng header `X-CoffeePOS-Machine-Token`. Desktop tạo token từ 32 random bytes và encode lowercase hex; plaintext chỉ giữ trong native protected storage (Windows DPAPI trong Windows-first flow), không đưa vào WebView, query string, process arguments hoặc log. Plugin chỉ giữ SHA-256 của token trong WordPress option `coffeepos_desktop_machine_token_sha256` và dùng `hash_equals` khi so sánh.
 
-Schema/token bootstrap/rotation/version response và POS route cần chốt cùng plugin trước khi pin artifact ở Phase 4.7; implementation/nghiệm thu endpoint ở 4.10. Nếu cần sửa plugin sau khi pin, tạo artifact version/hash mới và chạy lại acceptance liên quan. Desktop đọc kết quả endpoint, không tái tạo business/dependency logic WordPress trong Rust.
+Bootstrap token chạy bằng bounded pinned-PHP CLI sau khi CoffeePOS đã active: native truyền token qua stdin cho local bootstrap script, script chỉ persist SHA-256 rồi xóa buffer/temporary script theo lifecycle provisioning. Rotation giữ cả active + pending plaintext token trong protected native storage, cập nhật WordPress hash qua cùng local CLI, probe endpoint bằng pending token rồi mới promote; nếu probe/update fail thì local CLI restore old hash và pending token bị bỏ. Không reset token khi restart hoặc retry provisioning bình thường.
+
+Không dùng quyền admin/staff session để auth machine-health. Khi LAN bật endpoint vẫn bắt buộc machine token. Response không chứa secret, filesystem path, user/session data hoặc dữ liệu khách; `store.name` chỉ là store identity đã cấu hình.
+
+Contract schema/token bootstrap/rotation/version/POS route này được chốt ở Phase 4.7. Implementation/nghiệm thu endpoint thuộc Phase 4.10. CoffeePOS `1.0.0` artifact pin ở 4.7 vẫn có user-facing `/wp-json/coffeepos/v1/health` cũ; route đó không thay machine-health contract. Khi 4.10 sửa plugin để implement contract mới, phải bump CoffeePOS version + artifact hash và chạy lại acceptance 4.8–4.10; không mutate staged artifact cũ. Desktop đọc kết quả endpoint, không tái tạo CoffeePOS domain/dependency logic trong Rust.
 
 ## Các gate tích hợp còn lại
 

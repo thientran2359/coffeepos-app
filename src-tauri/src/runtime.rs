@@ -15,6 +15,7 @@ const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_LOG_CHUNK_BYTES: usize = 8192;
 const PORT_ATTEMPTS: usize = 3;
+const WORDPRESS_CRON_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const DATABASE_RUNTIME_USER: &str = "coffeepos_runtime";
 pub(crate) const DATABASE_WORDPRESS_USER: &str = "coffeepos_wp";
 pub(crate) const DATABASE_NAME: &str = "coffeepos";
@@ -209,6 +210,8 @@ pub struct RuntimeManager {
     http_port: Option<u16>,
     database: Option<ManagedChild>,
     php: Option<ManagedChild>,
+    cron: Option<ManagedChild>,
+    last_cron_spawn: Option<Instant>,
     php_probe: Option<PathBuf>,
     wordpress_health: WordPressHealthState,
     wordpress_error: Option<RuntimeErrorInfo>,
@@ -251,6 +254,8 @@ impl RuntimeManager {
             http_port: None,
             database: None,
             php: None,
+            cron: None,
+            last_cron_spawn: None,
             php_probe: None,
             wordpress_health: WordPressHealthState::Unavailable,
             wordpress_error: None,
@@ -299,6 +304,7 @@ impl RuntimeManager {
     }
 
     pub fn refresh(&mut self) -> RuntimeInfo {
+        self.refresh_cron_child();
         if self.state == RuntimeState::Running {
             let database_exit = child_exit(&mut self.database, "database");
             let php_exit = child_exit(&mut self.php, "php");
@@ -319,6 +325,11 @@ impl RuntimeManager {
                 self.wordpress_health = WordPressHealthState::Unavailable;
                 self.wordpress_error = None;
                 self.log_event("runtime child exited unexpectedly");
+            }
+            if self.state == RuntimeState::Running {
+                if let Err(error) = self.maybe_spawn_wordpress_cron(false) {
+                    self.log_event(&format!("wordpress cron spawn failed: {error}"));
+                }
             }
         } else if self.database.is_none() && self.php.is_none() {
             self.state = if installation_ready(&self.data_root) {
@@ -493,6 +504,9 @@ impl RuntimeManager {
             Ok(()) => {
                 self.wordpress_health = WordPressHealthState::Healthy;
                 self.log_event("wordpress healthy");
+                if let Err(error) = self.maybe_spawn_wordpress_cron(true) {
+                    self.log_event(&format!("wordpress cron spawn failed: {error}"));
+                }
             }
             Err(error) => {
                 self.wordpress_health = WordPressHealthState::Unhealthy;
@@ -553,6 +567,14 @@ impl RuntimeManager {
         self.wordpress_error = None;
         self.log_event("runtime stop requested");
         let mut failure = None;
+
+        if let Some(cron) = self.cron.as_mut() {
+            if let Err(error) = cron.terminate(self.timeouts.stop) {
+                failure = Some(error);
+            } else {
+                self.cron = None;
+            }
+        }
 
         if let Some(php) = self.php.as_mut() {
             if let Err(error) = php.terminate(self.timeouts.stop) {
@@ -758,6 +780,94 @@ impl RuntimeManager {
         self.spawn_logged(command, "php", "php.log")
     }
 
+    fn maybe_spawn_wordpress_cron(&mut self, force: bool) -> Result<(), RuntimeErrorInfo> {
+        if self.state != RuntimeState::Running || self.cron.is_some() {
+            return Ok(());
+        }
+        if !force
+            && self
+                .last_cron_spawn
+                .is_some_and(|last| last.elapsed() < WORDPRESS_CRON_INTERVAL)
+        {
+            return Ok(());
+        }
+        let site = self.data_root.join("site");
+        let cron_script = site.join("wp-cron.php");
+        if !cron_script.is_file() {
+            return Ok(());
+        }
+        let database_port = self.database_port.ok_or_else(|| {
+            error_info(
+                "wordpress cron",
+                "spawn",
+                "Database port is unavailable while preparing the managed WordPress cron runner.",
+                "Restart the runtime so MariaDB is ready before cron/background jobs are processed.",
+            )
+        })?;
+        let http_port = self.http_port.ok_or_else(|| {
+            error_info(
+                "wordpress cron",
+                "spawn",
+                "HTTP port is unavailable while preparing the managed WordPress cron runner.",
+                "Restart the runtime so the current managed site URL can be supplied to WordPress cron.",
+            )
+        })?;
+        let database_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+            .map_err(|error| {
+                error_info(
+                    "wordpress cron",
+                    "load database credential",
+                    error,
+                    "Run provisioning repair with the same Windows user profile, then retry.",
+                )
+            })?;
+        let mut command = Command::new(&self.runtime.php_executable);
+        command
+            .arg("-c")
+            .arg(&self.runtime.php_ini)
+            .arg(&cron_script)
+            .env_remove("PHPRC")
+            .env("PHP_INI_SCAN_DIR", "")
+            .env("COFFEEPOS_DB_PASSWORD", database_password)
+            .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
+            .env(
+                "COFFEEPOS_SITE_URL",
+                format!("http://{LOOPBACK}:{http_port}"),
+            )
+            .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
+            .env("COFFEEPOS_DESKTOP_CRON", "1")
+            .current_dir(&site);
+        self.cron = Some(self.spawn_logged(command, "wordpress cron", "cron.log")?);
+        self.last_cron_spawn = Some(Instant::now());
+        self.log_event("wordpress cron/background worker started");
+        Ok(())
+    }
+
+    fn refresh_cron_child(&mut self) {
+        let Some(cron) = self.cron.as_mut() else {
+            return;
+        };
+        match cron.try_wait() {
+            Ok(Some(status)) => {
+                self.cron = None;
+                if status.success() {
+                    self.log_event("wordpress cron/background worker completed");
+                } else {
+                    self.log_event(&format!(
+                        "wordpress cron/background worker exited with status {status}; inspect logs/cron.log"
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.cron = None;
+                self.log_event(&format!(
+                    "wordpress cron/background worker monitor failed: {error}"
+                ));
+            }
+        }
+    }
+
     fn spawn_logged(
         &self,
         mut command: Command,
@@ -941,6 +1051,13 @@ impl RuntimeManager {
 
     fn cleanup_started(&mut self) -> Result<(), RuntimeErrorInfo> {
         let mut failure = None;
+        if let Some(cron) = self.cron.as_mut() {
+            if let Err(error) = cron.terminate(self.timeouts.stop) {
+                failure = Some(error);
+            } else {
+                self.cron = None;
+            }
+        }
         if let Some(php) = self.php.as_mut() {
             if let Err(error) = php.terminate(self.timeouts.stop) {
                 failure = Some(error);
@@ -972,7 +1089,7 @@ impl RuntimeManager {
                 "Check application-data permissions and free disk space, then retry.",
             )
         })?;
-        for name in ["runtime.log", "database.log", "php.log"] {
+        for name in ["runtime.log", "database.log", "php.log", "cron.log"] {
             bound_existing_log(&logs.join(name))?;
         }
         Ok(())

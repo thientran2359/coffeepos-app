@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-pc-windows-msvc",
+  "coffeepos": {
+    "version": "1.0.0",
+    "archive": "coffeepos-1.0.0.zip",
+    "archive_sha256": "ee9f241a516e7c6ddddc6e84ad26515d0a9cd9ccd5d6fd101d078a738e598f2a",
+    "archive_sha256_source": "computed from the checked-in CoffeePOS release archive built on 2026-09-18 from clean Git commit 9473867c65f1409dbeeaa03a98daef564f620b8e",
+    "source_kind": "checked-in release snapshot from a clean detached Git worktree",
+    "source_git_commit": "9473867c65f1409dbeeaa03a98daef564f620b8e",
+    "build_script": "tools/build-release.ps1",
+    "composer_version": "2.10.2",
+    "build_php_version": "8.2.27",
+    "license": "GPL-2.0-or-later",
+    "requires_plugin": "woocommerce",
+    "plugin_root": "coffeepos/coffeepos",
+    "entry_file": "coffeepos/coffeepos/coffeepos.php",
+    "readme_file": "coffeepos/coffeepos/readme.txt",
+    "license_file": "coffeepos/coffeepos/LICENSE",
+    "autoload_file": "coffeepos/coffeepos/vendor/autoload.php"
+  },
+  "compatibility": {
+    "minimum_wordpress": "6.4",
+    "tested_wordpress": "7.0",
+    "minimum_php": "7.4",
+    "development_wordpress": "7.1",
+    "development_php": "8.4.25",
+    "development_mariadb": "11.4.13",
+    "development_woocommerce": "11.1.0"
+  }
+}
