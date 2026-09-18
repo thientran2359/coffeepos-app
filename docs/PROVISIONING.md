@@ -13,7 +13,7 @@ Phase 3 native provisioning hiện thực theo ensure semantics:
 5. Start MariaDB/PHP qua Runtime Manager, chạy WordPress bootstrap để tạo schema và initial administrator, sau đó kiểm tra `/wp-login.php` thật trước khi ghi journal `wordpress_installed`.
 6. Retry giữ nguyên datadir/site đã quản lý, không đổi credential hiện có và từ chối ghi đè site/config không thuộc CoffeePOS Desktop.
 
-Uploads được tách khỏi core mutable tại application-data root. Baseline Phase 3 chỉ chứa WordPress core. UI provisioning thuộc Phase 4.1–4.3; WooCommerce thuộc Phase 4.4–4.6; CoffeePOS artifact/provisioning/activation đã hoàn thành ở Phase 4.7–4.9, machine health thuộc Phase 4.10; full-stack idempotency/recovery thuộc Phase 4.11–4.12. Xem [ROADMAP.md](ROADMAP.md).
+Uploads được tách khỏi core mutable tại application-data root. Baseline Phase 3 chỉ chứa WordPress core. UI provisioning thuộc Phase 4.1–4.3; WooCommerce thuộc Phase 4.4–4.6; CoffeePOS artifact/provisioning/activation/machine health đã hoàn thành ở Phase 4.7–4.10; full-stack idempotency/recovery thuộc Phase 4.11–4.12. Xem [ROADMAP.md](ROADMAP.md).
 
 Validation Windows x64 dùng staged runtime thật:
 
@@ -28,7 +28,7 @@ Phase 4.8 native provisioning consume `coffeepos-manifest.json` + exact staged C
 
 Phase 4.9 tiếp tục cùng orchestration path bằng hai bounded pinned-PHP process. Activation process xác minh exact active WooCommerce 11.1.0 rồi gọi WordPress `activate_plugin` cho CoffeePOS 1.0.0; nếu retry sau một partial attempt đã để plugin active nhưng journal còn `coffee_pos_provisioned`, native gọi lại `CoffeePOS\Core\Lifecycle::activate()` để plugin tự đảm bảo defaults/capabilities/migration/rewrite. Fresh verification process sau đó load WordPress từ đầu và chỉ pass khi exact CoffeePOS runtime/autoload có mặt, `Migrator::SCHEMA_VERSION` khớp option và mọi `Schema::tableNames()` tồn tại vật lý, mọi `Settings::optionNames()` đã được seed, CoffeePOS roles/capabilities tồn tại, rewrite version/rules đúng và REST server thật chứa `/coffeepos/v1/health` cùng toàn bộ `RouteRegistrar::registeredRoutes()` của artifact. Native không tạo table/default/capability thay plugin. Journal chỉ chuyển sang `coffee_pos_activated` sau verifier pass; timeout/failure giữ stage provisioned để retry và giữ nguyên dữ liệu.
 
-Pinned CoffeePOS 1.0.0 artifact của Phase 4.9 có schema `0.0.1` và rewrite version `1.0.0:3`. Đây là trạng thái của exact artifact SHA256 đã pin ở Phase 4.7; sibling plugin checkout đang phát triển không được dùng để suy diễn baseline Desktop. Nếu Phase 4.10 thay plugin code/schema để implement machine-health contract thì phải bump version/hash và repin theo gate Phase 4.7.
+Pinned CoffeePOS 1.0.0 artifact của Phase 4.9 có schema `0.0.1` và rewrite version `1.0.0:3`. Phase 4.10 nâng exact managed artifact lên CoffeePOS `1.0.1`, build từ clean plugin commit `6de371a104aca6ae426ebea78a97460820dc4d65`, checked-in ZIP SHA256 `67e3f268ffd29946cfb4fdce13d6e7ad12caaf3ca7af007cff2177940d8e4a64`. Endpoint mới không đổi plugin DB schema nên `Migrator::SCHEMA_VERSION` vẫn là `0.0.1`. Native chỉ tự động upgrade đúng managed 1.0.0 Phase 4.9 artifact sang exact 1.0.1 này qua owned staging/backup; unmanaged, corrupt hoặc version/hash khác được preserve và từ chối.
 
 ## CoffeePOS machine-health contract
 
@@ -45,8 +45,8 @@ Pinned CoffeePOS 1.0.0 artifact của Phase 4.9 có schema `0.0.1` và rewrite v
   "versions": {
     "wordpress": "7.1",
     "woocommerce": "11.1.0",
-    "coffeepos": "1.0.0",
-    "coffeepos_schema": "0.0.2"
+    "coffeepos": "1.0.1",
+    "coffeepos_schema": "0.0.1"
   },
   "store": { "name": "My Coffee" },
   "pos_path": "/pos/"
@@ -65,11 +65,11 @@ Bootstrap token chạy bằng bounded pinned-PHP CLI sau khi CoffeePOS đã acti
 
 Không dùng quyền admin/staff session để auth machine-health. Khi LAN bật endpoint vẫn bắt buộc machine token. Response không chứa secret, filesystem path, user/session data hoặc dữ liệu khách; `store.name` chỉ là store identity đã cấu hình.
 
-Contract schema/token bootstrap/rotation/version/POS route này được chốt ở Phase 4.7. Implementation/nghiệm thu endpoint thuộc Phase 4.10. CoffeePOS `1.0.0` artifact pin ở 4.7 vẫn có user-facing `/wp-json/coffeepos/v1/health` cũ; route đó không thay machine-health contract. Khi 4.10 sửa plugin để implement contract mới, phải bump CoffeePOS version + artifact hash và chạy lại acceptance 4.8–4.10; không mutate staged artifact cũ. Desktop đọc kết quả endpoint, không tái tạo CoffeePOS domain/dependency logic trong Rust.
+Contract schema/token bootstrap/rotation/version/POS route này được chốt ở Phase 4.7 và được implement ở CoffeePOS `1.0.1` trong Phase 4.10. User-facing `/wp-json/coffeepos/v1/health` cũ vẫn giữ nguyên staff/session authorization và không thay machine-health contract. Desktop đọc kết quả `/system/status`, validate schema/HTTP/POS path rồi phân loại application health; Rust không tái tạo CoffeePOS domain/dependency logic.
 
 ## Các gate tích hợp còn lại
 
-- `ProvisioningInfo.ready` là trạng thái installation; không thay health sau mỗi lần start/restart ở 4.2. Trước khi có endpoint CoffeePOS, kiểm WordPress riêng trong phạm vi đã có.
+- `ProvisioningInfo.ready` là trạng thái installation; không thay health sau mỗi lần start/restart. Runtime vẫn kiểm WordPress riêng, sau đó probe CoffeePOS machine-health khi WordPress healthy và xóa health cũ khi stop/start failure/process death.
 - Phase 4.6 và 4.9 đã kiểm initialization/schema/plugin-owned baseline ngoài cờ plugin active. Phase 4.10 phải giữ ranh giới này: machine-health đọc trạng thái application thật, không thay activation verifier bằng file/journal metadata.
 - Phase 4.11/4.12 là kiểm chứng tích hợp; từng ensure operation phải an toàn với retry ngay từ lúc triển khai. Cuối 4.12, UI điều phối setup toàn stack và recovery qua journal sau khi app bị đóng giữa chừng.
 - Trước 5.2 chốt UX đặt/nhận credential ban đầu và login thật. Secret được bảo vệ trong native storage không có nghĩa người dùng đã đăng nhập được; machine health auth tách khỏi staff auth. Không reset credential khi restart hoặc retry.

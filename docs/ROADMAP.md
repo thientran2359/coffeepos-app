@@ -43,7 +43,8 @@ Giữ nguyên số phase. Các mốc artifact/install/activation là checkpoint 
 | 4.7 — CoffeePOS artifact | ✅ Hoàn thành Windows-first | CoffeePOS 1.0.0 immutable checked-in ZIP + SHA256 + source provenance + deterministic staging |
 | 4.8 — CoffeePOS provisioning | ✅ Hoàn thành Windows-first | Ownership-safe install 1.0.0, dependency preflight, journal stage, retry/data preservation |
 | 4.9 — CoffeePOS activation | ✅ Hoàn thành Windows-first | Exact 1.0.0 active, Woo 11.1.0 preflight, fresh-process plugin baseline verification, restart/retry persistence |
-| 4.10+ | ⏳ Chưa bắt đầu | Mốc tiếp theo: CoffeePOS health endpoint |
+| 4.10 — CoffeePOS health endpoint | ✅ Hoàn thành Windows-first | CoffeePOS 1.0.1 machine-health schema 1, DPAPI token auth, native classification, rotation/recovery, real E2E |
+| 4.11+ | ⏳ Chưa bắt đầu | Mốc tiếp theo: full install idempotency |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -154,6 +155,8 @@ Xác minh migrations, roles/capabilities, settings và route cần thiết bằn
 Chốt schema/auth/POS route trước artifact 4.7; 4.10 triển khai và nghiệm thu trên artifact đã pin. Phải kiểm token thiếu/sai, timeout, schema không tương thích, dependency lỗi và plugin inactive. Endpoint mất không đủ bằng chứng để kết luận dependency cụ thể; diagnostics giữ trạng thái unknown/unavailable khi không xác minh được.
 
 **Definition of Done:** Desktop phân biệt được healthy, dependency failure và transport/bootstrap failure từ endpoint thật; không tái tạo CoffeePOS domain checks trong Rust.
+
+**Hoàn thành Windows-first 2026-09-18:** CoffeePOS `1.0.1` implement `/wp-json/coffeepos/v1/system/status` schema 1 với `X-CoffeePOS-Machine-Token`, chỉ lưu SHA-256 server-side và trả 200 healthy / 503 degraded / 401 auth theo state plugin-owned. Desktop tạo token 32 random bytes lowercase hex trong Windows DPAPI, bootstrap qua bounded pinned-PHP stdin, probe endpoint thật sau WordPress health, validate strict response/POS path và phân loại authentication/contract/transport-bootstrap riêng. Managed 1.0.0 được upgrade atomically lên exact 1.0.1 artifact; token không reset khi retry/restart. Rotation dùng protected active+pending credential, verify pending trước promote và rollback old hash khi update/probe fail. Acceptance bao phủ missing/wrong/correct token, incompatible schema parser, dependency degraded, plugin inactive/missing route, runtime restart/process death/port move, credential rotation và second provisioning. Xem `docs/PHASE-04.10.md`.
 
 ### Phase 4.11 — Full install idempotency
 
@@ -283,4 +286,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.8 đã pass Windows-first. Mốc tiếp theo là **Phase 4.9 — CoffeePOS activation**; phải activate đúng managed CoffeePOS 1.0.0, kiểm WooCommerce dependency/version và plugin-owned migrations/capabilities/settings/routes trước khi coi CoffeePOS usable.
+Phase 4.1–4.10 đã pass Windows-first. Mốc tiếp theo là **Phase 4.11 — Full install idempotency**; phải chứng minh full DB → WordPress → WooCommerce → CoffeePOS rerun giữ nguyên credential, uploads, plugin ownership, machine token và dữ liệu/sentinel đã có.

@@ -911,7 +911,8 @@ Current Windows-first status:
 - Phase 4.7 — CoffeePOS artifact: complete Windows-first.
 - Phase 4.8 — CoffeePOS provisioning: complete Windows-first.
 - Phase 4.9 — CoffeePOS activation: complete Windows-first.
-- Next milestone: Phase 4.10 — CoffeePOS health endpoint.
+- Phase 4.10 — CoffeePOS health endpoint: complete Windows-first.
+- Next milestone: Phase 4.11 — Full install idempotency.
 
 From Phase 4 onward, work is intentionally split into small independently verifiable milestones:
 

@@ -65,6 +65,7 @@ pub enum CoffeePosHealthFailureKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CoffeePosHealthVersions {
     pub wordpress: String,
     pub woocommerce: String,
@@ -73,6 +74,7 @@ pub struct CoffeePosHealthVersions {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CoffeePosHealthStore {
     pub name: String,
 }
@@ -1912,7 +1914,8 @@ fn wordpress_probe_response_healthy(response: &[u8]) -> bool {
 pub(crate) fn probe_coffeepos_health(data_root: &Path, port: u16) -> CoffeePosHealthInfo {
     let token_path = data_root.join(MACHINE_TOKEN_SECRET);
     let pending_path = data_root.join(MACHINE_TOKEN_PENDING_SECRET);
-    let active_health = if token_path.is_file() {
+    let active_token_exists = token_path.is_file();
+    let active_health = if active_token_exists {
         match secret::load(&token_path) {
             Ok(token) => probe_coffeepos_health_with_token(port, &token),
             Err(error) => coffeepos_health_failure(
@@ -1923,7 +1926,12 @@ pub(crate) fn probe_coffeepos_health(data_root: &Path, port: u16) -> CoffeePosHe
             ),
         }
     } else {
-        CoffeePosHealthInfo::unavailable()
+        coffeepos_health_failure(
+            CoffeePosHealthFailureKind::Authentication,
+            "read machine credential",
+            "The protected CoffeePOS machine credential is missing.",
+            "Keep the installed store and use the explicit machine-credential repair/rotation flow. Normal runtime start will not invent a replacement credential.",
+        )
     };
 
     if !pending_path.is_file() {
@@ -1956,7 +1964,7 @@ pub(crate) fn probe_coffeepos_health(data_root: &Path, port: u16) -> CoffeePosHe
     };
     let pending_health = probe_coffeepos_health_with_token(port, &pending);
     if !coffeepos_health_accepts_credential(&pending_health) {
-        return if active_health.state == CoffeePosHealthState::Unavailable {
+        return if !active_token_exists {
             pending_health
         } else {
             active_health
@@ -1987,6 +1995,22 @@ pub(crate) fn probe_coffeepos_health(data_root: &Path, port: u16) -> CoffeePosHe
 }
 
 pub(crate) fn probe_coffeepos_health_with_token(port: u16, token: &str) -> CoffeePosHealthInfo {
+    probe_coffeepos_health_with_token_timeouts(
+        port,
+        token,
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+    )
+}
+
+fn probe_coffeepos_health_with_token_timeouts(
+    port: u16,
+    token: &str,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> CoffeePosHealthInfo {
     if token.len() != 64
         || !token
             .bytes()
@@ -2001,7 +2025,7 @@ pub(crate) fn probe_coffeepos_health_with_token(port: u16, token: &str) -> Coffe
     }
 
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-    let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(500)) {
+    let mut stream = match TcpStream::connect_timeout(&address, connect_timeout) {
         Ok(stream) => stream,
         Err(error) => {
             return coffeepos_health_failure(
@@ -2012,8 +2036,8 @@ pub(crate) fn probe_coffeepos_health_with_token(port: u16, token: &str) -> Coffe
             );
         }
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(read_timeout));
+    let _ = stream.set_write_timeout(Some(write_timeout));
     let request = format!(
         "GET /wp-json/coffeepos/v1/system/status HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nX-CoffeePOS-Machine-Token: {token}\r\nConnection: close\r\n\r\n"
     );
@@ -2085,11 +2109,13 @@ fn parse_coffeepos_health_response(response: &[u8]) -> CoffeePosHealthInfo {
             "Restart the local runtime and retry.",
         );
     };
-    let status_code = headers
-        .lines()
+    let status_line = headers.lines().next().unwrap_or_default();
+    let mut status_parts = status_line.split_whitespace();
+    let protocol = status_parts.next().unwrap_or_default();
+    let status_code = status_parts
         .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|value| value.parse::<u16>().ok());
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|_| matches!(protocol, "HTTP/1.0" | "HTTP/1.1"));
     let Some(status_code) = status_code else {
         return coffeepos_health_failure(
             CoffeePosHealthFailureKind::TransportBootstrap,
@@ -2868,6 +2894,73 @@ mod tests {
             unsafe_path.failure_kind,
             Some(CoffeePosHealthFailureKind::Contract)
         );
+
+        let nested_unknown = parse_coffeepos_health_response(&machine_health_response(
+            200,
+            &HEALTHY_MACHINE_BODY.replace(
+                r#""wordpress":"7.1""#,
+                r#""wordpress":"7.1","unexpected":"value""#,
+            ),
+        ));
+        assert_eq!(
+            nested_unknown.failure_kind,
+            Some(CoffeePosHealthFailureKind::Contract)
+        );
+
+        let invalid_protocol_response = format!(
+            "NOTHTTP 200 OK\r\nContent-Type: application/json\r\n\r\n{HEALTHY_MACHINE_BODY}"
+        );
+        let invalid_protocol =
+            parse_coffeepos_health_response(invalid_protocol_response.as_bytes());
+        assert_eq!(
+            invalid_protocol.failure_kind,
+            Some(CoffeePosHealthFailureKind::TransportBootstrap)
+        );
+    }
+
+    #[test]
+    fn coffeepos_health_probe_classifies_missing_protected_token_as_authentication_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let health = probe_coffeepos_health(temp.path(), 43129);
+        assert_eq!(health.state, CoffeePosHealthState::Failed);
+        assert_eq!(
+            health.failure_kind,
+            Some(CoffeePosHealthFailureKind::Authentication)
+        );
+        assert!(health
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("credential is missing"));
+    }
+
+    #[test]
+    fn coffeepos_health_probe_classifies_read_timeout_as_transport_failure() {
+        let listener = TcpListener::bind((LOOPBACK, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let token = "a".repeat(64);
+        let health = probe_coffeepos_health_with_token_timeouts(
+            port,
+            &token,
+            Duration::from_millis(200),
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+        );
+        assert_eq!(health.state, CoffeePosHealthState::Failed);
+        assert_eq!(
+            health.failure_kind,
+            Some(CoffeePosHealthFailureKind::TransportBootstrap)
+        );
+        assert!(health.error.as_ref().unwrap().message.contains("timed out"));
+        server.join().unwrap();
     }
 
     #[test]

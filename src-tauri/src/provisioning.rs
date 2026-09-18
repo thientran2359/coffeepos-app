@@ -37,7 +37,7 @@ const COFFEEPOS_PHASE_4_9_SHA256: &str =
     "ee9f241a516e7c6ddddc6e84ad26515d0a9cd9ccd5d6fd101d078a738e598f2a";
 const COFFEEPOS_PHASE_4_10_VERSION: &str = "1.0.1";
 const COFFEEPOS_PHASE_4_10_SHA256: &str =
-    "8f0e7a7c91f1679a05d012da85115934fd47ec25ddfa9a47b1ea989d6aded44a";
+    "67e3f268ffd29946cfb4fdce13d6e7ad12caaf3ca7af007cff2177940d8e4a64";
 const COFFEEPOS_UPGRADE_BACKUP: &str = "coffeepos.previous";
 const MANAGED_PLUGIN_OWNERSHIP_FILE: &str = ".coffeepos-managed.json";
 const COFFEEPOS_REQUIRED_FILES: [&str; 4] = [
@@ -308,6 +308,11 @@ impl Provisioner {
             data_root,
             containment: ProcessContainment::new()?,
         })
+    }
+
+    #[cfg(test)]
+    fn replace_php_executable_for_test(&mut self, executable: PathBuf) -> PathBuf {
+        std::mem::replace(&mut self.runtime.php_executable, executable)
     }
 
     pub fn inspect(&self) -> ProvisioningInfo {
@@ -871,17 +876,28 @@ impl Provisioner {
         })?;
         let script = self.write_machine_health_bootstrap_script()?;
         let log_path = self.data_root.join("logs/coffeepos.log");
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|error| {
-                provisioning_error(
+        let log = match OpenOptions::new().create(true).append(true).open(&log_path) {
+            Ok(log) => log,
+            Err(error) => {
+                let _ = fs::remove_file(&script);
+                return Err(provisioning_error(
                     "bootstrap CoffeePOS machine health",
                     format!("Cannot open CoffeePOS log: {error}."),
                     "Check application-data permissions and retry.",
-                )
-            })?;
+                ));
+            }
+        };
+        let stdout_log = match log.try_clone() {
+            Ok(log) => log,
+            Err(error) => {
+                let _ = fs::remove_file(&script);
+                return Err(provisioning_error(
+                    "bootstrap CoffeePOS machine health",
+                    format!("Cannot duplicate CoffeePOS log handle: {error}."),
+                    "Check application-data permissions and retry.",
+                ));
+            }
+        };
         let mut command = Command::new(&self.runtime.php_executable);
         command
             .arg("-c")
@@ -898,23 +914,21 @@ impl Provisioner {
             .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
             .env("COFFEEPOS_SITE_ROOT", self.data_root.join("site"))
             .stdin(Stdio::piped())
-            .stdout(Stdio::from(log.try_clone().map_err(|error| {
-                provisioning_error(
-                    "bootstrap CoffeePOS machine health",
-                    format!("Cannot duplicate CoffeePOS log handle: {error}."),
-                    "Check application-data permissions and retry.",
-                )
-            })?))
+            .stdout(Stdio::from(stdout_log))
             .stderr(Stdio::from(log))
             .current_dir(self.data_root.join("site"));
         configure_child_command(&mut command);
-        let mut child = command.spawn().map_err(|error| {
-            provisioning_error(
-                "bootstrap CoffeePOS machine health",
-                format!("Cannot start pinned PHP for machine-token bootstrap: {error}."),
-                "Verify the pinned PHP runtime and retry.",
-            )
-        })?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = fs::remove_file(&script);
+                return Err(provisioning_error(
+                    "bootstrap CoffeePOS machine health",
+                    format!("Cannot start pinned PHP for machine-token bootstrap: {error}."),
+                    "Verify the pinned PHP runtime and retry.",
+                ));
+            }
+        };
         if let Err(error) = self.containment.assign(&child) {
             let _ = child.kill();
             let _ = child.wait();
@@ -978,6 +992,9 @@ impl Provisioner {
         Ok(())
     }
 
+    // Phase 4.10 implements the explicit repair primitive and its recovery semantics. Phase 6.2
+    // will expose the user-facing repair action; normal start/restart/provisioning must not rotate.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn rotate_machine_health_token(
         &self,
         runtime_info: &RuntimeInfo,
@@ -1033,7 +1050,91 @@ impl Provisioner {
                 "Check protected application-data storage and retry.",
             )
         })?;
-        self.switch_machine_health_token(runtime_info, &active, &pending)?;
+        if let Err(switch_error) = self.switch_machine_health_token(runtime_info, &active, &pending)
+        {
+            let active_after_failure = probe_coffeepos_health_with_token(http_port, &active);
+            if matches!(
+                active_after_failure.state,
+                CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+            ) {
+                fs::remove_file(&pending_path).map_err(|error| {
+                    provisioning_error(
+                        "recover CoffeePOS machine credential",
+                        format!(
+                            "Credential update failed before replacing the active server hash, but the unused pending credential cannot be removed: {error}."
+                        ),
+                        "The existing active credential is still authoritative. Remove the stale pending file through explicit repair before rotating again.",
+                    )
+                })?;
+                return Err(provisioning_error(
+                    "rotate CoffeePOS machine credential",
+                    format!(
+                        "Credential update failed ({switch_error}). The previous active credential is still accepted, so the pending credential was discarded."
+                    ),
+                    "Keep using the previous protected credential and correct the reported update/runtime issue before retrying rotation.",
+                ));
+            }
+
+            let pending_after_failure = probe_coffeepos_health_with_token(http_port, &pending);
+            if !matches!(
+                pending_after_failure.state,
+                CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+            ) {
+                return Err(provisioning_error(
+                    "recover CoffeePOS machine credential",
+                    format!(
+                        "Credential update failed ({switch_error}), and neither the active nor pending protected credential can currently establish server authority."
+                    ),
+                    "Preserve both protected credentials for explicit recovery; do not start another rotation while the server commit point is unknown.",
+                ));
+            }
+
+            if let Err(rollback_error) =
+                self.switch_machine_health_token(runtime_info, &pending, &active)
+            {
+                return Err(provisioning_error(
+                    "rollback CoffeePOS machine credential",
+                    format!(
+                        "Credential update failed ({switch_error}); WordPress accepts the pending credential, but restoring the previous hash also failed: {rollback_error}."
+                    ),
+                    "Preserve both protected credentials for explicit recovery because WordPress still accepts the pending credential.",
+                ));
+            }
+            let restored = probe_coffeepos_health_with_token(http_port, &active);
+            if !matches!(
+                restored.state,
+                CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+            ) {
+                let detail = restored
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("the restored credential could not be verified");
+                return Err(provisioning_error(
+                    "rollback CoffeePOS machine credential",
+                    format!(
+                        "Pinned PHP restored the previous hash after the failed update, but the active credential could not be verified: {detail}."
+                    ),
+                    "Preserve both protected credentials and retry recovery when the endpoint is reachable; do not start another rotation.",
+                ));
+            }
+            fs::remove_file(&pending_path).map_err(|error| {
+                provisioning_error(
+                    "rollback CoffeePOS machine credential",
+                    format!(
+                        "The previous machine credential hash was restored, but the pending protected credential cannot be removed: {error}."
+                    ),
+                    "The previous active credential is authoritative. Remove the stale pending file through explicit repair before rotating again.",
+                )
+            })?;
+            return Err(provisioning_error(
+                "rotate CoffeePOS machine credential",
+                format!(
+                    "Credential update failed ({switch_error}). The pending credential had reached WordPress, so pinned PHP restored and verified the previous hash before the pending credential was discarded."
+                ),
+                "Keep using the previous protected credential and correct the reported update/runtime issue before retrying rotation.",
+            ));
+        }
         let pending_health = probe_coffeepos_health_with_token(http_port, &pending);
         if matches!(
             pending_health.state,
@@ -1075,26 +1176,36 @@ impl Provisioner {
             restored.state,
             CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
         ) {
+            let detail = restored
+                .error
+                .as_ref()
+                .map(|error| error.message.as_str())
+                .unwrap_or("the restored credential could not be verified");
             return Err(provisioning_error(
                 "rollback CoffeePOS machine credential",
-                "The previous active credential could not be re-verified after rollback.",
-                "Preserve both protected credential files and use explicit repair.",
+                format!(
+                    "Pending verification failed ({pending_failure}); pinned PHP restored the previous hash, but the active credential could not be verified: {detail}."
+                ),
+                "Preserve both protected credentials and retry recovery when the endpoint is reachable; do not start another rotation.",
             ));
         }
         fs::remove_file(&pending_path).map_err(|error| {
             provisioning_error(
                 "rollback CoffeePOS machine credential",
-                format!("Rollback succeeded but the pending credential cannot be removed: {error}."),
-                "The previous active credential is restored; remove the stale pending file through explicit repair.",
+                format!("Rollback restored the previous server hash but the pending credential cannot be removed: {error}."),
+                "The previous active credential is authoritative; remove the stale pending file through explicit repair before rotating again.",
             )
         })?;
         Err(provisioning_error(
             "rotate CoffeePOS machine credential",
-            format!("The pending credential failed endpoint verification: {pending_failure}."),
-            "The previous active credential was restored and verified. Correct the endpoint issue before retrying rotation.",
+            format!(
+                "The pending credential failed endpoint verification: {pending_failure}. The previous hash was restored and verified before the pending credential was discarded."
+            ),
+            "Keep using the previous protected credential and correct the endpoint issue before retrying rotation.",
         ))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn switch_machine_health_token(
         &self,
         runtime_info: &RuntimeInfo,
@@ -1122,20 +1233,31 @@ impl Provisioner {
                     error,
                     "Retry with the same Windows user profile; both protected machine credentials are preserved.",
                 )
-            })?;
+        })?;
         let script = self.write_machine_token_switch_script()?;
         let log_path = self.data_root.join("logs/coffeepos.log");
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|error| {
-                provisioning_error(
+        let log = match OpenOptions::new().create(true).append(true).open(&log_path) {
+            Ok(log) => log,
+            Err(error) => {
+                let _ = fs::remove_file(&script);
+                return Err(provisioning_error(
                     "switch CoffeePOS machine credential",
                     format!("Cannot open CoffeePOS log: {error}."),
                     "Check application-data permissions and retry.",
-                )
-            })?;
+                ));
+            }
+        };
+        let stdout_log = match log.try_clone() {
+            Ok(log) => log,
+            Err(error) => {
+                let _ = fs::remove_file(&script);
+                return Err(provisioning_error(
+                    "switch CoffeePOS machine credential",
+                    format!("Cannot duplicate CoffeePOS log handle: {error}."),
+                    "Check application-data permissions and retry.",
+                ));
+            }
+        };
         let mut command = Command::new(&self.runtime.php_executable);
         command
             .arg("-c")
@@ -1152,23 +1274,21 @@ impl Provisioner {
             .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
             .env("COFFEEPOS_SITE_ROOT", self.data_root.join("site"))
             .stdin(Stdio::piped())
-            .stdout(Stdio::from(log.try_clone().map_err(|error| {
-                provisioning_error(
-                    "switch CoffeePOS machine credential",
-                    format!("Cannot duplicate CoffeePOS log handle: {error}."),
-                    "Check application-data permissions and retry.",
-                )
-            })?))
+            .stdout(Stdio::from(stdout_log))
             .stderr(Stdio::from(log))
             .current_dir(self.data_root.join("site"));
         configure_child_command(&mut command);
-        let mut child = command.spawn().map_err(|error| {
-            provisioning_error(
-                "switch CoffeePOS machine credential",
-                format!("Cannot start pinned PHP for rotation: {error}."),
-                "Keep both protected credentials and verify the pinned PHP runtime.",
-            )
-        })?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = fs::remove_file(&script);
+                return Err(provisioning_error(
+                    "switch CoffeePOS machine credential",
+                    format!("Cannot start pinned PHP for rotation: {error}."),
+                    "Keep both protected credentials and verify the pinned PHP runtime.",
+                ));
+            }
+        };
         if let Err(error) = self.containment.assign(&child) {
             let _ = child.kill();
             let _ = child.wait();
@@ -1964,6 +2084,7 @@ require_once ABSPATH . 'wp-settings.php';\n",
         Ok(path)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn write_machine_token_switch_script(&self) -> Result<PathBuf, RuntimeErrorInfo> {
         let config = self.data_root.join("config");
         let mut temporary = NamedTempFile::new_in(&config).map_err(|error| {
@@ -4128,6 +4249,7 @@ fwrite(STDOUT, "CoffeePOS machine credential hash persisted.\n");
 exit(0);
 "#;
 
+#[cfg_attr(not(test), allow(dead_code))]
 const COFFEEPOS_MACHINE_TOKEN_SWITCH_BOOTSTRAP: &str = r#"<?php
 declare(strict_types=1);
 
@@ -4355,37 +4477,6 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    #[cfg(windows)]
-    fn update_wordpress_option(
-        provisioner: &Provisioner,
-        database_port: u16,
-        option_name: &str,
-        option_value: &str,
-    ) {
-        let password =
-            secret::load(&provisioner.data_root.join(DATABASE_WORDPRESS_SECRET)).unwrap();
-        let endpoint = DatabaseEndpoint::Tcp(database_port);
-        let mut command =
-            provisioner.database_client_command(&endpoint, DATABASE_WORDPRESS_USER, &password);
-        command
-            .arg(format!("--database={DATABASE_NAME}"))
-            .arg(format!(
-                "--execute=UPDATE wp_options SET option_value = '{}' WHERE option_name = '{}'",
-                sql_literal(option_value),
-                sql_literal(option_name)
-            ))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_child_command(&mut command);
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "database option update failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 
     #[cfg(windows)]
@@ -4957,7 +5048,7 @@ mod tests {
             "1.0.1:3"
         );
         let machine_token_path = data_root.join(MACHINE_TOKEN_SECRET);
-        let machine_token = secret::load(&machine_token_path).unwrap();
+        let mut machine_token = secret::load(&machine_token_path).unwrap();
         assert_eq!(machine_token.len(), 64);
         assert_eq!(machine_token.to_ascii_lowercase(), machine_token);
         let protected_machine_token = fs::read(&machine_token_path).unwrap();
@@ -5059,40 +5150,53 @@ mod tests {
         assert!(machine_health_authenticated.contains(r#""schema_version":1"#));
         assert!(machine_health_authenticated.contains(r#""status":"healthy""#));
 
-        update_wordpress_option(
-            &provisioner,
-            post_install_health.database_port.unwrap(),
-            "coffeepos_installed_version",
-            "stale-for-health-test",
-        );
-        let degraded = manager.refresh_coffeepos_health();
+        let original_rotation_php = provisioner
+            .replace_php_executable_for_test(data_root.join("missing-phase4-10-rotation-php.exe"));
+        let failed_rotation = provisioner
+            .rotate_machine_health_token(&post_install_health)
+            .unwrap_err();
         assert_eq!(
-            degraded.coffeepos_health.state,
-            CoffeePosHealthState::Degraded
+            failed_rotation.operation,
+            "rotate CoffeePOS machine credential"
+        );
+        assert_eq!(secret::load(&machine_token_path).unwrap(), machine_token);
+        assert!(!data_root.join(MACHINE_TOKEN_PENDING_SECRET).exists());
+        assert_eq!(
+            probe_coffeepos_health_with_token(
+                post_install_health.http_port.unwrap(),
+                machine_token.as_str()
+            )
+            .state,
+            CoffeePosHealthState::Healthy
+        );
+        provisioner.replace_php_executable_for_test(original_rotation_php);
+
+        let previous_machine_token = machine_token.clone();
+        provisioner
+            .rotate_machine_health_token(&post_install_health)
+            .unwrap();
+        machine_token = secret::load(&machine_token_path).unwrap();
+        assert_ne!(machine_token, previous_machine_token);
+        assert!(!data_root.join(MACHINE_TOKEN_PENDING_SECRET).exists());
+        let old_machine_health = http_get_with_headers(
+            post_install_health.http_port.unwrap(),
+            "/wp-json/coffeepos/v1/system/status",
+            &[("X-CoffeePOS-Machine-Token", previous_machine_token.as_str())],
         );
         assert!(
-            !degraded
-                .coffeepos_health
-                .payload
-                .as_ref()
-                .unwrap()
-                .coffeepos
+            old_machine_health.starts_with("HTTP/1.0 401 ")
+                || old_machine_health.starts_with("HTTP/1.1 401 "),
+            "Previous machine token remained valid after rotation:\n{old_machine_health}"
         );
-        let degraded_http = http_get_with_headers(
-            degraded.http_port.unwrap(),
+        let rotated_machine_health = http_get_with_headers(
+            post_install_health.http_port.unwrap(),
             "/wp-json/coffeepos/v1/system/status",
             &[("X-CoffeePOS-Machine-Token", machine_token.as_str())],
         );
         assert!(
-            degraded_http.starts_with("HTTP/1.0 503 ")
-                || degraded_http.starts_with("HTTP/1.1 503 "),
-            "CoffeePOS plugin invariant failure did not return machine-health HTTP 503:\n{degraded_http}"
-        );
-        update_wordpress_option(
-            &provisioner,
-            post_install_health.database_port.unwrap(),
-            "coffeepos_installed_version",
-            "1.0.1",
+            rotated_machine_health.starts_with("HTTP/1.0 200 ")
+                || rotated_machine_health.starts_with("HTTP/1.1 200 "),
+            "Rotated machine token was not accepted:\n{rotated_machine_health}"
         );
         assert_eq!(
             manager.refresh_coffeepos_health().coffeepos_health.state,
@@ -5340,6 +5444,8 @@ mod tests {
         drop(manager);
         drop(provisioner);
         temp.close().unwrap();
-        fs::remove_dir(&e2e_root).unwrap();
+        if fs::read_dir(&e2e_root).unwrap().next().is_none() {
+            fs::remove_dir(&e2e_root).unwrap();
+        }
     }
 }

@@ -4,10 +4,10 @@
   "coffeepos": {
     "version": "1.0.1",
     "archive": "coffeepos-1.0.1.zip",
-    "archive_sha256": "8f0e7a7c91f1679a05d012da85115934fd47ec25ddfa9a47b1ea989d6aded44a",
-    "archive_sha256_source": "computed from the checked-in CoffeePOS release archive built on 2026-09-18 from clean Git commit 6923b332d2dd2afd0c8cf5b784da463ca3ba6cc2",
+    "archive_sha256": "67e3f268ffd29946cfb4fdce13d6e7ad12caaf3ca7af007cff2177940d8e4a64",
+    "archive_sha256_source": "computed from the checked-in CoffeePOS release archive built on 2026-09-18 from clean Git commit 6de371a104aca6ae426ebea78a97460820dc4d65",
     "source_kind": "checked-in release snapshot from clean desktop-phase-4.10-artifact Git branch",
-    "source_git_commit": "6923b332d2dd2afd0c8cf5b784da463ca3ba6cc2",
+    "source_git_commit": "6de371a104aca6ae426ebea78a97460820dc4d65",
     "build_script": "tools/build-release.ps1",
     "composer_version": "2.10.2",
     "build_php_version": "8.2.27",
