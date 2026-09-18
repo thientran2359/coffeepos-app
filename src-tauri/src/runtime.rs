@@ -699,6 +699,58 @@ impl RuntimeManager {
         Ok(format!("http://{LOOPBACK}:{port}/"))
     }
 
+    pub fn pos_url(&self) -> Result<String, RuntimeErrorInfo> {
+        if self.state != RuntimeState::Running {
+            return Err(error_info(
+                "coffeepos",
+                "open POS",
+                "CoffeePOS cannot be opened because the local runtime is not running.",
+                "Start the store and wait until CoffeePOS reports ready before opening the POS.",
+            ));
+        }
+        if self.wordpress_health != WordPressHealthState::Healthy {
+            return Err(error_info(
+                "coffeepos",
+                "open POS",
+                "CoffeePOS cannot be opened because WordPress health has not been verified for the current runtime instance.",
+                "Wait for the store health check to finish or retry the health check before opening the POS.",
+            ));
+        }
+        if self.coffeepos_health.state != CoffeePosHealthState::Healthy {
+            return Err(error_info(
+                "coffeepos",
+                "open POS",
+                "CoffeePOS cannot be opened because application health is not healthy.",
+                "Retry the store health check and open Diagnostics if CoffeePOS remains unavailable or degraded.",
+            ));
+        }
+        let payload = self.coffeepos_health.payload.as_ref().ok_or_else(|| {
+            error_info(
+                "coffeepos",
+                "open POS",
+                "CoffeePOS reported healthy without a usable POS route.",
+                "Retry the store health check. If the problem continues, use a compatible CoffeePOS plugin build.",
+            )
+        })?;
+        if !safe_pos_path(&payload.pos_path) {
+            return Err(error_info(
+                "coffeepos",
+                "open POS",
+                "CoffeePOS reported an unsafe POS route.",
+                "Restore a compatible CoffeePOS router/settings configuration and retry the health check.",
+            ));
+        }
+        let port = self.http_port.ok_or_else(|| {
+            error_info(
+                "coffeepos",
+                "open POS",
+                "CoffeePOS cannot be opened because the managed HTTP port is unavailable.",
+                "Restart the runtime so CoffeePOS Desktop can select and verify a loopback HTTP port.",
+            )
+        })?;
+        Ok(format!("http://{LOOPBACK}:{port}{}", payload.pos_path))
+    }
+
     pub fn stop(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
         self.refresh();
         if (self.state == RuntimeState::NotInstalled || self.state == RuntimeState::Stopped)
@@ -3040,6 +3092,34 @@ mod tests {
 
         manager.state = RuntimeState::Stopped;
         assert_eq!(manager.wordpress_url().unwrap_err().operation, "open");
+    }
+
+    #[test]
+    fn pos_url_requires_current_healthy_machine_route_and_port() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().canonicalize().unwrap();
+        let mut manager = RuntimeManager::new(fake_runtime(), data).unwrap();
+
+        assert_eq!(manager.pos_url().unwrap_err().operation, "open POS");
+
+        manager.state = RuntimeState::Running;
+        manager.http_port = Some(43127);
+        manager.wordpress_health = WordPressHealthState::Healthy;
+        assert_eq!(manager.pos_url().unwrap_err().operation, "open POS");
+
+        manager.coffeepos_health = parse_coffeepos_health_response(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{HEALTHY_MACHINE_BODY}"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(manager.pos_url().unwrap(), "http://127.0.0.1:43127/pos/");
+
+        manager.http_port = Some(43999);
+        assert_eq!(manager.pos_url().unwrap(), "http://127.0.0.1:43999/pos/");
+
+        manager.state = RuntimeState::Stopped;
+        assert_eq!(manager.pos_url().unwrap_err().operation, "open POS");
     }
 
     #[test]

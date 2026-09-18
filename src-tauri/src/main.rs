@@ -244,7 +244,7 @@ fn open_system_browser(url: &str) -> Result<(), String> {
     };
     if result as isize <= 32 {
         Err(format!(
-            "Windows could not open the managed WordPress URL in the system browser (ShellExecuteW code {}). Check the default browser association and retry.",
+            "Windows could not open the managed local URL in the system browser (ShellExecuteW code {}). Check the default browser association and retry.",
             result as isize
         ))
     } else {
@@ -254,7 +254,7 @@ fn open_system_browser(url: &str) -> Result<(), String> {
 
 #[cfg(all(debug_assertions, not(windows)))]
 fn open_system_browser(_url: &str) -> Result<(), String> {
-    Err("Opening WordPress in the system browser is currently qualified only for Windows x64 development builds.".into())
+    Err("Opening managed local URLs in the system browser is currently qualified only for Windows x64 development builds.".into())
 }
 
 fn try_lifecycle<'a>(state: &'a ShellState, operation: &str) -> Result<MutexGuard<'a, ()>, String> {
@@ -565,6 +565,33 @@ fn open_wordpress(app: tauri::AppHandle, state: State<'_, ShellState>) -> Result
 }
 
 #[tauri::command]
+fn open_pos(app: tauri::AppHandle, state: State<'_, ShellState>) -> Result<String, String> {
+    #[cfg(debug_assertions)]
+    {
+        let _lifecycle_guard = try_lifecycle(&state, "open the POS")?;
+        let provisioning = inspect_provisioning(&app, &state)?;
+        if provisioning.state != ProvisioningState::Ready {
+            return Err(
+                "CoffeePOS can only be opened after provisioning is ready. Finish or recover setup first."
+                    .into(),
+            );
+        }
+        let url = with_runtime(&app, &state, |runtime| {
+            runtime.refresh();
+            runtime.pos_url()
+        })?;
+        open_system_browser(&url)?;
+        Ok(url)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = app;
+        let _ = state;
+        Err("Bundled runtime resources are not packaged yet. Open POS is available only in the qualified development build until Phase 9.".into())
+    }
+}
+
+#[tauri::command]
 fn provision_wordpress(
     app: tauri::AppHandle,
     state: State<'_, ShellState>,
@@ -683,6 +710,7 @@ fn main() {
             restart_runtime,
             retry_runtime_health,
             open_wordpress,
+            open_pos,
             get_provisioning_info,
             provision_wordpress
         ])

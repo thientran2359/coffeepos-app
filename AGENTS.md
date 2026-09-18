@@ -917,7 +917,9 @@ Current Windows-first status:
 - Phase 5.1 — UI shell and navigation: complete Windows-first.
 - Phase 5.2 — Store and account onboarding: complete Windows-first.
 - Phase 5.3 — Home and app settings: implemented; lightweight validation passed, manual Windows acceptance pending.
-- Next implementation milestone after Phase 5.3 acceptance: Phase 5.4 — Open POS and login.
+- Phase 5.4 — Open POS and login: implemented; lightweight validation passed, manual Windows acceptance pending.
+- Phase 5.5 — Daily startup: implemented; lightweight validation passed, manual Windows acceptance pending.
+- Next implementation milestone after Phase 5.5 acceptance: Phase 5.6 — Minimize, exit and shutdown.
 
 From Phase 4 onward, work is intentionally split into small independently verifiable milestones:
 

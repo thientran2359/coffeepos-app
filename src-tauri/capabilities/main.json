@@ -15,6 +15,7 @@
     "allow-restart-runtime",
     "allow-retry-runtime-health",
     "allow-open-wordpress",
+    "allow-open-pos",
     "allow-get-provisioning-info",
     "allow-provision-wordpress"
   ]

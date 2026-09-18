@@ -12,6 +12,7 @@ fn main() {
             "restart_runtime",
             "retry_runtime_health",
             "open_wordpress",
+            "open_pos",
             "get_provisioning_info",
             "provision_wordpress",
         ]),

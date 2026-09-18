@@ -16,7 +16,7 @@ Windows x64 là target được triển khai và nghiệm thu trước. macOS đ
 
 ## Ranh giới và dependency gates
 
-Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ngày 2026-09-18 điều chỉnh Phase 5 thành các milestone UI/UX dưới đây; số 5.x cũ không còn dùng để lên kế hoạch. Phase 5.1–5.2 đã hoàn thành Windows-first với native Tauri/WebView acceptance và staged runtime regressions. Phase 5.3 đã triển khai và pass lightweight automated checks; manual Windows acceptance còn chờ người dùng smoke-test. Đặc tả trải nghiệm nằm tại [UI-UX.md](UI-UX.md). Các mốc artifact/install/activation là checkpoint kỹ thuật của cùng một setup flow; không yêu cầu người vận hành bấm từng bước.
+Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ngày 2026-09-18 điều chỉnh Phase 5 thành các milestone UI/UX dưới đây; số 5.x cũ không còn dùng để lên kế hoạch. Phase 5.1–5.2 đã hoàn thành Windows-first với native Tauri/WebView acceptance và staged runtime regressions. Phase 5.3–5.5 đã triển khai và pass lightweight automated checks; manual Windows acceptance còn chờ người dùng smoke-test. Đặc tả trải nghiệm nằm tại [UI-UX.md](UI-UX.md). Các mốc artifact/install/activation là checkpoint kỹ thuật của cùng một setup flow; không yêu cầu người vận hành bấm từng bước.
 
 - `provisioning.ready` nghĩa là phần cài đặt đã hoàn tất, không chứng minh service đang chạy. Runtime readiness và application health là các kết quả riêng; chỉ hiển thị POS sẵn sàng sau health tương ứng.
 - Idempotency, retry an toàn, cleanup, lỗi có hướng phục hồi và bảo vệ secrets là yêu cầu ngay tại phase tạo hành vi đó. Phase 4.11–4.12 kiểm chứng tích hợp toàn stack; Phase 6 bổ sung diagnostics/repair UI, không trì hoãn xử lý lỗi cơ bản tới đó.
@@ -49,7 +49,9 @@ Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ng
 | 5.1 — UI shell and navigation | ✅ Hoàn thành Windows-first | Setup tách khỏi installed shell; Home/Settings/Diagnostics; native mouse/keyboard/resize; navigation/reload không respawn runtime; recovery 4.12 regressions pass |
 | 5.2 — Store and account onboarding | ✅ Hoàn thành Windows-first | Fresh wizard + user-set admin credential trong DPAPI; WordPress/CoffeePOS store identity; real POS login; clipboard copy; retry/relaunch + legacy credential preservation |
 | 5.3 — Home and app settings | 🟡 Đã triển khai, chờ manual acceptance | Home Start/Retry theo native state; stale health không giữ qua lifecycle; Desktop startup-view setting persist atomically; lightweight checks pass |
-| 5.4+ | ⏳ Chưa bắt đầu | Mốc implementation tiếp theo sau acceptance 5.3: Mở POS và đăng nhập |
+| 5.4 — Open POS and login | 🟡 Đã triển khai, chờ manual acceptance | Home Mở bán hàng khi machine health healthy; system browser dùng verified dynamic origin + plugin pos_path; auth/session giữ ở WordPress/CoffeePOS; lightweight checks pass |
+| 5.5 — Daily startup | 🟡 Đã triển khai, chờ manual acceptance | Installed ready store auto-start khi runtime stopped; reload running không start lại; setup/recovery không auto-start; không tự mở POS; lightweight checks pass |
+| 5.6+ | ⏳ Chưa bắt đầu | Mốc implementation tiếp theo sau acceptance 5.5: Thu nhỏ, thoát và shutdown |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -183,7 +185,7 @@ Nghiệm thu trực tiếp từ app: fresh store → setup toàn stack → appli
 
 ## Phase 5 — Trải nghiệm ứng dụng và mở bán hàng
 
-Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3 đã triển khai code và lightweight validation, còn manual Windows acceptance theo [PHASE-05.3.md](PHASE-05.3.md). Phase 5.4+ chưa triển khai. Trước code mỗi milestone, bổ sung spec phase với wireframe success/loading/error, contract native cần dùng và acceptance theo [UI-UX.md](UI-UX.md). Tái sử dụng runtime/provisioning hiện có; không viết lại backend chỉ để đổi giao diện.
+Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3–5.5 đã triển khai code và lightweight validation, còn manual Windows acceptance theo [PHASE-05.3.md](PHASE-05.3.md), [PHASE-05.4.md](PHASE-05.4.md) và [PHASE-05.5.md](PHASE-05.5.md). Phase 5.6+ chưa triển khai. Trước code mỗi milestone, bổ sung spec phase với wireframe success/loading/error, contract native cần dùng và acceptance theo [UI-UX.md](UI-UX.md). Tái sử dụng runtime/provisioning hiện có; không viết lại backend chỉ để đổi giao diện.
 
 ### Phase 5.1 — Khung giao diện và điều hướng
 
@@ -215,11 +217,15 @@ Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3 đã triển khai cod
 
 **Done khi:** app → Mở bán hàng → login → POS → đơn test → logout/login lại; session hết hạn, runtime restart/đổi port và open failure có đường phục hồi. Redirect login không được coi là authenticated POS. Browser không cung cấp tín hiệu tab/login cho shell; WebView nếu chọn phải cách ly management IPC và kiểm external navigation. Kiểm jobs/self-request/concurrency bằng POS thật. Không thêm nghiệp vụ bán hàng vào Desktop.
 
+**Đã triển khai 2026-09-18, chờ manual acceptance:** MVP chốt system browser. Home chỉ hiện **Mở bán hàng** khi runtime đang running, WordPress healthy và CoffeePOS machine-health healthy. Native `open_pos` không nhận URL từ frontend, refresh process state dưới lifecycle guard, lấy `pos_path` đã validate từ machine-health và ghép với loopback origin/dynamic port hiện tại; browser-open failure trả lỗi actionable về Home và không gọi provisioning. Frontend chặn double-submit, không cache POS URL và chỉ báo “Đã yêu cầu mở trình duyệt”, không suy đoán login/tab state. UI lint/build, Rust fmt và focused URL tests đều pass; login → order → logout/login, session expiry, restart/port move và browser interaction thật để người dùng manual smoke-test. Xem [PHASE-05.4.md](PHASE-05.4.md).
+
 ### Phase 5.5 — Khởi động hằng ngày
 
 **Scope:** mở app trên store đã cài tự start runtime, báo tiến trình/lỗi trên trang chính; healthy thì cho Mở bán hàng. Không tự bật app cùng OS trong milestone này.
 
 **Done khi:** relaunch đi đúng luồng không reinstall, không sinh process hoặc tab trùng do polling/reload; failure có Retry; setup dở được dẫn về recovery. Không làm mất session/data bằng startup automation.
+
+**Đã triển khai 2026-09-18, chờ manual acceptance:** bootstrap chỉ auto-start sau khi provisioning native xác nhận ready và get_runtime_info trả stopped; runtime đã running hoặc đang transition chỉ render state hiện tại. Auto-start tái sử dụng start_runtime + lifecycle mutex hiện có, polling vẫn chỉ refresh và không gọi open_pos, nên reload/navigation không tự sinh tab POS. Startup failure rơi về Home state Phase 5.3 với **Thử lại** gọi start thật; not_installed/needs_repair giữ setup/recovery. Bootstrap có busy guard để retry không tạo hai startup request. Lượt này cũng đóng gap Phase 5.4 bằng cách thêm open_pos vào Tauri app manifest/capability; focused native compile đã generate permission allow-open-pos. UI lint/build, Rust fmt, git diff --check và focused runtime test đều pass. Manual smoke-test còn cần xác nhận PID/log start-count qua relaunch/reload, startup failure/retry và không auto-open browser. Xem [PHASE-05.5.md](PHASE-05.5.md).
 
 ### Phase 5.6 — Thu nhỏ, thoát và shutdown
 
@@ -315,4 +321,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3** đã triển khai và pass lightweight automated validation, còn manual acceptance. Sau khi acceptance 5.3 đạt, mốc implementation tiếp theo là **Phase 5.4 — Mở POS và đăng nhập**.
+Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.5** đã triển khai và pass lightweight automated validation, còn manual acceptance. Sau khi acceptance 5.5 đạt, mốc implementation tiếp theo là **Phase 5.6 — Thu nhỏ, thoát và shutdown**.

@@ -117,6 +117,7 @@ const homeState = element("home-state");
 const homeStatus = element("home-status");
 const homeDetail = element("home-detail");
 const homeAction = element<HTMLButtonElement>("home-action");
+const homeOpenStatus = element("home-open-status");
 const homeSettings = element<HTMLButtonElement>("home-settings");
 const homeDiagnostics = element<HTMLButtonElement>("home-diagnostics");
 
@@ -172,7 +173,9 @@ let completionPending = false;
 let settingsBusy = false;
 let runtimeTransition: "starting" | "stopping" | "checking" | null = null;
 let runtimeLoadError: string | null = null;
-let homeActionKind: "start" | "retry_health" | "refresh" | null = null;
+let homeActionKind: "start" | "retry_health" | "refresh" | "open_pos" | null = null;
+let posOpenBusy = false;
+let bootstrapBusy = false;
 
 function nativeErrorText(error: unknown): string {
   if (typeof error === "string") return error;
@@ -197,7 +200,7 @@ function setHiddenIfChanged(node: HTMLElement, hidden: boolean): void {
 }
 
 function setHomeAction(
-  kind: "start" | "retry_health" | "refresh" | null,
+  kind: "start" | "retry_health" | "refresh" | "open_pos" | null,
   label = "",
   disabled = false,
 ): void {
@@ -379,6 +382,10 @@ function renderHome(): void {
   const payload = currentRuntime?.coffeepos_health.payload;
   const verifiedStoreName = payload?.store.name.trim();
   homeStoreName.textContent = verifiedStoreName || "Cửa hàng CoffeePOS đã cài đặt";
+  const posReady = currentRuntime?.state === "running"
+    && currentRuntime.wordpress_health === "healthy"
+    && currentRuntime.coffeepos_health.state === "healthy";
+  if (!posReady && !posOpenBusy) setTextIfChanged(homeOpenStatus, "");
 
   if (runtimeTransition === "starting") {
     setTextIfChanged(homeState, "Đang khởi động");
@@ -477,8 +484,8 @@ function renderHome(): void {
   if (currentRuntime.coffeepos_health.state === "healthy") {
     setTextIfChanged(homeState, "Sẵn sàng");
     setTextIfChanged(homeStatus, "Hệ thống đã sẵn sàng");
-    setTextIfChanged(homeDetail, "Cửa hàng đang chạy và đã vượt qua kiểm tra sẵn sàng.");
-    setHomeAction(null);
+    setTextIfChanged(homeDetail, "Cửa hàng đang chạy. Mở POS trong trình duyệt và đăng nhập nếu được yêu cầu.");
+    setHomeAction("open_pos", posOpenBusy ? "Đang mở…" : "Mở bán hàng", posOpenBusy);
     return;
   }
 
@@ -736,6 +743,7 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
   setTextIfChanged(coffeeposHealthError, "");
   coffeeposHealthDetails.textContent = "";
   openWordPressStatus.textContent = "";
+  homeOpenStatus.textContent = "";
   runtimeDescription.textContent = command === "stop_runtime"
     ? "Đang dừng PHP và MariaDB…"
     : command === "retry_runtime_health"
@@ -757,7 +765,7 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
 }
 
 async function runHomeAction(): Promise<void> {
-  if (homeAction.disabled || provisioningBusy || runtimeBusy) return;
+  if (homeAction.disabled || provisioningBusy || runtimeBusy || posOpenBusy) return;
   if (homeActionKind === "start") {
     await runtimeAction("start_runtime");
   } else if (homeActionKind === "retry_health") {
@@ -766,6 +774,8 @@ async function runHomeAction(): Promise<void> {
     homeAction.disabled = true;
     await refreshRuntime();
     renderHome();
+  } else if (homeActionKind === "open_pos") {
+    await openPos();
   }
 }
 
@@ -801,35 +811,66 @@ async function openManagedWordPress(): Promise<void> {
   }
 }
 
+async function openPos(): Promise<void> {
+  if (provisioningBusy || runtimeBusy || posOpenBusy || currentProvisioning?.state !== "ready") return;
+  posOpenBusy = true;
+  renderHome();
+  setTextIfChanged(homeOpenStatus, "Đang yêu cầu mở POS trong trình duyệt…");
+  let feedback = "";
+  try {
+    await invoke<string>("open_pos");
+    feedback = "Đã yêu cầu mở trình duyệt. Đăng nhập trong CoffeePOS nếu được yêu cầu.";
+  } catch (error) {
+    feedback = nativeErrorText(error);
+    await refreshRuntime();
+  } finally {
+    posOpenBusy = false;
+    renderHome();
+    setTextIfChanged(homeOpenStatus, feedback);
+  }
+}
+
 async function bootstrap(): Promise<void> {
+  if (bootstrapBusy) return;
+  bootstrapBusy = true;
   setup.hidden = true;
   installedShell.hidden = true;
   bootstrapPanel.hidden = false;
   retry.hidden = true;
+  retry.disabled = true;
   title.textContent = "Đang mở cửa hàng…";
   description.textContent = "Đang đọc trạng thái cài đặt.";
 
   if (!isTauri()) {
     title.textContent = "Bản xem trước giao diện";
     description.textContent = "Chạy npm run dev để mở ứng dụng desktop. Bản xem trước không gọi native provisioning hoặc runtime.";
+    bootstrapBusy = false;
     return;
   }
 
   try {
-    const info = await invoke<ShellInfo>("get_shell_info");
-    applyShellInfo(info);
-  } catch (error) {
-    showBootstrapError(error);
-    return;
-  }
+    try {
+      const info = await invoke<ShellInfo>("get_shell_info");
+      applyShellInfo(info);
+    } catch (error) {
+      showBootstrapError(error);
+      return;
+    }
 
-  const provisioningLoaded = await refreshProvisioning();
-  if (!provisioningLoaded) return;
-  if (currentProvisioning?.state === "not_installed") {
-    await refreshSetupInfo();
-    if (currentProvisioning) renderProvisioning(currentProvisioning);
+    const provisioningLoaded = await refreshProvisioning();
+    if (!provisioningLoaded) return;
+    if (currentProvisioning?.state === "not_installed") {
+      await refreshSetupInfo();
+      if (currentProvisioning) renderProvisioning(currentProvisioning);
+    }
+    await refreshRuntime();
+    if (currentProvisioning?.state === "ready" && currentRuntime?.state === "stopped") {
+      await runtimeAction("start_runtime");
+    }
+  } finally {
+    bootstrapBusy = false;
+    if (!retry.hidden) retry.disabled = false;
   }
-  await refreshRuntime();
 }
 
 retry.addEventListener("click", () => void bootstrap());
@@ -896,7 +937,7 @@ setupForm.addEventListener("submit", async (event) => {
 });
 
 window.setInterval(() => {
-  if (isTauri() && currentProvisioning?.state === "ready" && !provisioningBusy && !runtimeBusy) {
+  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !provisioningBusy && !runtimeBusy) {
     void refreshRuntime();
   }
 }, 2000);

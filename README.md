@@ -12,7 +12,7 @@ npm run doctor
 npm run dev
 ```
 
-Phase 1–3, **Phase 4.1–4.12** và **Phase 5.1–5.2** đã hoàn tất Windows-first. **Phase 5.3 — Trang chính và cài đặt ứng dụng** đã triển khai: Home có Start/Retry theo native state, technical detail ở Chẩn đoán và Desktop có preference Trang mở đầu được persist an toàn. Lightweight automated checks đã pass; native/manual acceptance của 5.3 để người dùng smoke-test trước khi đánh dấu hoàn thành theo Definition of Done.
+Phase 1–3, **Phase 4.1–4.12** và **Phase 5.1–5.2** đã hoàn tất Windows-first. **Phase 5.3–5.5** đã triển khai: Home có Start/Retry theo native state, **Mở bán hàng** dùng route CoffeePOS thật trên dynamic runtime origin, và store đã cài tự start runtime khi mở/reload Desktop. Auto-start không tự mở POS, không chạy lại provisioning và không chạy cùng Windows. Lightweight automated checks đã pass; native/manual acceptance của 5.3–5.5 để người dùng smoke-test trước khi đánh dấu hoàn thành theo Definition of Done.
 
 ```sh
 npm run dev:ui    # preview trong trình duyệt; không có native IPC hoặc persistence
@@ -35,6 +35,8 @@ npm test          # Rust tests cho config, runtime, secrets và provisioning
 - [Phase 5.1](docs/PHASE-05.1.md): shell Trang chính/Cài đặt/Chẩn đoán, navigation/runtime non-respawn, native mouse/keyboard/resize và 150% WebView DPI acceptance.
 - [Phase 5.2](docs/PHASE-05.2.md): fresh store/account onboarding, protected admin credential, real CoffeePOS login, recovery/idempotency regressions và native Tauri acceptance.
 - [Phase 5.3](docs/PHASE-05.3.md): Home state/action, health retry không reinstall, Desktop startup-view preference và lightweight validation; manual acceptance đang chờ.
+- [Phase 5.4](docs/PHASE-05.4.md): Mở bán hàng qua system browser từ verified runtime origin + machine-health POS route; auth/session do WordPress/CoffeePOS sở hữu; lightweight validation pass, manual acceptance đang chờ.
+- [Phase 5.5](docs/PHASE-05.5.md): installed store auto-start runtime khi mở/reload app; setup/recovery không auto-start, polling không respawn/open POS; lightweight validation pass, manual acceptance đang chờ.
 - [Roadmap](docs/ROADMAP.md): nguồn sự thật cho các phase/subphase và Definition of Done từ Phase 4.1 trở đi.
 - [Development](docs/DEVELOPMENT.md): setup từng hệ điều hành, lệnh chạy, vị trí dữ liệu.
 - [Runtime](docs/RUNTIME.md): hợp đồng runtime cho Phase 2.
