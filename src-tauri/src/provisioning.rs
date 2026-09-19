@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 const LOOPBACK: &str = "127.0.0.1";
-const PROVISIONING_SCHEMA_VERSION: u32 = 1;
+pub const PROVISIONING_SCHEMA_VERSION: u32 = 1;
 const WORDPRESS_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const DATABASE_BOOTSTRAP_SECRET: &str = "config/database-bootstrap.secret";
 pub const WORDPRESS_ADMIN_SECRET: &str = "config/wordpress-admin.secret";

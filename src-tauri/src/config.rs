@@ -5,6 +5,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
+pub const APP_CONFIG_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupView {
@@ -36,7 +38,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: APP_CONFIG_SCHEMA_VERSION,
             store_name: "My Coffee".into(),
             bind_host: "127.0.0.1".into(),
             startup_view: StartupView::Home,
@@ -111,7 +113,7 @@ fn canonical_setup_store_name(value: &str) -> Result<String, String> {
 
 impl AppConfig {
     fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1 {
+        if self.schema_version != APP_CONFIG_SCHEMA_VERSION {
             return Err("Unsupported configuration version. Use a compatible CoffeePOS Desktop version; the file has been preserved.".into());
         }
         if self.bind_host != "127.0.0.1" {

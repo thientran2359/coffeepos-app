@@ -2,7 +2,7 @@
 
 Phase 7.1 chốt định dạng backup portable cho CoffeePOS Desktop trước khi viết logic dump/copy dữ liệu. Mục tiêu của phase này là tạo một contract có thể validate độc lập, có version rõ ràng, không phụ thuộc đường dẫn máy nguồn và không bê nguyên secret Windows DPAPI sang profile/máy khác.
 
-> **Trạng thái:** đặc tả đã chốt cho implementation Phase 7.1. Chưa có native backup implementation ở mốc tài liệu này.
+> **Trạng thái:** implementation Phase 7.1 đã có native encrypted backup-format writer + `inspect_backup` / `validate_backup`, strict schema/path/checksum/compatibility validation và focused acceptance tests. Database snapshot/copy data thật vẫn thuộc Phase 7.2/7.3.
 
 ## Mục tiêu
 
@@ -121,9 +121,16 @@ Manifest là source of truth của archive:
     "minimum_restore_schema": 1,
     "requires_explicit_migration": false
   },
-  "inventory_entry": "inventory.json"
+  "inventory_entry": "inventory.json",
+  "total_files": 4,
+  "total_uncompressed_bytes": 456,
+  "warnings": []
 }
 ~~~
+
+`total_files` và `total_uncompressed_bytes` chỉ tính các **data entry** được liệt kê trong `inventory.json`; không tính `manifest.json` và `inventory.json`. `warnings` là danh sách **warning code được schema allowlist**, không phải free-form text. Schema 1 hiện cho phép `unmanaged_extensions_excluded`; UI tự map code này sang nội dung hiển thị. Cách này giữ manifest/IPC không mang secret, user path hay absolute source path.
+
+Schema 1 cố định logical database name là `coffeepos`. Writer không nhận arbitrary database name và validator reject archive khai báo tên database khác.
 
 Không đặt absolute source path, Windows username, SID, data-root hoặc runtime executable path vào manifest.
 
@@ -134,6 +141,8 @@ Inventory liệt kê mọi **data entry**, không gồm manifest.json và invent
 ~~~json
 {
   "schema_version": 1,
+  "total_files": 4,
+  "total_uncompressed_bytes": 456,
   "entries": [
     {
       "path": "database/store.sql",
@@ -265,8 +274,11 @@ Initial hard guard có thể dùng:
 - tối đa 1 TiB total uncompressed bytes;
 - tối đa 256 GiB cho một entry;
 - tối đa 1.024 UTF-8 bytes cho normalized archive path.
+- `manifest.json` tối đa 1 MiB;
+- `inventory.json` tối đa 128 MiB;
+- `config/store.json` và `secrets/administrator.json` tối đa 1 MiB mỗi entry.
 
-Các bound này là anti-abuse/corruption guard, không phải quota sản phẩm. Nếu sau này cần tăng, bump policy/test rõ ràng thay vì silently bỏ bound.
+Các bound này là anti-abuse/corruption guard, không phải quota sản phẩm và áp dụng đồng thời. Vì vậy inventory byte bound có thể chặn trước entry-count bound nếu path metadata lớn. Writer và validator phải dùng cùng các control-metadata bound; writer fail trước khi tạo container nếu metadata vượt bound. Nếu sau này cần tăng, bump policy/test rõ ràng thay vì silently bỏ bound.
 
 ## Compatibility policy
 
@@ -326,6 +338,7 @@ Các lỗi chính:
 
 - wrong password/authentication failure;
 - unsupported backup schema;
+- insufficient restore disk space / unavailable disk-capacity check;
 - incompatible component/schema version;
 - corrupt/truncated encrypted container;
 - invalid ZIP;

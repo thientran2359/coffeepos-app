@@ -209,6 +209,8 @@ active_swapped
 active_verified
 committed
 cleanup
+abort_started
+aborted
 rollback_started
 rolled_back
 ~~~
@@ -233,28 +235,39 @@ original_state phải được persist atomically ở stage planned/validated, t
 
 Daily auto-start, repair, provisioning và backup mới phải bị gate khi restore journal chưa committed/reconciled.
 
+## Restore operation/admission gate
+
+Sau khi apply revalidate candidate và persist planned/validated + original_state, native phải acquire một external restore operation/admission gate cho **cả existing_store và no_previous_store** trước runtime_stopped, recovery snapshot hoặc staging mutation.
+
+Gate này:
+
+- chặn concurrent backup/repair/provisioning/restore/lifecycle action và normal POS/browser admission;
+- độc lập về semantics với internal lifecycle mutex, nên lifecycle mutex có thể nhả/reacquire cho bounded start/stop mà restore gate vẫn giữ;
+- được relaunch tái lập từ non-terminal restore journal trước daily startup;
+- chỉ release ở committed success, verified rolled_back reconciliation, hoặc successful aborted reconciliation;
+- nếu recovery evidence không đủ, gate giữ và runtime không tự mở admission.
+
 ## Pre-restore recovery snapshot
 
 Nếu current profile có installed managed store cần bị thay:
 
-1. acquire restore operation guard;
-2. dùng archive/snapshot primitives của Phase 7.3 để tạo **internal recovery snapshot**, nhưng restore transaction sở hữu maintenance lease và **không chạy bước resume runtime của 7.3**;
-3. random strong recovery password được tạo native;
-4. password bảo vệ bằng target DPAPI trong transaction-owned protected state;
-5. archive nằm dưới managed backups/restore-recovery/<transaction-id>/;
-6. Phase 7.1 validator phải pass;
-7. journal persist recovery_backup_ready;
-8. chỉ sau đó mới được tạo/cutover staging.
+1. dùng archive/snapshot primitives của Phase 7.3 để tạo **internal recovery snapshot**, nhưng restore transaction sở hữu maintenance lease và **không chạy bước resume runtime của 7.3**;
+2. random strong recovery password được tạo native;
+3. password bảo vệ bằng target DPAPI trong transaction-owned protected state;
+4. archive nằm dưới managed backups/restore-recovery/<transaction-id>/;
+5. Phase 7.1 validator phải pass;
+6. journal persist recovery_backup_ready;
+7. chỉ sau đó mới được tạo/cutover staging.
 
 Internal snapshot không dùng user backup password và không được quảng bá là portable.
 
-Từ lúc bắt đầu recovery snapshot cho tới khi restore **committed** hoặc rollback đã **rolled_back + verify pass**, active store phải giữ stopped/admission-fenced liên tục:
+Từ lúc bắt đầu recovery snapshot cho tới khi restore **committed**, pre-cutover abort đã **aborted + cleanup/resume pass**, hoặc rollback đã **rolled_back + verify pass**, active store không được nhận normal writers. Bình thường store giữ stopped; ngoại lệ duy nhất là controlled resume của pre-cutover abort, khi process có thể start lại nhưng external restore admission gate vẫn giữ cho tới khi previous-state verification pass:
 
-- không restart Caddy/PHP/cron sau recovery_backup_ready;
+- không restart Caddy/PHP/cron sau recovery_backup_ready trong staging/cutover path; controlled pre-cutover abort được restart theo abort contract bên dưới;
 - daily auto-start bị gate;
 - POS/browser admission không được mở lại;
 - Phase 7.3 cleanup được gọi theo restore-owned mode để cleanup temp nhưng không restore runtime_was_running;
-- runtime_was_running chỉ được áp dụng lại sau commit hoặc verified rollback.
+- runtime_was_running chỉ được áp dụng lại sau committed, verified rolled_back, hoặc trong successful pre-cutover abort sau khi cleanup + previous-state verification đã pass và ngay trước/khi persist aborted dưới external restore gate.
 
 Nhờ đó recovery snapshot luôn là điểm cuối cùng của old store trước cutover; không thể phát sinh order/upload mới sau snapshot rồi bị mất khi swap.
 
@@ -469,8 +482,10 @@ Failure sau cutover_started nhưng trước committed:
 6. verify previous provisioning state + health bằng maintenance verification mode;
 7. stop verification runtime;
 8. persist rolled_back;
-9. nếu runtime_was_running và rollback đã verify, start normal runtime;
-10. giữ recovery snapshot + failed staging/quarantine evidence nếu cleanup không an toàn.
+9. nếu runtime_was_running và rollback đã verify, start normal runtime + health có kiểm soát trong khi external restore admission gate vẫn giữ; nếu previous store vốn stopped thì giữ stopped;
+10. nếu controlled runtime start/health fail, stop partial runtime khi an toàn, giữ external restore gate và safe recovery evidence; **không** re-enter rollback vì data rollback đã verified;
+11. chỉ sau khi previous-state startup policy đã reconcile thành công mới release external restore admission/operation gate;
+12. giữ recovery snapshot + failed staging/quarantine evidence nếu cleanup không an toàn.
 
 Không xóa rollback evidence trước khi old store đã verify.
 
@@ -498,11 +513,16 @@ Relaunch đọc restore journal **trước** daily startup.
 
 Policy:
 
-- validated/recovery_backup_ready/staging_* trước cutover → active store chưa đổi; cleanup/resume staging an toàn;
+- planned/validated trước maintenance mutation → active store chưa đổi; cleanup candidate/temp và reconcile về pre-restore state;
+- runtime_stopped/recovery_backup_ready/staging_prepared/database_imported/uploads_restored/target_secrets_bound/staging_verified → pre-cutover; active store chưa cutover, giữ/reacquire external restore gate rồi resume staging hoặc chạy pre-cutover abort deterministic;
 - cutover_started → inspect exact active/rollback/staging ownership markers rồi complete swap hoặc rollback deterministic;
 - active_swapped chưa active_verified → chỉ verify restored state bằng maintenance verification mode; nếu không chứng minh được thì rollback;
+- active_verified → restored active store đã pass verification nhưng commit chưa durable; re-check transaction/ownership evidence, verification runtime phải stopped và không còn managed child. Nếu evidence intact, persist committed **trước khi** mở normal writers, sau đó áp dụng normal startup policy/release gate. Nếu evidence mâu thuẫn hoặc thiếu, giữ fenced/blocked để recovery rõ ràng; không tự rollback một active store đã được ghi nhận verified.
 - rollback_started → hoàn tất rollback;
-- committed → cleanup leftover staging theo ownership marker, không rollback thành công cũ.
+- rolled_back → terminal verified rollback; không re-enter cutover/rollback, chỉ reconcile owned quarantine/rollback cleanup còn lại, áp dụng startup policy theo original_state + runtime_was_running (hoặc welcome với no_previous_store), rồi release admission gate;
+- abort_started → tiếp tục pre-cutover abort cleanup/resume dưới external restore gate; chỉ chuyển aborted sau khi previous state verify pass;
+- aborted → terminal/reconciled; verify owned staging/temp đã cleanup, không resume restore transaction; áp dụng normal startup policy theo original_state + runtime_was_running (hoặc fresh welcome), verify trạng thái tương ứng rồi release external restore gate;
+- committed/cleanup → terminal success cleanup; reconcile leftover staging/rollback ownership evidence, không rollback thành công cũ, rồi áp dụng normal startup policy/release gate nếu chưa hoàn tất.
 
 Recovery classification phải đọc original_state từ journal. Với no_previous_store, absence của old rollback trees/secrets là expected; recovery chỉ yêu cầu transaction-owned restored artifacts có thể quarantine/remove an toàn và fresh state có thể verify.
 
@@ -539,10 +559,28 @@ Frontend không gửi target data root, extraction root, SQL command hoặc arti
 
 Cancel được hỗ trợ theo stage:
 
-- trước maintenance/cutover: cleanup staging rồi return cancelled;
-- đang tạo recovery backup: dùng cleanup semantics Phase 7.3;
-- sau staging health nhưng trước cutover: cleanup staging, current store unchanged;
+- trước khi acquire maintenance lease: cleanup inspect/temp rồi return cancelled, không tạo restore journal đang hoạt động;
+- sau khi acquire maintenance lease nhưng **trước cutover_started**: chạy explicit pre-cutover abort transaction bên dưới;
 - sau cutover_started: không “cancel” bằng cách bỏ dở; request chuyển thành rollback-to-previous-store transaction.
+
+### Pre-cutover abort
+
+Khi cancel ở runtime_stopped, recovery_backup_ready, staging_prepared, database_imported, uploads_restored, target_secrets_bound hoặc staging_verified:
+
+1. persist **abort_started** và giữ external restore admission/operation gate trong suốt cleanup + controlled resume; nếu internal lifecycle mutex phải nhả để gọi start/health thì external restore gate vẫn giữ;
+2. stop/kill bounded mọi staging verification, MariaDB/import/PHP child thuộc transaction và chứng minh không còn managed child;
+3. xóa/quarantine chỉ owned staging/temp/decrypted artifacts của transaction; validated recovery snapshot đã hoàn tất được giữ theo retention policy;
+4. active site/database/uploads/config chưa từng cutover nên vẫn là authority, không chạy rollback tree swap;
+5. nếu original_state=existing_store và runtime_was_running=true, start normal runtime có kiểm soát + health **trong khi external restore gate vẫn giữ**; nếu trước restore store stopped thì verify runtime vẫn stopped;
+6. nếu original_state=no_previous_store, verify fresh/NotInstalled state và không spawn managed runtime;
+7. nếu controlled resume/health fail, stop mọi partial runtime có thể dừng an toàn, giữ stage abort_started/non-terminal recovery evidence và **không release external restore gate**;
+8. chỉ khi cleanup + previous-state verification pass mới persist stage **aborted** atomically;
+9. reconcile restore journal: giữ terminal aborted record đủ cho diagnostics hoặc remove journal bằng atomic/fsync policy sau khi terminal state đã durable; cả hai cách đều phải làm daily-start gate thấy transaction đã kết thúc;
+10. release external restore admission/operation gate;
+11. existing store tiếp tục normal runtime nếu runtime_was_running=true; fresh target quay về welcome/setup;
+12. chỉ sau các bước trên mới trả CancelResult=cancelled cho UI.
+
+Nếu cleanup/resume fail, không trả cancelled-success. Journal giữ abort_started/non-terminal recovery evidence, admission vẫn fenced và UI hiển thị actionable recovery state.
 
 UI disable close action có thể gây abandoned mutation; Alt+F4/close phải đi qua existing shutdown/operation guard và chờ bounded cleanup/rollback contract.
 
@@ -596,14 +634,17 @@ UI disable close action có thể gây abandoned mutation; Alt+F4/close phải �
 25. Rollback failure fixture giữ recovery evidence và app không tự chạy store không xác minh.
 26. Fresh-profile restore inject failure sau cutover_started/active_swapped → rollback về NotInstalled, không đòi rollback trees không tồn tại; relaunch vẫn vào welcome/setup flow.
 27. Crash/relaunch fixture chứng minh journal original_state được persist trước cutover và recovery phân biệt existing_store với no_previous_store chỉ từ journal + ownership evidence.
+28. Cancel sau recovery_backup_ready và sau staging_verified đều persist abort_started, cleanup owned staging/temp, giữ external admission gate qua controlled resume + health, rồi mới persist/reconcile aborted và release gate; existing stopped store vẫn stopped, fresh target trở về welcome.
+29. Inject cleanup/runtime-start/health failure trong pre-cutover cancel → không báo cancelled-success, stage còn abort_started, partial runtime được stop khi an toàn và external admission gate vẫn giữ.
+30. Kill app ngay sau durable active_verified nhưng trước committed → relaunch giữ admission fenced, xác nhận verification runtime đã stopped/no managed child + ownership evidence còn nguyên, persist committed rồi mới mở normal runtime; inconsistent evidence → blocked, không silent rollback.
 
 ### Lifecycle/UI
 
-28. Restore khi source runtime running: after failed restore/rollback, old runtime trở lại running nếu verify pass.
-29. Restore khi source runtime stopped: không để old/new runtime running sau rollback/success ngoài one-time verify.
-30. Duplicate click/reload không tạo restore thứ hai.
-31. Close/Alt+F4 trong restore không orphan MariaDB/Caddy/PHP.
-32. Keyboard/focus/resize/150% DPI thao tác được picker/password/review/confirm/progress/result.
+31. Restore khi source runtime running: after failed restore/rollback, old runtime trở lại running nếu verify pass.
+32. Restore khi source runtime stopped: không để old/new runtime running sau rollback/success ngoài one-time verify.
+33. Duplicate click/reload không tạo restore thứ hai.
+34. Close/Alt+F4 trong restore không orphan MariaDB/Caddy/PHP.
+35. Keyboard/focus/resize/150% DPI thao tác được picker/password/review/confirm/progress/result.
 
 ## Validation dự kiến
 

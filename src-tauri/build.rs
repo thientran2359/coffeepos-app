@@ -1,6 +1,8 @@
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "inspect_backup",
+            "validate_backup",
             "get_log_catalog",
             "read_log_page",
             "export_support_bundle",

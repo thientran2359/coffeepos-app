@@ -1,5 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// Phase 7.1 defines the format writer before Phase 7.2/7.3 start feeding it
+// real database/upload snapshots, so part of the writer surface is intentionally dormant here.
+#[allow(dead_code)]
+mod backup_format;
 mod config;
 mod logs;
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
@@ -8,6 +12,9 @@ mod provisioning;
 mod runtime;
 mod secret;
 
+use backup_format::{
+    BackupCompatibilityTarget, BackupErrorInfo, BackupInspection, BackupValidation,
+};
 use config::{AppConfig, StartupView, Store};
 use logs::{LogCatalog, LogErrorInfo, LogPage, SupportBundleResult};
 #[cfg(debug_assertions)]
@@ -21,7 +28,7 @@ use provisioning::{
 };
 use runtime::{HealthDiagnosticsInfo, RuntimeInfo, RuntimeManager, RuntimeState};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use tauri::menu::{Menu, MenuItem};
@@ -534,6 +541,124 @@ fn logs_command_error(action: &str, code: &str, message: &str, recovery: &str) -
         message: message.into(),
         recovery: recovery.into(),
     }
+}
+
+fn backup_command_error(
+    action: &str,
+    code: &str,
+    message: &str,
+    recovery: &str,
+) -> BackupErrorInfo {
+    BackupErrorInfo {
+        component: "backup".into(),
+        action: action.into(),
+        code: code.into(),
+        message: message.into(),
+        recovery: recovery.into(),
+    }
+}
+
+async fn run_backup_dialog_operation<T: Send + 'static>(
+    app: tauri::AppHandle,
+    action: &'static str,
+    backup_password: String,
+    operation: fn(&Path, &str, &BackupCompatibilityTarget) -> Result<T, BackupErrorInfo>,
+) -> Result<T, BackupErrorInfo> {
+    #[cfg(debug_assertions)]
+    {
+        let backup_password = zeroize::Zeroizing::new(backup_password);
+        let restore_root = application_data_root(&app).map_err(|_| {
+            backup_command_error(
+                action,
+                "disk_capacity_unavailable",
+                "CoffeePOS cannot resolve the managed restore data volume.",
+                "Repair the CoffeePOS data path and retry backup inspection.",
+            )
+        })?;
+        tauri::async_runtime::spawn_blocking(move || {
+            let selected = backup_format::choose_backup_file(action)?;
+            let path = selected.ok_or_else(|| {
+                backup_command_error(
+                    action,
+                    "selection_cancelled",
+                    "No CoffeePOS backup file was selected.",
+                    "Choose a .coffeepos-backup file when you are ready to continue.",
+                )
+            })?;
+            let (project_root, runtime_manifest) = development_runtime_paths().map_err(|_| {
+                backup_command_error(
+                    action,
+                    "target_compatibility_unavailable",
+                    "CoffeePOS cannot resolve the pinned target versions needed to inspect this backup.",
+                    "Repair the managed runtime artifacts before retrying backup inspection.",
+                )
+            })?;
+            let target = backup_format::load_development_compatibility_target(
+                &project_root,
+                &runtime_manifest,
+                &restore_root,
+                action,
+            )?;
+            operation(&path, backup_password.as_str(), &target)
+        })
+        .await
+        .map_err(|_| {
+            backup_command_error(
+                action,
+                "worker_failed",
+                "CoffeePOS could not complete the backup operation.",
+                "Retry the operation or restart CoffeePOS Desktop.",
+            )
+        })?
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = app;
+        let _ = backup_password;
+        let _ = operation;
+        Err(backup_command_error(
+            action,
+            "runtime_artifacts_unavailable",
+            "Backup inspection is not available until managed runtime artifacts are packaged for this build.",
+            "Use the qualified Windows development build until runtime packaging is completed.",
+        ))
+    }
+}
+
+#[tauri::command]
+async fn inspect_backup(
+    app: tauri::AppHandle,
+    backup_password: String,
+) -> Result<BackupInspection, BackupErrorInfo> {
+    run_backup_dialog_operation(
+        app,
+        action_inspect(),
+        backup_password,
+        backup_format::inspect_backup,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn validate_backup(
+    app: tauri::AppHandle,
+    backup_password: String,
+) -> Result<BackupValidation, BackupErrorInfo> {
+    run_backup_dialog_operation(
+        app,
+        action_validate(),
+        backup_password,
+        backup_format::validate_backup,
+    )
+    .await
+}
+
+const fn action_inspect() -> &'static str {
+    "inspect"
+}
+
+const fn action_validate() -> &'static str {
+    "validate"
 }
 
 #[tauri::command]
@@ -1733,6 +1858,8 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            inspect_backup,
+            validate_backup,
             get_log_catalog,
             read_log_page,
             export_support_bundle,

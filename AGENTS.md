@@ -926,8 +926,9 @@ Current Windows-first status:
 - Phase 6.2 — Runtime performance and responsiveness: implemented; focused lifecycle/concurrency validation passed, manual Windows UX acceptance pending.
 - Phase 6.3 — Repair flow: implemented; focused validation passed, manual Windows acceptance tracked in the roadmap.
 - Phase 6.4 — Log viewer/export: complete Windows-first as confirmed by the user on 2026-09-19.
-- Phase 7.1–7.4 documentation: defined in docs/PHASE-07.1.md through docs/PHASE-07.4.md.
-- Next implementation milestone: Phase 7.1 — Backup format.
+- Phase 7.1 — Backup format: implemented; focused encrypted-container/schema/path/compatibility validation passed. Real database/upload snapshot creation remains in Phase 7.2/7.3.
+- Phase 7.2–7.4 documentation: defined in docs/PHASE-07.2.md through docs/PHASE-07.4.md.
+- Next implementation milestone: Phase 7.2 — Database snapshot.
 
 From Phase 4 onward, work is intentionally split into small independently verifiable milestones:
 
