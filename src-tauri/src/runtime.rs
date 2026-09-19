@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 const LOOPBACK: &str = "127.0.0.1";
-const MANIFEST_SCHEMA_VERSION: u32 = 2;
+const MANIFEST_SCHEMA_VERSION: u32 = 3;
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_LOG_CHUNK_BYTES: usize = 8192;
 const PORT_ATTEMPTS: usize = 3;
@@ -173,6 +173,13 @@ pub(crate) struct BackgroundHealthProbe {
     generation: u64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DatabaseMaintenanceLease {
+    pub(crate) runtime_was_running: bool,
+    pub(crate) previous_state: RuntimeState,
+    pub(crate) database_port: u16,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentHealthState {
@@ -275,6 +282,8 @@ struct MariaDbManifest {
     archive: String,
     server: PathBuf,
     client: PathBuf,
+    dump: PathBuf,
+    import: PathBuf,
     install_db: PathBuf,
     source: String,
     checksum_source: String,
@@ -303,6 +312,8 @@ pub struct ResolvedRuntime {
     pub(crate) mariadb_version: String,
     pub(crate) mariadb_executable: PathBuf,
     pub(crate) mariadb_client_executable: PathBuf,
+    pub(crate) mariadb_dump_executable: PathBuf,
+    pub(crate) mariadb_import_executable: PathBuf,
     pub(crate) mariadb_install_db_executable: PathBuf,
     pub(crate) mariadb_base_dir: PathBuf,
 }
@@ -414,6 +425,10 @@ pub struct RuntimeManager {
     log_lock: Arc<Mutex<()>>,
     last_error: Option<RuntimeErrorInfo>,
     timeouts: RuntimeTimeouts,
+    backup_maintenance_active: bool,
+    backup_recovery_lease: Option<DatabaseMaintenanceLease>,
+    backup_recovery_staging: Option<PathBuf>,
+    backup_recovery_children: Vec<ManagedChild>,
 }
 
 impl RuntimeManager {
@@ -464,6 +479,10 @@ impl RuntimeManager {
             log_lock: Arc::new(Mutex::new(())),
             last_error: None,
             timeouts: RuntimeTimeouts::default(),
+            backup_maintenance_active: false,
+            backup_recovery_lease: None,
+            backup_recovery_staging: None,
+            backup_recovery_children: Vec::new(),
         })
     }
 
@@ -506,6 +525,321 @@ impl RuntimeManager {
 
     pub(crate) fn provisioning_context(&self) -> (ResolvedRuntime, PathBuf) {
         (self.runtime.clone(), self.data_root.clone())
+    }
+
+    pub(crate) fn backup_maintenance_active(&self) -> bool {
+        self.backup_maintenance_active
+    }
+
+    pub(crate) fn register_backup_recovery_context(
+        &mut self,
+        lease: &DatabaseMaintenanceLease,
+        staging_dir: &Path,
+    ) {
+        self.backup_recovery_lease = Some(lease.clone());
+        self.backup_recovery_staging = Some(staging_dir.to_path_buf());
+    }
+
+    pub(crate) fn backup_recovery_context(&self) -> Option<(DatabaseMaintenanceLease, PathBuf)> {
+        Some((
+            self.backup_recovery_lease.clone()?,
+            self.backup_recovery_staging.clone()?,
+        ))
+    }
+
+    pub(crate) fn backup_recovery_staging_path(&self) -> Option<&Path> {
+        self.backup_recovery_staging.as_deref()
+    }
+
+    pub(crate) fn clear_backup_recovery_context(&mut self) {
+        self.backup_recovery_lease = None;
+        self.backup_recovery_staging = None;
+        self.backup_recovery_children.clear();
+    }
+
+    pub(crate) fn retain_backup_recovery_child(&mut self, child: Child) {
+        self.backup_recovery_children.push(ManagedChild { child });
+    }
+
+    pub(crate) fn terminate_retained_backup_children(&mut self) -> Result<(), RuntimeErrorInfo> {
+        let mut remaining = Vec::new();
+        let mut first_error = None;
+        for mut child in self.backup_recovery_children.drain(..) {
+            let pid = child.id();
+            let kill_error = child.child.kill().err();
+            match wait_for_child_exit(&mut child.child, self.timeouts.stop) {
+                Ok(_) => {}
+                Err(wait_error) => {
+                    let kill_detail = kill_error
+                        .map(|error| format!(" Termination request error: {error}."))
+                        .unwrap_or_default();
+                    first_error.get_or_insert_with(|| {
+                        error_info(
+                            "backup_database",
+                            "recover backup child",
+                            format!(
+                                "Managed backup child {pid} could not be confirmed stopped.{} {}",
+                                kill_detail, wait_error.message
+                            ),
+                            "Backup maintenance remains fenced. Stop the remaining process from Windows, then retry backup cleanup.",
+                        )
+                    });
+                    remaining.push(child);
+                }
+            }
+        }
+        self.backup_recovery_children = remaining;
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn enter_database_backup_maintenance(
+        &mut self,
+    ) -> Result<DatabaseMaintenanceLease, RuntimeErrorInfo> {
+        if self.backup_maintenance_active {
+            return Err(error_info(
+                "backup_database",
+                "quiesce",
+                "A database backup maintenance lease is already active.",
+                "Finish or cancel the current backup cleanup before starting another managed operation.",
+            ));
+        }
+        let before = self.refresh();
+        let previous_state = before.state.clone();
+        let runtime_was_running = previous_state == RuntimeState::Running;
+        match previous_state {
+            RuntimeState::Running | RuntimeState::Stopped => {}
+            RuntimeState::NotInstalled => {
+                return Err(error_info(
+                    "backup_database",
+                    "quiesce",
+                    "The managed store is not installed, so there is no database to back up.",
+                    "Finish CoffeePOS provisioning before creating a database backup.",
+                ));
+            }
+            RuntimeState::Installing | RuntimeState::Starting | RuntimeState::Stopping => {
+                return Err(error_info(
+                    "backup_database",
+                    "quiesce",
+                    "The runtime is already changing state and cannot enter backup maintenance.",
+                    "Wait for the current lifecycle operation to finish, then retry the backup.",
+                ));
+            }
+        }
+
+        if runtime_was_running || self.has_managed_children() {
+            if let Err(stop_error) = self.stop() {
+                if runtime_was_running && !self.has_managed_children() {
+                    return match self.start() {
+                        Ok(_) => Err(stop_error),
+                        Err(resume_error) => Err(error_info(
+                            "backup_database",
+                            "quiesce",
+                            format!(
+                                "CoffeePOS stopped the normal runtime with an error ({}) and could not restore it after aborting backup maintenance: {}",
+                                stop_error.message, resume_error.message
+                            ),
+                            "Keep CoffeePOS open, inspect runtime health, and restore a healthy running state before retrying backup.",
+                        )),
+                    };
+                }
+                return Err(stop_error);
+            }
+        }
+        if self.has_managed_children() {
+            return Err(error_info(
+                "backup_database",
+                "quiesce",
+                "CoffeePOS could not confirm that the normal runtime stopped before backup maintenance.",
+                "Keep the application open, stop the remaining managed process, then retry the backup.",
+            ));
+        }
+
+        let setup = (|| {
+            self.validate_installed_layout()?;
+            self.prepare_logs()?;
+            let database_port = choose_runtime_port(None, &[])?;
+            self.database_port = Some(database_port);
+            self.database = Some(self.spawn_database(database_port)?);
+            self.wait_database_ready(database_port)?;
+            Ok(database_port)
+        })();
+        let database_port = match setup {
+            Ok(port) => port,
+            Err(error) => {
+                let cleanup_error = if self.has_managed_children() {
+                    self.stop().err()
+                } else {
+                    self.database_port = None;
+                    self.state = if installation_ready(&self.data_root) {
+                        RuntimeState::Stopped
+                    } else {
+                        RuntimeState::NotInstalled
+                    };
+                    None
+                };
+                let resume_error = if runtime_was_running && !self.has_managed_children() {
+                    self.start().err()
+                } else {
+                    None
+                };
+                return match (cleanup_error, resume_error) {
+                    (None, None) => Err(error),
+                    (cleanup_error, resume_error) => {
+                        let cleanup_detail = cleanup_error
+                            .map(|value| format!(" Cleanup failed: {}", value.message))
+                            .unwrap_or_default();
+                        let resume_detail = resume_error
+                            .map(|value| format!(" Resume failed: {}", value.message))
+                            .unwrap_or_default();
+                        Err(error_info(
+                            "backup_database",
+                            "cleanup",
+                            format!(
+                                "Database backup maintenance could not start: {}{}{}",
+                                error.message, cleanup_detail, resume_detail
+                            ),
+                            "Keep CoffeePOS open, confirm the managed runtime state, then retry backup only after cleanup/recovery is complete.",
+                        ))
+                    }
+                };
+            }
+        };
+        self.state = RuntimeState::Stopped;
+        self.wordpress_health = WordPressHealthState::Unavailable;
+        self.wordpress_error = None;
+        self.clear_coffeepos_health();
+        self.last_error = None;
+        self.backup_maintenance_active = true;
+        self.log_event("database backup maintenance ready");
+        Ok(DatabaseMaintenanceLease {
+            runtime_was_running,
+            previous_state,
+            database_port,
+        })
+    }
+
+    pub(crate) fn finish_database_backup_maintenance(
+        &mut self,
+        lease: &DatabaseMaintenanceLease,
+    ) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        if !self.backup_recovery_children.is_empty() {
+            return Err(error_info(
+                "backup_database",
+                "cleanup",
+                "Backup child cleanup is still pending, so the previous runtime state cannot be restored yet.",
+                "Retry backup cleanup after Windows confirms all retained backup children have stopped.",
+            ));
+        }
+        let stop_error = if self.database.is_some() || self.has_managed_children() {
+            self.stop_for_backup_maintenance().err()
+        } else {
+            None
+        };
+        if self.has_managed_children() {
+            let detail = stop_error
+                .as_ref()
+                .map(|error| format!(" Last stop error: {}", error.message))
+                .unwrap_or_default();
+            return Err(error_info(
+                "backup_database",
+                "cleanup",
+                format!(
+                    "CoffeePOS could not confirm that backup-maintenance processes stopped.{detail}"
+                ),
+                "Keep the application open and stop the remaining managed process before retrying or exiting.",
+            ));
+        }
+        self.backup_maintenance_active = false;
+        self.database_port = None;
+        self.state = if installation_ready(&self.data_root) {
+            RuntimeState::Stopped
+        } else {
+            RuntimeState::NotInstalled
+        };
+        self.log_event("database backup maintenance stopped");
+        let restored = if lease.runtime_was_running {
+            self.start()
+        } else {
+            Ok(self.info())
+        };
+        match (stop_error, restored) {
+            (None, Ok(info)) => Ok(info),
+            (Some(error), Ok(_)) => Err(error_info(
+                "backup_database",
+                "cleanup",
+                format!(
+                    "Backup maintenance required forced database cleanup before the previous runtime state was restored: {}",
+                    error.message
+                ),
+                "The managed child processes are stopped and the previous runtime state was reconciled. Inspect database health before retrying backup.",
+            )),
+            (None, Err(error)) => Err(error),
+            (Some(stop_error), Err(resume_error)) => Err(error_info(
+                "backup_database",
+                "cleanup",
+                format!(
+                    "Backup maintenance cleanup reported an error ({}) and the previous runtime state could not be restored: {}",
+                    stop_error.message, resume_error.message
+                ),
+                "Keep CoffeePOS open, confirm all managed processes are stopped, then restore runtime health before retrying backup.",
+            )),
+        }
+    }
+
+    pub(crate) fn seal_database_backup_snapshot(
+        &mut self,
+    ) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        if !self.backup_maintenance_active {
+            return Err(error_info(
+                "backup_database",
+                "seal snapshot",
+                "Database backup maintenance is not active.",
+                "Restart the backup from the beginning so CoffeePOS can acquire a fresh maintenance lease.",
+            ));
+        }
+        if !self.backup_recovery_children.is_empty() {
+            return Err(error_info(
+                "backup_database",
+                "seal snapshot",
+                "Backup child cleanup is still pending, so the database snapshot cannot be sealed.",
+                "Keep backup maintenance fenced and retry cleanup after Windows confirms the retained child has stopped.",
+            ));
+        }
+
+        let stop_result = if self.database.is_some() || self.has_managed_children() {
+            self.stop_for_backup_maintenance()
+        } else {
+            Ok(self.info())
+        };
+        if self.has_managed_children() {
+            return Err(error_info(
+                "backup_database",
+                "seal snapshot",
+                "CoffeePOS could not confirm that the database-only maintenance process stopped.",
+                "Keep the backup maintenance fence active and finish cleanup before retrying backup.",
+            ));
+        }
+        stop_result?;
+        // Keep the maintenance lease fenced after MariaDB stops. Phase 7.3 captures uploads and
+        // portable metadata only after this point, then `finish_database_backup_maintenance`
+        // releases the fence and restores the previous runtime state.
+        self.backup_maintenance_active = true;
+        self.database_port = None;
+        self.state = RuntimeState::Stopped;
+        self.wordpress_health = WordPressHealthState::Unavailable;
+        self.wordpress_error = None;
+        self.clear_coffeepos_health();
+        self.last_error = None;
+        self.log_event("database backup snapshot sealed; maintenance fence retained");
+        Ok(self.info())
+    }
+
+    pub(crate) fn contain_backup_child(&self, child: &Child) -> Result<(), RuntimeErrorInfo> {
+        self.containment.assign(child)
     }
 
     fn has_php_workers(&self) -> bool {
@@ -579,6 +913,14 @@ impl RuntimeManager {
         &mut self,
         check_wordpress_health: bool,
     ) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        if self.backup_maintenance_active {
+            return Err(error_info(
+                "runtime",
+                "start",
+                "Runtime start is blocked while database backup maintenance is active.",
+                "Finish or cancel the current backup cleanup before starting the store.",
+            ));
+        }
         self.refresh();
         match self.state {
             RuntimeState::Running => return Ok(self.info()),
@@ -791,6 +1133,9 @@ impl RuntimeManager {
     pub(crate) fn prepare_background_maintenance(
         &mut self,
     ) -> (RuntimeInfo, Option<BackgroundHealthProbe>) {
+        if self.backup_maintenance_active {
+            return (self.info(), None);
+        }
         let runtime = self.refresh();
         if runtime.state != RuntimeState::Running {
             return (runtime, None);
@@ -1087,6 +1432,22 @@ impl RuntimeManager {
     }
 
     pub fn stop(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        if self.backup_maintenance_active {
+            return Err(error_info(
+                "runtime",
+                "stop",
+                "Runtime stop is blocked while database backup maintenance is active.",
+                "Finish or cancel the current backup cleanup before stopping the store.",
+            ));
+        }
+        self.stop_internal()
+    }
+
+    fn stop_for_backup_maintenance(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        self.stop_internal()
+    }
+
+    fn stop_internal(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
         self.refresh();
         if (self.state == RuntimeState::NotInstalled || self.state == RuntimeState::Stopped)
             && !self.has_managed_children()
@@ -1196,7 +1557,9 @@ impl RuntimeManager {
     }
 
     pub fn requires_exit_confirmation(&self) -> bool {
-        self.has_managed_children()
+        self.backup_maintenance_active
+            || !self.backup_recovery_children.is_empty()
+            || self.has_managed_children()
             || matches!(
                 self.state,
                 RuntimeState::Installing
@@ -1233,6 +1596,14 @@ impl RuntimeManager {
     }
 
     pub fn restart(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        if self.backup_maintenance_active {
+            return Err(error_info(
+                "runtime",
+                "restart",
+                "Runtime restart is blocked while database backup maintenance is active.",
+                "Finish or cancel the current backup cleanup before restarting the store.",
+            ));
+        }
         self.refresh();
         match self.state {
             RuntimeState::Installing | RuntimeState::Starting | RuntimeState::Stopping => {
@@ -2161,6 +2532,18 @@ pub fn resolve_development_manifest(
         "MariaDB install-db executable",
         Some(manifest_root),
     )?;
+    let mariadb_dump = canonical_file_under(
+        &development_root,
+        &manifest.mariadb.dump,
+        "MariaDB dump executable",
+        Some(manifest_root),
+    )?;
+    let mariadb_import = canonical_file_under(
+        &development_root,
+        &manifest.mariadb.import,
+        "MariaDB import executable",
+        Some(manifest_root),
+    )?;
     Ok(ResolvedRuntime {
         runtime_version: manifest.runtime_version,
         php_version: manifest.php.version,
@@ -2202,6 +2585,8 @@ pub fn resolve_development_manifest(
             "MariaDB client executable",
             Some(manifest_root),
         )?),
+        mariadb_dump_executable: command_compatible_path(mariadb_dump),
+        mariadb_import_executable: command_compatible_path(mariadb_import),
         mariadb_install_db_executable: command_compatible_path(mariadb_install_db),
         mariadb_base_dir: command_compatible_path(resolve_mariadb_base_dir(
             &development_root,
@@ -3269,7 +3654,7 @@ pub(crate) struct ProcessContainment {
 #[cfg(windows)]
 impl ProcessContainment {
     pub(crate) fn new() -> Result<Self, RuntimeErrorInfo> {
-        let job = unsafe { windows_job::create_kill_on_close_job() }.map_err(|error| {
+        let job = unsafe { windows_job::process_lifetime_job() }.map_err(|error| {
             error_info(
                 "runtime",
                 "create process job",
@@ -3281,21 +3666,14 @@ impl ProcessContainment {
     }
 
     pub(crate) fn assign(&self, child: &Child) -> Result<(), RuntimeErrorInfo> {
-        unsafe { windows_job::assign_process(self.job, child) }.map_err(|error| {
+        unsafe { windows_job::verify_process_in_job(self.job, child) }.map_err(|error| {
             error_info(
                 "runtime",
-                "assign process job",
-                format!("Cannot attach child process to the Windows runtime job: {error}."),
-                "Stop any stale runtime process and retry. CoffeePOS does not leave this child running without containment.",
+                "verify process job",
+                format!("Cannot verify child process inheritance in the Windows runtime job: {error}."),
+                "Stop any stale runtime process and retry. CoffeePOS only starts managed children that inherit process-lifetime crash containment.",
             )
         })
-    }
-}
-
-#[cfg(windows)]
-impl Drop for ProcessContainment {
-    fn drop(&mut self) {
-        unsafe { windows_job::close_job(self.job) };
     }
 }
 
@@ -3320,9 +3698,11 @@ mod windows_job {
     use std::mem::{size_of, zeroed};
     use std::os::windows::io::AsRawHandle;
     use std::ptr;
+    use std::sync::OnceLock;
 
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+    static PROCESS_LIFETIME_JOB: OnceLock<Result<usize, String>> = OnceLock::new();
 
     #[repr(C)]
     struct JobObjectBasicLimitInformation {
@@ -3367,10 +3747,21 @@ mod windows_job {
             info_length: u32,
         ) -> i32;
         fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn IsProcessInJob(process: *mut c_void, job: *mut c_void, result: *mut i32) -> i32;
         fn CloseHandle(handle: *mut c_void) -> i32;
     }
 
-    pub unsafe fn create_kill_on_close_job() -> io::Result<usize> {
+    pub unsafe fn process_lifetime_job() -> io::Result<usize> {
+        match PROCESS_LIFETIME_JOB
+            .get_or_init(|| create_process_lifetime_job().map_err(|error| error.to_string()))
+        {
+            Ok(job) => Ok(*job),
+            Err(message) => Err(io::Error::other(message.clone())),
+        }
+    }
+
+    unsafe fn create_process_lifetime_job() -> io::Result<usize> {
         let job = CreateJobObjectW(ptr::null(), ptr::null());
         if job.is_null() {
             return Err(io::Error::last_os_error());
@@ -3388,22 +3779,30 @@ mod windows_job {
             let _ = CloseHandle(job);
             return Err(error);
         }
+        // Associate the CoffeePOS process itself with this process-lifetime job. Windows then
+        // places every child in the same job atomically at CreateProcess time unless the child is
+        // explicitly created with CREATE_BREAKAWAY_FROM_JOB (CoffeePOS never sets that flag).
+        // This closes the spawn -> AssignProcessToJobObject crash window for backup helpers.
+        if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+            let error = io::Error::last_os_error();
+            let _ = CloseHandle(job);
+            return Err(error);
+        }
         Ok(job as usize)
     }
 
-    pub unsafe fn assign_process(job: usize, child: &Child) -> io::Result<()> {
+    pub unsafe fn verify_process_in_job(job: usize, child: &Child) -> io::Result<()> {
         let process = child.as_raw_handle();
-        if AssignProcessToJobObject(job as *mut c_void, process) == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+        let mut in_job = 0_i32;
+        if IsProcessInJob(process, job as *mut c_void, &mut in_job) == 0 {
+            return Err(io::Error::last_os_error());
         }
-    }
-
-    pub unsafe fn close_job(job: usize) {
-        if job != 0 {
-            let _ = CloseHandle(job as *mut c_void);
+        if in_job == 0 {
+            return Err(io::Error::other(
+                "child did not inherit the CoffeePOS process-lifetime job",
+            ));
         }
+        Ok(())
     }
 }
 
@@ -3437,6 +3836,7 @@ mod tests {
         let web_server = development.join("caddy/caddy-test");
         let mariadb = development.join("mariadb/bin/mariadbd-test");
         let client = development.join("mariadb/bin/mariadb-test");
+        let dump = development.join("mariadb/bin/mariadb-dump-test");
         let install_db = development.join("mariadb/bin/mariadb-install-db-test");
         for path in [
             &php,
@@ -3445,6 +3845,7 @@ mod tests {
             &web_server,
             &mariadb,
             &client,
+            &dump,
             &install_db,
         ] {
             touch(path);
@@ -3459,6 +3860,7 @@ mod tests {
         let web_server = root.join("caddy/caddy-test");
         let server = root.join("mariadb/bin/mariadbd-test");
         let client = root.join("mariadb/bin/mariadb-test");
+        let dump = root.join("mariadb/bin/mariadb-dump-test");
         let install_db = root.join("mariadb/bin/mariadb-install-db-test");
         touch(&root.join("php/license.txt"));
         touch(&root.join("caddy/LICENSE"));
@@ -3466,7 +3868,7 @@ mod tests {
         touch(&root.join("fixture/router.php"));
         fs::create_dir_all(root.join("fixture/site")).unwrap();
         let manifest = json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "target": current_target_triple().unwrap(),
             "runtime_version": "test-runtime",
             "php": {
@@ -3496,6 +3898,8 @@ mod tests {
                 "archive": "mariadb-test.zip",
                 "server": &server,
                 "client": &client,
+                "dump": &dump,
+                "import": &client,
                 "install_db": &install_db,
                 "source": "test fixture",
                 "checksum_source": "test fixture checksum",
@@ -3527,6 +3931,51 @@ mod tests {
         assert_eq!(resolved.runtime_version, "test-runtime");
         assert_eq!(resolved.php_version, "8.4-test");
         assert_eq!(resolved.mariadb_version, "11.4-test");
+        assert!(resolved.mariadb_dump_executable.is_absolute());
+        assert!(resolved.mariadb_import_executable.is_absolute());
+        assert!(resolved
+            .mariadb_dump_executable
+            .starts_with(command_compatible_path(development.clone())));
+        assert!(resolved
+            .mariadb_import_executable
+            .starts_with(command_compatible_path(development)));
+    }
+
+    #[test]
+    fn development_manifest_rejects_missing_database_dump_tool() {
+        if current_target_triple().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().canonicalize().unwrap();
+        let (development, php) = manifest_fixture(&project);
+        let manifest = development.join("manifest.json");
+        write_manifest(&manifest, &php);
+        fs::remove_file(development.join("mariadb/bin/mariadb-dump-test")).unwrap();
+
+        let error = resolve_development_manifest(&project, &manifest).unwrap_err();
+        assert!(error.message.contains("MariaDB dump executable"));
+    }
+
+    #[test]
+    fn development_manifest_rejects_database_dump_path_escape() {
+        if current_target_triple().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().canonicalize().unwrap();
+        let (development, php) = manifest_fixture(&project);
+        let escaped_dump = project.join("outside-mariadb-dump");
+        touch(&escaped_dump);
+        let manifest = development.join("manifest.json");
+        write_manifest(&manifest, &php);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        value["mariadb"]["dump"] = serde_json::json!(escaped_dump);
+        fs::write(&manifest, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let error = resolve_development_manifest(&project, &manifest).unwrap_err();
+        assert!(error.message.contains("outside runtime/development"));
     }
 
     #[test]
@@ -3596,6 +4045,8 @@ mod tests {
             mariadb_version: "test-db".into(),
             mariadb_executable: executable.clone(),
             mariadb_client_executable: executable.clone(),
+            mariadb_dump_executable: executable.clone(),
+            mariadb_import_executable: executable.clone(),
             mariadb_install_db_executable: executable.clone(),
             mariadb_base_dir: base,
         }

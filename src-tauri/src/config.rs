@@ -7,18 +7,13 @@ use tempfile::NamedTempFile;
 
 pub const APP_CONFIG_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupView {
+    #[default]
     Home,
     Settings,
     Diagnostics,
-}
-
-impl Default for StartupView {
-    fn default() -> Self {
-        Self::Home
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

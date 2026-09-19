@@ -12,6 +12,7 @@ Giao diện hiện tại là công cụ development. Việc gom setup, runtime c
 
 | Màn hình | Nội dung và hành động chính | Mốc triển khai |
 | --- | --- | --- |
+| Chọn ngôn ngữ | Fresh profile chọn **Tiếng Việt / English** trước Welcome; selection persist cho Desktop shell | 7.5 |
 | Chào mừng | Giải thích ngắn: cài một lần, dữ liệu nằm trên máy; nút **Thiết lập cửa hàng** | 4.12: bắt đầu setup tối thiểu; 5.1–5.2: hoàn thiện |
 | Thiết lập cửa hàng | Tên cửa hàng, tài khoản ban đầu, validation; nút **Cài đặt** | 5.2 |
 | Tiến trình thiết lập | Các bước thật đã xong/đang chạy; lỗi và tiếp tục khi an toàn | 4.12, tích hợp form ở 5.2 |
@@ -27,7 +28,7 @@ Trước setup, dùng luồng theo bước, không đưa người dùng vào das
 Ba mục cấp cao dùng cùng một loại khái niệm và cùng một cấp độ thông tin:
 
 - **Tổng quan**: nơi vận hành hằng ngày. Hiển thị cửa hàng có sẵn sàng hay không, cảnh báo ngắn và action thường dùng như **Mở bán hàng**.
-- **Cấu hình**: các preference và thiết lập thuộc CoffeePOS Desktop như màn hình mở đầu, hành vi ứng dụng và cấu hình local/LAN khi phase tương ứng tồn tại.
+- **Cấu hình**: các preference và thiết lập thuộc CoffeePOS Desktop như màn hình mở đầu, ngôn ngữ Desktop, hành vi ứng dụng và cấu hình local/LAN khi phase tương ứng tồn tại.
 - **Hệ thống**: trạng thái runtime và công cụ kỹ thuật. Landing của Hệ thống ưu tiên health summary; **Chẩn đoán** là chức năng bên trong khu vực này. Phase 6.2 tối ưu runtime phía sau UI; Phase 6.3 Repair và 6.4 Log viewer/export mở rộng Hệ thống thay vì tạo thêm top-level tab.
 
 Shell dùng một cấu trúc ổn định trên cả ba khu vực:
@@ -51,11 +52,13 @@ Internal config key hiện có được giữ tương thích trong lúc refactor
 ### Lần đầu
 
 ```text
-Chào mừng → Thông tin cửa hàng/tài khoản → Cài đặt
-         → Tiến trình thật → Hoàn tất → Tổng quan → Mở bán hàng
+Chọn ngôn ngữ → Chào mừng → Thông tin cửa hàng/tài khoản → Cài đặt
+              → Tiến trình thật → Hoàn tất → Tổng quan → Mở bán hàng
 ```
 
 Phase 4.12 hoàn thiện tiến trình/recovery trên input setup cũ; Phase 5.2 đã bổ sung form tài khoản, review/complete, protected user-set credential và nghiệm thu fresh flow đầy đủ. Không kéo các hành vi Phase 5.4 như mở POS vào onboarding.
+
+Phase 7.5 thêm language chooser **chỉ cho brand-new profile** trước Welcome. Existing/partial legacy profile không bị chèn một gate mới giữa recovery; khi chưa có preference thì Desktop dùng fallback `vi`. Sau khi chọn, onboarding dùng một locale nhất quán. `app_language` là preference của Desktop profile và không tự đổi WordPress/POS locale; xem [PHASE-07.5.md](PHASE-07.5.md).
 
 Màn hình tiến trình lấy trạng thái từ native. Nếu chưa có sự kiện từng bước, dùng trạng thái tổng quát có thật; không chạy thanh phần trăm theo timer. Sau thành công, nói rõ cửa hàng đã cài xong; chỉ nói hệ thống sẵn sàng khi live application health đạt.
 
@@ -132,7 +135,7 @@ Trong **Hệ thống → Sửa chữa**, mở tab chỉ hiển thị trạng th�
 - Navigation cấp cao sau setup chỉ dùng **Tổng quan / Cấu hình / Hệ thống**. Chẩn đoán và công cụ kỹ thuật dùng navigation cấp hai trong Hệ thống. Wizard có thứ tự bước trước setup. Lỗi/chờ là state của màn hình, không bắt buộc tạo route riêng cho mọi state.
 - Không lặp hierarchy kiểu eyebrow → page title → card title khi các nhãn cùng nghĩa. Mỗi màn hình có một page heading chính; card/section heading chỉ dùng khi thực sự chia nội dung.
 - Có focus bàn phím rõ; Tab/Enter hoạt động; chuyển màn hình đưa focus tới tiêu đề phù hợp, lỗi form tới field liên quan. Progress dùng thông báo accessible, không đọc lặp mỗi poll.
-- Không chỉ dùng màu để báo lỗi/thành công. Text tiếng Việt nhất quán, không cắt nội dung quan trọng; resize và DPI/zoom phải giữ được nút chính, cho cuộn khi cần.
+- Không chỉ dùng màu để báo lỗi/thành công. Text phải nhất quán theo locale Desktop đã chọn (`vi` hoặc `en`), không cắt nội dung quan trọng; resize và DPI/zoom phải giữ được nút chính, cho cuộn khi cần.
 - Operation đang chạy không bị nhân đôi bởi double click, Back hoặc reload. Draft không nhạy cảm được giữ khi điều hướng hợp lệ; secret phải có quy tắc vòng đời riêng.
 
 Trước triển khai mỗi màn hình, spec phase phải có wireframe cho trạng thái chính/lỗi/chờ và danh sách action thật. Dùng thiết kế đó để review bố cục trước code; tài liệu này chưa chốt palette/font hay mockup hình ảnh cuối cùng.
@@ -143,6 +146,7 @@ Trước triển khai mỗi màn hình, spec phase phải có wireframe cho tr�
 | --- | --- |
 | 6.x Hệ thống / Diagnostics / Repair / Logs | Hệ thống là khu vực cấp cao; Chẩn đoán tóm tắt dễ hiểu, chi tiết kỹ thuật mở khi cần; repair giải thích phạm vi/kết quả; Nhật ký có source selector + bounded viewer, export có trạng thái, native Save As và redaction |
 | 7.x Hệ thống / Backup / Restore | Địa điểm lưu, tiến trình, thành công/lỗi; validate bản restore và giải thích dữ liệu sẽ thay trước xác nhận; lỗi giữ đường phục hồi |
+| 7.5 Desktop localization | Fresh profile chọn Tiếng Việt/English trước Welcome; Cấu hình cho đổi locale và hot-switch shell; navigation, states, action/error copy, tray/close và accessibility text theo locale; target profile giữ language riêng qua backup/restore |
 | 8.x LAN | Mặc định tắt; bật/tắt rõ ràng, URL thực có thể copy, lỗi network/firewall, ảnh hưởng khi đổi địa chỉ hoặc dừng server |
 | 9.x Distribution/Update | Setup trên máy sạch, thông báo prerequisite; update tiến trình/lỗi và dữ liệu được giữ; không bắt người dùng chạy lệnh |
 

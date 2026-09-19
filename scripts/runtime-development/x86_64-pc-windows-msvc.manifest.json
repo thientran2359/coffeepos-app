@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "target": "x86_64-pc-windows-msvc",
   "runtime_version": "2026-09-19.windows-dev.2",
   "php": {
@@ -34,6 +34,8 @@
     "license_file": "mariadb/COPYING",
     "server": "mariadb/bin/mariadbd.exe",
     "client": "mariadb/bin/mariadb.exe",
+    "dump": "mariadb/bin/mariadb-dump.exe",
+    "import": "mariadb/bin/mariadb.exe",
     "install_db": "mariadb/bin/mariadb-install-db.exe"
   },
   "http_fixture": {

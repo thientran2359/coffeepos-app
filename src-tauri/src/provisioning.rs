@@ -7590,6 +7590,8 @@ mod tests {
                 mariadb_version: "11.4.13".into(),
                 mariadb_executable: artifact_root.join("mariadbd.exe"),
                 mariadb_client_executable: artifact_root.join("mariadb.exe"),
+                mariadb_dump_executable: artifact_root.join("mariadb-dump.exe"),
+                mariadb_import_executable: artifact_root.join("mariadb.exe"),
                 mariadb_install_db_executable: artifact_root.join("mariadb-install-db.exe"),
                 mariadb_base_dir: artifact_root.join("mariadb"),
             },

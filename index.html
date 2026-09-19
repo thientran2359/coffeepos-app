@@ -204,6 +204,7 @@
               <button type="button" class="system-nav-item" data-system-section="diagnostics" aria-controls="system-diagnostics-panel" aria-current="page">Chẩn đoán</button>
               <button type="button" class="system-nav-item" data-system-section="repair" aria-controls="system-repair-panel">Sửa chữa</button>
               <button type="button" class="system-nav-item" data-system-section="logs" aria-controls="system-logs-panel">Nhật ký</button>
+              <button type="button" class="system-nav-item" data-system-section="backup" aria-controls="system-backup-panel">Sao lưu và khôi phục</button>
             </nav>
             <div id="system-diagnostics-panel" data-system-panel="diagnostics">
             <section class="card" id="health-diagnostics" aria-labelledby="health-diagnostics-title">
@@ -361,6 +362,89 @@
                   <button id="log-export" type="button">Xuất gói hỗ trợ</button>
                 </div>
                 <p id="log-export-status" class="hint" role="status" aria-live="polite"></p>
+              </section>
+            </div>
+            <div id="system-backup-panel" data-system-panel="backup" hidden>
+              <section class="card backup-card" id="backup" aria-labelledby="backup-title" aria-busy="false">
+                <div class="section-heading compact-heading">
+                  <div>
+                    <span class="section-label">SAO LƯU VÀ KHÔI PHỤC</span>
+                    <h3 id="backup-title" tabindex="-1">Sao lưu cửa hàng</h3>
+                  </div>
+                  <span id="backup-state" class="state-badge">Sẵn sàng</span>
+                </div>
+                <p class="lead">Tạo một bản sao lưu mã hóa gồm dữ liệu cửa hàng, hình ảnh tải lên và cấu hình cần thiết để khôi phục trên CoffeePOS Desktop tương thích.</p>
+
+                <div id="backup-last-success" class="backup-last-success" hidden>
+                  <span class="section-label">LẦN SAO LƯU GẦN NHẤT</span>
+                  <strong id="backup-last-success-time">—</strong>
+                  <span>Đã hoàn thành</span>
+                </div>
+
+                <div data-backup-view="landing">
+                  <p class="hint">Bản sao lưu không mang theo plugin hoặc theme tùy chỉnh. Trong lúc tạo snapshot, POS sẽ tạm dừng để giữ dữ liệu nhất quán.</p>
+                  <div class="actions">
+                    <button id="backup-create" type="button">Tạo bản sao lưu</button>
+                  </div>
+                  <p id="backup-landing-status" class="hint" role="status" aria-live="polite"></p>
+                </div>
+
+                <div data-backup-view="password" hidden>
+                  <form id="backup-password-form" class="backup-password-form" novalidate>
+                    <div class="field-group">
+                      <label for="backup-password">Mật khẩu bản sao lưu</label>
+                      <input id="backup-password" type="password" maxlength="128" autocomplete="new-password" required />
+                    </div>
+                    <div class="field-group">
+                      <label for="backup-password-confirm">Nhập lại mật khẩu</label>
+                      <input id="backup-password-confirm" type="password" maxlength="128" autocomplete="new-password" required />
+                    </div>
+                    <p class="hint">Mật khẩu này cần khi khôi phục trên máy hoặc Windows profile khác. CoffeePOS không lưu lại mật khẩu sau thao tác.</p>
+                    <p id="backup-password-error" class="field-error" role="alert" hidden></p>
+                    <div class="actions split-actions">
+                      <button id="backup-password-cancel" class="secondary" type="button">Hủy</button>
+                      <button id="backup-choose-destination" type="submit">Chọn nơi lưu</button>
+                    </div>
+                  </form>
+                </div>
+
+                <div data-backup-view="progress" hidden>
+                  <div class="backup-progress-copy">
+                    <strong id="backup-progress-title">Đang sao lưu…</strong>
+                    <p id="backup-progress-stage" role="status" aria-live="polite">Đang chuẩn bị dữ liệu cửa hàng.</p>
+                    <progress id="backup-progress" max="100" value="0">0%</progress>
+                    <p id="backup-progress-count" class="hint">Đang chờ thông tin tiến độ từ hệ thống.</p>
+                  </div>
+                  <p class="hint">POS tạm dừng trong khi CoffeePOS tạo snapshot nhất quán.</p>
+                  <div class="actions">
+                    <button id="backup-cancel" class="secondary" type="button">Hủy</button>
+                  </div>
+                  <p id="backup-progress-status" class="hint" role="status" aria-live="polite"></p>
+                </div>
+
+                <div data-backup-view="success" hidden>
+                  <div class="backup-result">
+                    <strong>Đã sao lưu cửa hàng</strong>
+                    <p>File backup đã được kiểm tra và lưu tại vị trí bạn chọn.</p>
+                    <p id="backup-success-warning" class="hint" role="status" hidden>Một số plugin hoặc theme tùy chỉnh không nằm trong file backup. Dữ liệu cửa hàng, uploads và cấu hình portable vẫn đã được sao lưu.</p>
+                  </div>
+                  <div class="actions">
+                    <button id="backup-open-folder" type="button">Mở thư mục chứa file</button>
+                    <button id="backup-create-another" class="secondary" type="button">Tạo bản sao lưu khác</button>
+                  </div>
+                  <p id="backup-success-status" class="hint" role="status" aria-live="polite"></p>
+                </div>
+
+                <div data-backup-view="failure" hidden>
+                  <div class="backup-result backup-result-error" role="alert">
+                    <strong>Không thể tạo bản sao lưu</strong>
+                    <p id="backup-failure-message">CoffeePOS chưa thể hoàn tất thao tác sao lưu.</p>
+                    <p id="backup-failure-recovery" class="hint"></p>
+                  </div>
+                  <div class="actions">
+                    <button id="backup-retry" type="button">Thử lại</button>
+                  </div>
+                </div>
               </section>
             </div>
           </section>

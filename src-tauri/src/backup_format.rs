@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
@@ -31,7 +32,10 @@ const MAX_MANIFEST_JSON_BYTES: u64 = 1024 * 1024;
 const MAX_INVENTORY_JSON_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_PORTABLE_CONFIG_JSON_BYTES: u64 = 1024 * 1024;
 const MAX_WARNINGS: usize = 128;
+const MAX_WARNING_ITEMS: usize = 256;
+const MAX_WARNING_ITEM_BYTES: usize = 128;
 pub const WARNING_UNMANAGED_EXTENSIONS_EXCLUDED: &str = "unmanaged_extensions_excluded";
+pub const WARNING_UNMANAGED_SITE_CODE_NOT_INCLUDED: &str = "unmanaged_site_code_not_included";
 
 const ZIP_LOCAL_FILE_HEADER: u32 = 0x0403_4b50;
 const ZIP_CENTRAL_DIRECTORY_HEADER: u32 = 0x0201_4b50;
@@ -79,6 +83,28 @@ pub struct BackupSourceVersions {
     pub app_config_schema: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BackupDestinationIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BackupDestinationSelection {
+    pub(crate) path: PathBuf,
+    pub(crate) existing_identity: Option<BackupDestinationIdentity>,
+}
+
+impl BackupDestinationSelection {
+    pub(crate) fn capture(path: PathBuf, action: &str) -> Result<Self, BackupErrorInfo> {
+        let existing_identity = capture_destination_identity(&path, action)?;
+        Ok(Self {
+            path,
+            existing_identity,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct DatabaseDescriptor {
@@ -113,6 +139,77 @@ struct CompatibilityDescriptor {
     requires_explicit_migration: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupWarning {
+    pub code: String,
+    pub items: Vec<String>,
+}
+
+impl Serialize for BackupWarning {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.code == WARNING_UNMANAGED_EXTENSIONS_EXCLUDED && self.items.is_empty() {
+            return serializer.serialize_str(&self.code);
+        }
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("BackupWarning", 2)?;
+        state.serialize_field("code", &self.code)?;
+        state.serialize_field("items", &self.items)?;
+        state.end()
+    }
+}
+
+impl BackupWarning {
+    pub(crate) fn unmanaged_site_code_not_included(
+        items: impl IntoIterator<Item = String>,
+    ) -> Result<Self, BackupErrorInfo> {
+        let mut items = items.into_iter().collect::<Vec<_>>();
+        items.sort();
+        items.dedup();
+        let warning = Self {
+            code: WARNING_UNMANAGED_SITE_CODE_NOT_INCLUDED.into(),
+            items,
+        };
+        validate_warning(&warning, "preflight")?;
+        Ok(warning)
+    }
+}
+
+impl<'de> Deserialize<'de> for BackupWarning {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WarningMetadataWire {
+            code: String,
+            #[serde(default)]
+            items: Vec<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum WarningWire {
+            LegacyCode(String),
+            Metadata(WarningMetadataWire),
+        }
+
+        match WarningWire::deserialize(deserializer)? {
+            WarningWire::LegacyCode(code) => Ok(Self {
+                code,
+                items: Vec::new(),
+            }),
+            WarningWire::Metadata(value) => Ok(Self {
+                code: value.code,
+                items: value.items,
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct BackupManifestV1 {
@@ -129,7 +226,7 @@ struct BackupManifestV1 {
     inventory_entry: String,
     total_files: u64,
     total_uncompressed_bytes: u64,
-    warnings: Vec<String>,
+    warnings: Vec<BackupWarning>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -219,7 +316,10 @@ pub struct BackupInspection {
     pub total_files: u64,
     pub total_uncompressed_bytes: u64,
     pub compatibility: BackupCompatibilityResult,
+    /// Stable warning codes kept for the Phase 7.1 inspection IPC contract.
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warning_metadata: Vec<BackupWarning>,
     pub can_restore: bool,
 }
 
@@ -245,7 +345,7 @@ pub(crate) struct BackupManifestSeed {
     database_name: String,
     minimum_restore_schema: u32,
     requires_explicit_migration: bool,
-    warnings: Vec<String>,
+    warnings: Vec<BackupWarning>,
 }
 
 impl BackupManifestSeed {
@@ -280,6 +380,37 @@ struct PreparedPayloadEntry {
     size: u64,
     sha256: String,
     crc32: u32,
+    source_snapshot: Option<SourceFileSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceFileSnapshot {
+    size: u64,
+    modified: Option<SystemTime>,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackupWriteStage {
+    Preparing,
+    Archiving,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct BackupWriteProgress {
+    pub stage: BackupWriteStage,
+    pub entries_completed: u64,
+    pub total_entries: u64,
+    pub bytes_processed: u64,
+    pub total_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -432,6 +563,23 @@ pub(crate) fn new_backup_manifest_seed(
     source: BackupSourceVersions,
     warnings: Vec<String>,
 ) -> Result<BackupManifestSeed, BackupErrorInfo> {
+    let warnings = warnings
+        .into_iter()
+        .map(|code| BackupWarning {
+            code,
+            items: Vec::new(),
+        })
+        .collect();
+    new_backup_manifest_seed_with_warning_metadata(source, warnings)
+}
+
+pub(crate) fn new_backup_manifest_seed_with_warning_metadata(
+    source: BackupSourceVersions,
+    warnings: Vec<BackupWarning>,
+) -> Result<BackupManifestSeed, BackupErrorInfo> {
+    for warning in &warnings {
+        validate_warning(warning, "preflight")?;
+    }
     Ok(BackupManifestSeed {
         backup_id: random_uuid_v4()?,
         created_at: rfc3339_utc(now_epoch()),
@@ -440,6 +588,61 @@ pub(crate) fn new_backup_manifest_seed(
         minimum_restore_schema: BACKUP_SCHEMA_VERSION,
         requires_explicit_migration: false,
         warnings,
+    })
+}
+
+pub(crate) fn portable_store_config_entry(
+    store_name: &str,
+    administrator_username: &str,
+    administrator_email: &str,
+) -> Result<BackupPayloadEntry, BackupErrorInfo> {
+    let config = PortableStoreConfigV1 {
+        schema_version: STORE_CONFIG_SCHEMA_VERSION,
+        store_name: store_name.to_owned(),
+        administrator: PortableAdministratorIdentity {
+            username: administrator_username.to_owned(),
+            email: administrator_email.to_owned(),
+        },
+    };
+    validate_store_config(&config, "preflight")?;
+    let bytes = serialize_json_bounded(
+        &config,
+        MAX_PORTABLE_CONFIG_JSON_BYTES,
+        "store_config_serialize_failed",
+        "portable store configuration",
+    )?;
+    Ok(BackupPayloadEntry {
+        path: STORE_CONFIG_ENTRY.into(),
+        source: BackupEntrySource::Memory(Zeroizing::new(bytes)),
+    })
+}
+
+pub(crate) fn portable_administrator_secret_entry(
+    administrator_username: &str,
+    administrator_password: &str,
+) -> Result<BackupPayloadEntry, BackupErrorInfo> {
+    if !valid_portable_admin_username(administrator_username) || administrator_password.is_empty() {
+        return Err(backup_error(
+            "preflight",
+            "administrator_secret_unavailable",
+            "The portable administrator credential is incomplete.",
+            "Repair the administrator account metadata and protected password before creating a backup.",
+        ));
+    }
+    let secret = PortableAdministratorSecretV1 {
+        schema_version: ADMINISTRATOR_SECRET_SCHEMA_VERSION,
+        username: administrator_username.to_owned(),
+        password: Zeroizing::new(administrator_password.to_owned()),
+    };
+    let bytes = serialize_json_bounded(
+        &secret,
+        MAX_PORTABLE_CONFIG_JSON_BYTES,
+        "administrator_secret_serialize_failed",
+        "portable administrator credential",
+    )?;
+    Ok(BackupPayloadEntry {
+        path: ADMINISTRATOR_SECRET_ENTRY.into(),
+        source: BackupEntrySource::Memory(Zeroizing::new(bytes)),
     })
 }
 
@@ -468,6 +671,18 @@ pub(crate) fn write_encrypted_backup<W: Write>(
     seed: BackupManifestSeed,
     entries: &[BackupPayloadEntry],
 ) -> Result<(), BackupErrorInfo> {
+    let cancelled = AtomicBool::new(false);
+    write_encrypted_backup_with_control(output, backup_password, seed, entries, &cancelled, |_| {})
+}
+
+pub(crate) fn write_encrypted_backup_with_control<W: Write, F: FnMut(BackupWriteProgress)>(
+    output: W,
+    backup_password: &str,
+    seed: BackupManifestSeed,
+    entries: &[BackupPayloadEntry],
+    cancelled: &AtomicBool,
+    mut progress: F,
+) -> Result<(), BackupErrorInfo> {
     if backup_password.is_empty() {
         return Err(backup_error(
             "create",
@@ -476,7 +691,15 @@ pub(crate) fn write_encrypted_backup<W: Write>(
             "Enter and confirm a backup password, then retry.",
         ));
     }
-    let prepared = prepare_payload_entries(entries)?;
+    ensure_write_not_cancelled(cancelled, "archive")?;
+    progress(BackupWriteProgress {
+        stage: BackupWriteStage::Preparing,
+        entries_completed: 0,
+        total_entries: entries.len() as u64,
+        bytes_processed: 0,
+        total_bytes: 0,
+    });
+    let prepared = prepare_payload_entries(entries, Some(cancelled))?;
     let manifest = build_manifest(seed, &prepared)?;
     let inventory = build_inventory(&prepared)?;
     validate_manifest_shape(&manifest, "create")?;
@@ -518,7 +741,22 @@ pub(crate) fn write_encrypted_backup<W: Write>(
             "Check the destination and retry backup creation.",
         )
     })?;
-    write_zip64_stream(&mut encrypted, &raw_entries, entries)?;
+    progress(BackupWriteProgress {
+        stage: BackupWriteStage::Archiving,
+        entries_completed: 0,
+        total_entries: prepared.len() as u64,
+        bytes_processed: 0,
+        total_bytes: inventory.total_uncompressed_bytes,
+    });
+    write_zip64_stream(
+        &mut encrypted,
+        &raw_entries,
+        entries,
+        &prepared,
+        Some(cancelled),
+        &mut progress,
+    )?;
+    ensure_write_not_cancelled(cancelled, "archive")?;
     encrypted.finish().map_err(|_| {
         backup_error(
             "create",
@@ -532,6 +770,7 @@ pub(crate) fn write_encrypted_backup<W: Write>(
 
 fn prepare_payload_entries(
     entries: &[BackupPayloadEntry],
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<PreparedPayloadEntry>, BackupErrorInfo> {
     if entries.len() as u64 > MAX_PAYLOAD_ENTRIES {
         return Err(size_limit_error(
@@ -543,6 +782,9 @@ fn prepare_payload_entries(
     let mut prepared = Vec::with_capacity(entries.len());
     let mut total = 0_u64;
     for (source_index, entry) in entries.iter().enumerate() {
+        if let Some(cancelled) = cancelled {
+            ensure_write_not_cancelled(cancelled, "archive")?;
+        }
         let path = validate_archive_path(&entry.path, "create")?;
         if !is_allowed_data_path(&path) {
             return Err(backup_error(
@@ -561,7 +803,8 @@ fn prepare_payload_entries(
                 "Resolve the duplicate source path before retrying backup creation.",
             ));
         }
-        let (size, sha256, crc32) = inspect_entry_source(&entry.source)?;
+        let (size, sha256, crc32, source_snapshot) =
+            inspect_entry_source(&entry.source, cancelled)?;
         if size > MAX_ENTRY_UNCOMPRESSED_BYTES {
             return Err(size_limit_error(
                 "create",
@@ -586,20 +829,39 @@ fn prepare_payload_entries(
             size,
             sha256,
             crc32,
+            source_snapshot,
         });
     }
     require_payload_shape(&prepared, "create")?;
     Ok(prepared)
 }
 
-fn inspect_entry_source(source: &BackupEntrySource) -> Result<(u64, String, u32), BackupErrorInfo> {
+fn inspect_entry_source(
+    source: &BackupEntrySource,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(u64, String, u32, Option<SourceFileSnapshot>), BackupErrorInfo> {
     match source {
         BackupEntrySource::File(path) => {
             validate_source_file(path)?;
             let file = File::open(path).map_err(|_| source_read_error())?;
-            hash_reader(BufReader::new(file), "create")
+            let before =
+                source_snapshot_from_metadata(&file.metadata().map_err(|_| source_read_error())?);
+            let (size, sha256, crc32) = hash_reader(BufReader::new(&file), "create", cancelled)?;
+            let after =
+                source_snapshot_from_metadata(&file.metadata().map_err(|_| source_read_error())?);
+            validate_source_file(path)?;
+            let path_after = source_snapshot_from_metadata(
+                &fs::metadata(path).map_err(|_| source_read_error())?,
+            );
+            if before != after || after != path_after {
+                return Err(source_changed_error());
+            }
+            Ok((size, sha256, crc32, Some(after)))
         }
-        BackupEntrySource::Memory(bytes) => hash_reader(bytes.as_slice(), "create"),
+        BackupEntrySource::Memory(bytes) => {
+            let (size, sha256, crc32) = hash_reader(bytes.as_slice(), "create", cancelled)?;
+            Ok((size, sha256, crc32, None))
+        }
     }
 }
 
@@ -663,12 +925,61 @@ fn source_read_error() -> BackupErrorInfo {
     )
 }
 
-fn hash_reader(mut reader: impl Read, action: &str) -> Result<(u64, String, u32), BackupErrorInfo> {
+fn source_changed_error() -> BackupErrorInfo {
+    backup_error(
+        "archive",
+        "source_changed",
+        "A managed backup source changed while CoffeePOS was reading it.",
+        "Keep store data idle during backup and retry from a fresh consistent snapshot.",
+    )
+}
+
+fn source_snapshot_from_metadata(metadata: &fs::Metadata) -> SourceFileSnapshot {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::MetadataExt;
+
+    SourceFileSnapshot {
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(windows)]
+        creation_time: metadata.creation_time(),
+        #[cfg(windows)]
+        last_write_time: metadata.last_write_time(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    }
+}
+
+fn ensure_write_not_cancelled(cancelled: &AtomicBool, action: &str) -> Result<(), BackupErrorInfo> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(backup_error(
+            action,
+            "cancelled",
+            "The backup operation was cancelled.",
+            "CoffeePOS will remove owned temporary backup files before normal runtime resumes.",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn hash_reader(
+    mut reader: impl Read,
+    action: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(u64, String, u32), BackupErrorInfo> {
     let mut sha = Sha256::new();
     let mut crc = Crc32::new();
     let mut total = 0_u64;
     let mut buffer = Zeroizing::new([0_u8; 64 * 1024]);
     loop {
+        if let Some(cancelled) = cancelled {
+            ensure_write_not_cancelled(cancelled, "archive")?;
+        }
         let read = reader.read(&mut buffer[..]).map_err(|_| {
             backup_error(
                 action,
@@ -792,14 +1103,24 @@ fn serialize_json_bounded<T: Serialize>(
     Ok(writer.into_inner())
 }
 
-fn write_zip64_stream<W: Write>(
+fn write_zip64_stream<W: Write, F: FnMut(BackupWriteProgress)>(
     writer: &mut W,
     raw_entries: &[RawZipEntry],
     payload_entries: &[BackupPayloadEntry],
+    prepared_entries: &[PreparedPayloadEntry],
+    cancelled: Option<&AtomicBool>,
+    progress: &mut F,
 ) -> Result<(), BackupErrorInfo> {
     let mut offset = 0_u64;
     let mut central = Vec::with_capacity(raw_entries.len());
+    let total_entries = prepared_entries.len() as u64;
+    let total_bytes = prepared_entries.iter().map(|entry| entry.size).sum();
+    let mut entries_completed = 0_u64;
+    let mut bytes_processed = 0_u64;
     for raw in raw_entries {
+        if let Some(cancelled) = cancelled {
+            ensure_write_not_cancelled(cancelled, "archive")?;
+        }
         let local_header_offset = offset;
         write_u32(writer, ZIP_LOCAL_FILE_HEADER, "create")?;
         write_u16(writer, 45, "create")?;
@@ -833,7 +1154,7 @@ fn write_zip64_stream<W: Write>(
         let (written, sha256, crc32) = match &raw.source {
             RawZipSource::Control(bytes) => {
                 write_all(writer, bytes, "create")?;
-                let (size, sha, crc) = hash_reader(bytes.as_slice(), "create")?;
+                let (size, sha, crc) = hash_reader(bytes.as_slice(), "create", cancelled)?;
                 (size, sha, crc)
             }
             RawZipSource::Payload(index) => {
@@ -845,7 +1166,39 @@ fn write_zip64_stream<W: Write>(
                         "Retry backup creation from the current store state.",
                     )
                 })?;
-                copy_source_with_hash(writer, &source.source)?
+                let prepared = prepared_entries.get(*index).ok_or_else(|| {
+                    backup_error(
+                        "archive",
+                        "source_changed",
+                        "A prepared backup source is no longer available.",
+                        "Retry backup creation from the current store state.",
+                    )
+                })?;
+                let result = copy_source_with_hash(
+                    writer,
+                    &source.source,
+                    prepared.source_snapshot.as_ref(),
+                    cancelled,
+                    |delta| {
+                        bytes_processed = bytes_processed.saturating_add(delta);
+                        progress(BackupWriteProgress {
+                            stage: BackupWriteStage::Archiving,
+                            entries_completed,
+                            total_entries,
+                            bytes_processed,
+                            total_bytes,
+                        });
+                    },
+                )?;
+                entries_completed = entries_completed.saturating_add(1);
+                progress(BackupWriteProgress {
+                    stage: BackupWriteStage::Archiving,
+                    entries_completed,
+                    total_entries,
+                    bytes_processed,
+                    total_bytes,
+                });
+                result
             }
         };
         if written != raw.size || crc32 != raw.crc32 {
@@ -881,6 +1234,9 @@ fn write_zip64_stream<W: Write>(
 
     let central_start = offset;
     for item in &central {
+        if let Some(cancelled) = cancelled {
+            ensure_write_not_cancelled(cancelled, "archive")?;
+        }
         let name = item.path.as_bytes();
         write_u32(writer, ZIP_CENTRAL_DIRECTORY_HEADER, "create")?;
         write_u16(writer, (3 << 8) | 45, "create")?;
@@ -943,26 +1299,55 @@ fn write_zip64_stream<W: Write>(
 fn copy_source_with_hash<W: Write>(
     writer: &mut W,
     source: &BackupEntrySource,
+    expected_snapshot: Option<&SourceFileSnapshot>,
+    cancelled: Option<&AtomicBool>,
+    mut on_chunk: impl FnMut(u64),
 ) -> Result<(u64, String, u32), BackupErrorInfo> {
     match source {
         BackupEntrySource::File(path) => {
             validate_source_file(path)?;
             let file = File::open(path).map_err(|_| source_read_error())?;
-            copy_reader_with_hash(writer, BufReader::new(file))
+            let before =
+                source_snapshot_from_metadata(&file.metadata().map_err(|_| source_read_error())?);
+            if expected_snapshot.is_some_and(|expected| expected != &before) {
+                return Err(source_changed_error());
+            }
+            let result =
+                copy_reader_with_hash(writer, BufReader::new(&file), cancelled, &mut on_chunk)?;
+            let after =
+                source_snapshot_from_metadata(&file.metadata().map_err(|_| source_read_error())?);
+            validate_source_file(path)?;
+            let path_after = source_snapshot_from_metadata(
+                &fs::metadata(path).map_err(|_| source_read_error())?,
+            );
+            if before != after
+                || after != path_after
+                || expected_snapshot.is_some_and(|expected| expected != &after)
+            {
+                return Err(source_changed_error());
+            }
+            Ok(result)
         }
-        BackupEntrySource::Memory(bytes) => copy_reader_with_hash(writer, bytes.as_slice()),
+        BackupEntrySource::Memory(bytes) => {
+            copy_reader_with_hash(writer, bytes.as_slice(), cancelled, &mut on_chunk)
+        }
     }
 }
 
 fn copy_reader_with_hash<W: Write>(
     writer: &mut W,
     mut reader: impl Read,
+    cancelled: Option<&AtomicBool>,
+    mut on_chunk: impl FnMut(u64),
 ) -> Result<(u64, String, u32), BackupErrorInfo> {
     let mut sha = Sha256::new();
     let mut crc = Crc32::new();
     let mut total = 0_u64;
     let mut buffer = Zeroizing::new([0_u8; 64 * 1024]);
     loop {
+        if let Some(cancelled) = cancelled {
+            ensure_write_not_cancelled(cancelled, "archive")?;
+        }
         let read = reader
             .read(&mut buffer[..])
             .map_err(|_| source_read_error())?;
@@ -981,6 +1366,7 @@ fn copy_reader_with_hash<W: Write>(
         write_all(writer, &buffer[..read], "create")?;
         sha.update(&buffer[..read]);
         crc.update(&buffer[..read]);
+        on_chunk(read as u64);
     }
     Ok((total, hex_lower(&sha.finalize()), crc.finish()))
 }
@@ -1377,6 +1763,11 @@ fn validate_decrypted_zip<R: Read>(
 
     let compatibility = evaluate_compatibility(&manifest, target);
     let can_restore = compatibility.can_restore();
+    let warning_metadata = manifest.warnings.clone();
+    let warning_codes = warning_metadata
+        .iter()
+        .map(|warning| warning.code.clone())
+        .collect();
     let inspection = BackupInspection {
         backup_id: manifest.backup_id,
         created_at: manifest.created_at,
@@ -1387,7 +1778,8 @@ fn validate_decrypted_zip<R: Read>(
         total_files: inventory.total_files,
         total_uncompressed_bytes: inventory.total_uncompressed_bytes,
         compatibility,
-        warnings: manifest.warnings,
+        warnings: warning_codes,
+        warning_metadata,
         can_restore,
     };
     Ok(BackupValidation {
@@ -1560,13 +1952,42 @@ fn validate_manifest_shape(
     let mut warning_codes = BTreeSet::new();
     if manifest.warnings.len() > MAX_WARNINGS
         || manifest.warnings.iter().any(|warning| {
-            !matches!(warning.as_str(), WARNING_UNMANAGED_EXTENSIONS_EXCLUDED)
-                || !warning_codes.insert(warning.as_str())
+            validate_warning(warning, action).is_err()
+                || !warning_codes.insert(warning.code.as_str())
         })
     {
         return Err(invalid_manifest_error(action));
     }
     Ok(())
+}
+
+fn validate_warning(warning: &BackupWarning, action: &str) -> Result<(), BackupErrorInfo> {
+    let valid = match warning.code.as_str() {
+        WARNING_UNMANAGED_EXTENSIONS_EXCLUDED => warning.items.is_empty(),
+        WARNING_UNMANAGED_SITE_CODE_NOT_INCLUDED => {
+            !warning.items.is_empty()
+                && warning.items.len() <= MAX_WARNING_ITEMS
+                && warning.items.iter().all(|item| {
+                    !item.is_empty()
+                        && item.len() <= MAX_WARNING_ITEM_BYTES
+                        && item.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                        })
+                })
+                && warning.items.iter().collect::<BTreeSet<_>>().len() == warning.items.len()
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(backup_error(
+            action,
+            "invalid_manifest",
+            "The backup manifest contains unsupported or unsafe warning metadata.",
+            "Create a new backup from a healthy source store without exposing source paths in warning metadata.",
+        ))
+    }
 }
 
 fn valid_source_versions(source: &BackupSourceVersions) -> bool {
@@ -1707,12 +2128,8 @@ fn validate_store_config(
         && !config.store_name.trim().is_empty()
         && config.store_name.chars().count() <= 80
         && !config.store_name.chars().any(char::is_control)
-        && !config.administrator.username.trim().is_empty()
-        && config.administrator.username.chars().count() <= 60
-        && !config.administrator.username.chars().any(char::is_control)
-        && !config.administrator.email.trim().is_empty()
-        && config.administrator.email.chars().count() <= 100
-        && !config.administrator.email.chars().any(char::is_control);
+        && valid_portable_admin_username(&config.administrator.username)
+        && valid_portable_admin_email(&config.administrator.email);
     if valid {
         Ok(())
     } else {
@@ -1723,6 +2140,51 @@ fn validate_store_config(
             "Create a new backup from a healthy source store.",
         ))
     }
+}
+
+fn valid_portable_admin_username(value: &str) -> bool {
+    let value = value.trim();
+    (3..=60).contains(&value.chars().count())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn valid_portable_admin_email(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 100
+        || value
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return false;
+    }
+    let Some((local, domain)) = value.rsplit_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || local.len() > 64
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || !local
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'_' | b'-'))
+    {
+        return false;
+    }
+    let labels = domain.split('.').collect::<Vec<_>>();
+    labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 fn evaluate_compatibility(
@@ -1769,7 +2231,7 @@ fn evaluate_compatibility(
 
 fn validate_archive_path(raw: &str, action: &str) -> Result<String, BackupErrorInfo> {
     let invalid = raw.is_empty()
-        || raw.as_bytes().len() > MAX_ARCHIVE_PATH_BYTES
+        || raw.len() > MAX_ARCHIVE_PATH_BYTES
         || raw.contains('\0')
         || raw.contains('\\')
         || raw.starts_with('/')
@@ -2081,7 +2543,7 @@ fn validate_zip64_end_records<R: Read>(
     action: &str,
 ) -> Result<(), BackupErrorInfo> {
     let record_size = read_u64(reader, action)?;
-    if record_size < 44 || record_size > 1024 * 1024 {
+    if !(44..=1024 * 1024).contains(&record_size) {
         return Err(invalid_zip_error(action));
     }
     let _version_made_by = read_u16(reader, action)?;
@@ -2439,6 +2901,167 @@ pub fn choose_backup_file(action: &str) -> Result<Option<PathBuf>, BackupErrorIn
     ))
 }
 
+pub(crate) fn default_backup_file_name(store_name: &str) -> String {
+    let mut slug = String::with_capacity(store_name.len().min(64));
+    let mut previous_separator = false;
+    for ch in store_name.trim().chars() {
+        if slug.chars().count() >= 48 {
+            break;
+        }
+        if ch.is_alphanumeric() || matches!(ch, '-' | '_') {
+            slug.push(ch);
+            previous_separator = false;
+        } else if !slug.is_empty() && !previous_separator {
+            slug.push('-');
+            previous_separator = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        slug.push_str("Store");
+    }
+    let (year, month, day, hour, minute, second) = utc_parts(now_epoch());
+    format!(
+        "CoffeePOS-{slug}-{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}.coffeepos-backup"
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn choose_backup_destination(
+    suggested_file_name: &str,
+) -> Result<Option<BackupDestinationSelection>, BackupErrorInfo> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        CommDlgExtendedError, GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
+        OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+
+    let suggested = if suggested_file_name
+        .to_ascii_lowercase()
+        .ends_with(".coffeepos-backup")
+    {
+        suggested_file_name.to_owned()
+    } else {
+        format!("{suggested_file_name}.coffeepos-backup")
+    };
+    let mut file_buffer = vec![0_u16; 32_768];
+    let suggested_utf16 = suggested.encode_utf16().collect::<Vec<_>>();
+    if suggested_utf16.len() >= file_buffer.len() {
+        return Err(backup_error(
+            "preflight",
+            "invalid_destination",
+            "The suggested backup file name is too long for the Windows file picker.",
+            "Shorten the store name and retry backup creation.",
+        ));
+    }
+    file_buffer[..suggested_utf16.len()].copy_from_slice(&suggested_utf16);
+    let filter: Vec<u16> = "CoffeePOS backup (*.coffeepos-backup)\0*.coffeepos-backup\0\0"
+        .encode_utf16()
+        .collect();
+    let default_extension: Vec<u16> = "coffeepos-backup\0".encode_utf16().collect();
+    let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.lpstrFile = file_buffer.as_mut_ptr();
+    dialog.nMaxFile = file_buffer.len() as u32;
+    dialog.lpstrDefExt = default_extension.as_ptr();
+    dialog.Flags = OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    let selected = unsafe { GetSaveFileNameW(&mut dialog) };
+    if selected == 0 {
+        let code = unsafe { CommDlgExtendedError() };
+        if code == 0 {
+            return Ok(None);
+        }
+        return Err(backup_error(
+            "preflight",
+            "save_dialog_failed",
+            "Windows could not open the CoffeePOS backup destination picker.",
+            "Retry backup creation or restart CoffeePOS Desktop.",
+        ));
+    }
+    let len = file_buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(file_buffer.len());
+    let path = PathBuf::from(String::from_utf16_lossy(&file_buffer[..len]));
+    let extension_is_valid = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.to_ascii_lowercase().ends_with(".coffeepos-backup"));
+    if !extension_is_valid {
+        return Err(backup_error(
+            "preflight",
+            "invalid_destination_extension",
+            "CoffeePOS backups must use the .coffeepos-backup extension.",
+            "Choose a destination ending in .coffeepos-backup and retry.",
+        ));
+    }
+    BackupDestinationSelection::capture(path, "preflight").map(Some)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn choose_backup_destination(
+    _suggested_file_name: &str,
+) -> Result<Option<BackupDestinationSelection>, BackupErrorInfo> {
+    Err(backup_error(
+        "preflight",
+        "unsupported_platform",
+        "Backup creation is currently qualified for Windows.",
+        "Run the Phase 7 backup flow on the supported Windows build.",
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn capture_destination_identity(
+    path: &Path,
+    action: &str,
+) -> Result<Option<BackupDestinationIdentity>, BackupErrorInfo> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let file =
+        match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(backup_error(
+                action,
+                "destination_identity_unavailable",
+                "CoffeePOS cannot inspect the selected backup destination safely.",
+                "Choose a regular local destination that CoffeePOS can inspect, then retry backup.",
+            )),
+        };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let result = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    if result == 0 {
+        return Err(backup_error(
+            action,
+            "destination_identity_unavailable",
+            "CoffeePOS cannot read the selected backup destination identity.",
+            "Choose another local destination and retry backup.",
+        ));
+    }
+    Ok(Some(BackupDestinationIdentity {
+        volume_serial_number: info.dwVolumeSerialNumber,
+        file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    }))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn capture_destination_identity(
+    _path: &Path,
+    action: &str,
+) -> Result<Option<BackupDestinationIdentity>, BackupErrorInfo> {
+    Err(backup_error(
+        action,
+        "unsupported_platform",
+        "Backup destination identity checks are currently qualified for Windows.",
+        "Run the Phase 7 backup flow on the supported Windows build.",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2510,14 +3133,15 @@ mod tests {
     }
 
     fn write_fixture(source: BackupSourceVersions, entries: &[BackupPayloadEntry]) -> Vec<u8> {
+        write_fixture_with_seed(BackupManifestSeed::fixture(source), entries)
+    }
+
+    fn write_fixture_with_seed(
+        seed: BackupManifestSeed,
+        entries: &[BackupPayloadEntry],
+    ) -> Vec<u8> {
         let mut encrypted = Vec::new();
-        write_encrypted_backup(
-            &mut encrypted,
-            PASSWORD,
-            BackupManifestSeed::fixture(source),
-            entries,
-        )
-        .unwrap();
+        write_encrypted_backup(&mut encrypted, PASSWORD, seed, entries).unwrap();
         encrypted
     }
 
@@ -2546,6 +3170,128 @@ mod tests {
         writer.write_all(bytes).unwrap();
         writer.finish().unwrap();
         output
+    }
+
+    #[test]
+    fn backup_format_portable_projection_entries_are_minimal_and_validated() {
+        let store =
+            portable_store_config_entry("Coffee & Co Café", "owner_73", "owner73@example.com")
+                .unwrap();
+        assert_eq!(store.path, STORE_CONFIG_ENTRY);
+        let BackupEntrySource::Memory(store_bytes) = store.source else {
+            panic!("portable store config must stay in memory until encryption");
+        };
+        let store_json: serde_json::Value = serde_json::from_slice(&store_bytes).unwrap();
+        assert_eq!(store_json["store_name"], "Coffee & Co Café");
+        assert_eq!(store_json["administrator"]["username"], "owner_73");
+        assert_eq!(store_json["administrator"]["email"], "owner73@example.com");
+        assert!(store_json.get("bind_host").is_none());
+        assert!(store_json.get("startup_view").is_none());
+
+        let administrator = portable_administrator_secret_entry("owner_73", ADMIN_CANARY).unwrap();
+        assert_eq!(administrator.path, ADMINISTRATOR_SECRET_ENTRY);
+        let BackupEntrySource::Memory(secret_bytes) = administrator.source else {
+            panic!("portable administrator secret must stay in zeroizing memory");
+        };
+        let secret_json: serde_json::Value = serde_json::from_slice(&secret_bytes).unwrap();
+        assert_eq!(secret_json["username"], "owner_73");
+        assert_eq!(secret_json["password"], ADMIN_CANARY);
+
+        assert!(portable_store_config_entry("Store", "x", "owner@example.com").is_err());
+        assert!(portable_store_config_entry("Store", "owner_73", "bad-email").is_err());
+        assert!(portable_administrator_secret_entry("owner_73", "").is_err());
+    }
+
+    #[test]
+    fn backup_format_structured_warning_roundtrips_without_paths() {
+        let warning = BackupWarning::unmanaged_site_code_not_included(vec![
+            "custom-theme".into(),
+            "custom-plugin".into(),
+            "custom-plugin".into(),
+        ])
+        .unwrap();
+        assert_eq!(warning.items, vec!["custom-plugin", "custom-theme"]);
+        assert!(BackupWarning::unmanaged_site_code_not_included(vec![
+            "C:\\Users\\Alice\\plugin".into()
+        ])
+        .is_err());
+
+        let mut seed = BackupManifestSeed::fixture(source_versions());
+        seed.warnings = vec![warning.clone()];
+        let encrypted = write_fixture_with_seed(seed, &valid_entries());
+        let validation = validate_bytes(&encrypted, PASSWORD).unwrap();
+        assert_eq!(
+            validation.inspection.warnings,
+            vec![WARNING_UNMANAGED_SITE_CODE_NOT_INCLUDED]
+        );
+        assert_eq!(validation.inspection.warning_metadata, vec![warning]);
+    }
+
+    #[test]
+    fn backup_format_controlled_writer_reports_progress_and_cancels() {
+        let entries = valid_entries();
+        let mut encrypted = Vec::new();
+        let cancelled = AtomicBool::new(false);
+        let mut progress = Vec::new();
+        write_encrypted_backup_with_control(
+            &mut encrypted,
+            PASSWORD,
+            BackupManifestSeed::fixture(source_versions()),
+            &entries,
+            &cancelled,
+            |update| progress.push(update),
+        )
+        .unwrap();
+        let last = progress.last().expect("archive progress must be reported");
+        assert_eq!(last.stage, BackupWriteStage::Archiving);
+        assert_eq!(last.entries_completed, entries.len() as u64);
+        assert_eq!(last.bytes_processed, last.total_bytes);
+        assert!(validate_bytes(&encrypted, PASSWORD).unwrap().valid);
+
+        let cancelled = AtomicBool::new(true);
+        let error = write_encrypted_backup_with_control(
+            Vec::new(),
+            PASSWORD,
+            BackupManifestSeed::fixture(source_versions()),
+            &entries,
+            &cancelled,
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(error.action, "archive");
+    }
+
+    #[test]
+    fn backup_format_file_snapshot_detects_change_before_streaming() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("upload.bin");
+        fs::write(&path, b"before").unwrap();
+        let file = File::open(&path).unwrap();
+        let expected = source_snapshot_from_metadata(&file.metadata().unwrap());
+        drop(file);
+        fs::write(&path, b"after-with-a-different-size").unwrap();
+
+        let mut output = Vec::new();
+        let error = copy_source_with_hash(
+            &mut output,
+            &BackupEntrySource::File(path),
+            Some(&expected),
+            None,
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "source_changed");
+    }
+
+    #[test]
+    fn backup_format_default_file_name_is_safe_and_has_required_extension() {
+        let name = default_backup_file_name(" Café / Main:Store? ");
+        assert!(name.starts_with("CoffeePOS-Café-Main-Store-"));
+        assert!(name.ends_with(".coffeepos-backup"));
+        assert!(!name.contains('/'));
+        assert!(!name.contains(':'));
+        assert!(!name.contains('?'));
     }
 
     fn build_seek_zip(entries: Vec<(&str, Vec<u8>, Option<u32>)>) -> Vec<u8> {

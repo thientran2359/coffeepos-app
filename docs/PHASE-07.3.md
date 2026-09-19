@@ -2,7 +2,7 @@
 
 Phase 7.3 biến contract 7.1 + database primitive 7.2 thành complete portable backup mà người dùng có thể tạo từ **Hệ thống → Sao lưu và khôi phục**. Operation phải giữ database, uploads và store config trong cùng một maintenance snapshot, mã hóa toàn bộ payload và chỉ báo thành công sau khi archive cuối đã validate.
 
-> **Trạng thái:** đặc tả đã chốt cho implementation Phase 7.3. Restore/cutover thuộc Phase 7.4.
+> **Trạng thái:** implemented và validated trên Windows ngày 2026-09-19. Complete encrypted backup gồm database + uploads + portable store config + administrator secret đã chạy qua native Save As/progress/cancel, validator Phase 7.1 và disposable-store smoke. Restore/cutover thuộc Phase 7.4.
 
 ## Mục tiêu
 

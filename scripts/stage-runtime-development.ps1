@@ -91,6 +91,12 @@ if (-not (Test-Path -LiteralPath (Join-Path $caddyExtract 'LICENSE'))) {
 if (-not (Test-Path -LiteralPath (Join-Path $mariaSourceRoot 'bin/mariadbd.exe'))) {
     throw 'MariaDB archive did not contain the expected winx64 directory layout.'
 }
+if (-not (Test-Path -LiteralPath (Join-Path $mariaSourceRoot 'bin/mariadb.exe'))) {
+    throw 'MariaDB archive did not contain mariadb.exe required for managed import/verification.'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $mariaSourceRoot 'bin/mariadb-dump.exe'))) {
+    throw 'MariaDB archive did not contain mariadb-dump.exe required for logical backup.'
+}
 
 if (Test-Path -LiteralPath $stageRoot) {
     Remove-Item -LiteralPath $stageRoot -Recurse -Force
@@ -119,3 +125,4 @@ Write-Host "PHP:     $(Join-Path $stageRoot $manifest.php.executable)"
 Write-Host "PHP CGI: $(Join-Path $stageRoot $manifest.php.cgi)"
 Write-Host "Caddy:   $(Join-Path $stageRoot $manifest.web_server.executable)"
 Write-Host "MariaDB: $(Join-Path $stageRoot $manifest.mariadb.server)"
+Write-Host "MariaDB dump: $(Join-Path $stageRoot $manifest.mariadb.dump)"

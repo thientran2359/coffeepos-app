@@ -1,7 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-// Phase 7.1 defines the format writer before Phase 7.2/7.3 start feeding it
-// real database/upload snapshots, so part of the writer surface is intentionally dormant here.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+mod backup;
+#[allow(dead_code)]
+mod backup_database;
+// Phase 7.1 defines the format writer before Phase 7.3 starts feeding it the
+// complete encrypted database/uploads/config snapshot.
 #[allow(dead_code)]
 mod backup_format;
 mod config;
@@ -12,6 +16,7 @@ mod provisioning;
 mod runtime;
 mod secret;
 
+use backup::{BackupOperationState, BackupResult, BackupStatus};
 use backup_format::{
     BackupCompatibilityTarget, BackupErrorInfo, BackupInspection, BackupValidation,
 };
@@ -19,12 +24,11 @@ use config::{AppConfig, StartupView, Store};
 use logs::{LogCatalog, LogErrorInfo, LogPage, SupportBundleResult};
 #[cfg(debug_assertions)]
 use provisioning::Provisioner;
-use provisioning::{
-    ProvisioningInfo, RepairApplyResult, RepairItemStatus, RepairPlan, RepairResultStatus,
-};
+use provisioning::{ProvisioningInfo, RepairApplyResult, RepairPlan};
 #[cfg(debug_assertions)]
 use provisioning::{
-    ProvisioningState, WORDPRESS_ADMIN_EMAIL, WORDPRESS_ADMIN_SECRET, WORDPRESS_ADMIN_USER,
+    ProvisioningState, RepairItemStatus, RepairResultStatus, WORDPRESS_ADMIN_EMAIL,
+    WORDPRESS_ADMIN_SECRET, WORDPRESS_ADMIN_USER,
 };
 use runtime::{HealthDiagnosticsInfo, RuntimeInfo, RuntimeManager, RuntimeState};
 use serde::{Deserialize, Serialize};
@@ -47,6 +51,7 @@ struct ShellState {
     exit_authorized: AtomicBool,
     shutdown_in_progress: AtomicBool,
     support_export_in_progress: AtomicBool,
+    backup: Mutex<BackupOperationState>,
     #[cfg(debug_assertions)]
     provisioning: Mutex<()>,
 }
@@ -99,6 +104,7 @@ struct SetupInfo {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 struct RepairInputs {
     admin_password: Option<String>,
 }
@@ -239,6 +245,11 @@ fn inspect_provisioning(
     app: &tauri::AppHandle,
     state: &ShellState,
 ) -> Result<ProvisioningInfo, String> {
+    let backup_active = state
+        .backup
+        .lock()
+        .map_err(|_| "Backup state unavailable. Restart CoffeePOS Desktop.".to_string())?
+        .active();
     let provisioning_guard = match state.provisioning.try_lock() {
         Ok(guard) => Some(guard),
         Err(TryLockError::WouldBlock) => None,
@@ -254,7 +265,7 @@ fn inspect_provisioning(
         .map_err(|error| error.to_string())?;
     let provisioner = Provisioner::from_development(&project_root, &manifest, resolved, root)
         .map_err(|error| error.to_string())?;
-    if provisioning_guard.is_some() {
+    if provisioning_guard.is_some() || backup_active {
         Ok(provisioner.inspect())
     } else {
         Ok(provisioner.installing_info())
@@ -662,6 +673,374 @@ const fn action_validate() -> &'static str {
 }
 
 #[tauri::command]
+fn get_backup_status(state: State<'_, ShellState>) -> Result<BackupStatus, BackupErrorInfo> {
+    state
+        .backup
+        .lock()
+        .map(|guard| guard.status.clone())
+        .map_err(|_| {
+            backup_command_error(
+                "status",
+                "backup_state_unavailable",
+                "CoffeePOS cannot read the current backup operation state.",
+                "Restart CoffeePOS Desktop before retrying backup.",
+            )
+        })
+}
+
+#[tauri::command]
+fn cancel_backup(
+    state: State<'_, ShellState>,
+    operation_id: String,
+) -> Result<BackupStatus, BackupErrorInfo> {
+    let guard = state.backup.lock().map_err(|_| {
+        backup_command_error(
+            "cleanup",
+            "backup_state_unavailable",
+            "CoffeePOS cannot signal the current backup operation.",
+            "Keep CoffeePOS open and retry after the current operation settles.",
+        )
+    })?;
+    guard.request_cancel(&operation_id)?;
+    Ok(guard.status.clone())
+}
+
+#[tauri::command]
+fn open_backup_folder(
+    state: State<'_, ShellState>,
+    operation_id: String,
+) -> Result<(), BackupErrorInfo> {
+    let destination = {
+        let guard = state.backup.lock().map_err(|_| {
+            backup_command_error(
+                "finalize",
+                "backup_state_unavailable",
+                "CoffeePOS cannot read the completed backup destination.",
+                "Restart CoffeePOS Desktop and open the destination manually.",
+            )
+        })?;
+        guard
+            .last_destination
+            .as_ref()
+            .filter(|(id, _)| id == &operation_id)
+            .map(|(_, path)| path.clone())
+            .ok_or_else(|| {
+                backup_command_error(
+                    "finalize",
+                    "backup_destination_unavailable",
+                    "The requested completed backup destination is no longer available in this app session.",
+                    "Open the destination manually or create another backup.",
+                )
+            })?
+    };
+    backup::open_backup_folder(&destination)
+}
+
+#[tauri::command]
+async fn create_backup(
+    app: tauri::AppHandle,
+    backup_password: String,
+) -> Result<BackupResult, BackupErrorInfo> {
+    #[cfg(debug_assertions)]
+    {
+        let backup_password = zeroize::Zeroizing::new(backup_password);
+        let state = app.state::<ShellState>();
+        let shell = with_store(&app, &state, |_| Ok(())).map_err(|_| {
+            backup_command_error(
+                "preflight",
+                "store_config_unavailable",
+                "CoffeePOS cannot read the managed store configuration for backup.",
+                "Repair the application configuration and retry backup.",
+            )
+        })?;
+        let operation_id = backup::new_operation_id()?;
+        let cancelled = {
+            let mut guard = state.backup.lock().map_err(|_| {
+                backup_command_error(
+                    "preflight",
+                    "backup_state_unavailable",
+                    "CoffeePOS cannot reserve a backup operation.",
+                    "Restart CoffeePOS Desktop before retrying backup.",
+                )
+            })?;
+            guard.begin(operation_id.clone())?
+        };
+
+        let suggested = backup_format::default_backup_file_name(&shell.config.store_name);
+        let selected = tauri::async_runtime::spawn_blocking(move || {
+            backup_format::choose_backup_destination(&suggested)
+        })
+        .await
+        .map_err(|_| {
+            backup_command_error(
+                "preflight",
+                "save_dialog_worker_failed",
+                "CoffeePOS could not complete the backup destination picker.",
+                "Retry backup creation or restart CoffeePOS Desktop.",
+            )
+        })?;
+        let destination = match selected {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                if let Ok(mut guard) = state.backup.lock() {
+                    guard.finish_cancelled(&operation_id);
+                }
+                return Ok(BackupResult {
+                    operation_id,
+                    status: "cancelled".into(),
+                });
+            }
+            Err(error) => {
+                if let Ok(mut guard) = state.backup.lock() {
+                    guard.finish_failed(&operation_id, error.clone());
+                }
+                return Err(error);
+            }
+        };
+        if cancelled.load(Ordering::Acquire) {
+            if let Ok(mut guard) = state.backup.lock() {
+                guard.finish_cancelled(&operation_id);
+            }
+            return Ok(BackupResult {
+                operation_id,
+                status: "cancelled".into(),
+            });
+        }
+
+        if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
+            let error = backup_command_error(
+                "preflight",
+                "lifecycle_busy",
+                "CoffeePOS is already completing another managed lifecycle operation.",
+                "Wait for the current operation to finish, then retry backup.",
+            );
+            if let Ok(mut guard) = state.backup.lock() {
+                guard.finish_failed(&operation_id, error.clone());
+            }
+            return Err(error);
+        }
+
+        let worker_app = app.clone();
+        let worker_operation_id = operation_id.clone();
+        let worker_cancelled = cancelled.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let state = worker_app.state::<ShellState>();
+            if let Ok(mut guard) = state.backup.lock() {
+                guard.update(backup::BackupProgress {
+                    operation_id: worker_operation_id.clone(),
+                    stage: backup::BackupStage::Preflight,
+                    processed_files: 0,
+                    estimated_files: 0,
+                    processed_bytes: 0,
+                    estimated_bytes: 0,
+                    warnings: Vec::new(),
+                });
+            }
+            let _lifecycle_guard = try_lifecycle(&state, "create a portable store backup")
+                .map_err(|error| {
+                    backup_command_error(
+                        "preflight",
+                        "lifecycle_busy",
+                        &error,
+                        "Wait for the current managed operation to finish, then retry backup.",
+                    )
+                })?;
+            let provisioning = inspect_provisioning(&worker_app, &state).map_err(|error| {
+                backup_command_error(
+                    "preflight",
+                    "provisioning_state_unavailable",
+                    &error,
+                    "Repair provisioning state before creating a portable backup.",
+                )
+            })?;
+            if provisioning.state != ProvisioningState::Ready {
+                return Err(backup_command_error(
+                    "preflight",
+                    "store_not_ready",
+                    "CoffeePOS can create a portable backup only from a fully provisioned ready store.",
+                    "Finish or repair store provisioning, then retry backup.",
+                ));
+            }
+            let admin_username = provisioning.admin_username.ok_or_else(|| {
+                backup_command_error(
+                    "preflight",
+                    "administrator_identity_unavailable",
+                    "The ready store does not expose its managed administrator identity.",
+                    "Repair provisioning metadata before retrying backup.",
+                )
+            })?;
+            let _provisioning_guard = try_provisioning(&state, "create a portable store backup")
+                .map_err(|error| {
+                    backup_command_error(
+                        "preflight",
+                        "provisioning_busy",
+                        &error,
+                        "Wait for provisioning or repair to finish, then retry backup.",
+                    )
+                })?;
+            let root = data_root(&worker_app, &state).map_err(|_| {
+                backup_command_error(
+                    "preflight",
+                    "data_root_unavailable",
+                    "CoffeePOS cannot resolve the managed data root for backup.",
+                    "Repair the application data path before retrying backup.",
+                )
+            })?;
+            let (project_root, manifest) = development_runtime_paths().map_err(|_| {
+                backup_command_error(
+                    "preflight",
+                    "runtime_artifacts_unavailable",
+                    "CoffeePOS cannot resolve the pinned managed runtime needed for backup.",
+                    "Restage the managed runtime artifacts before retrying backup.",
+                )
+            })?;
+            let target = backup_format::load_development_compatibility_target(
+                &project_root,
+                &manifest,
+                &root,
+                "create",
+            )?;
+            let context = backup::BackupCreateContext {
+                data_root: root.clone(),
+                admin_username,
+                source: target.source.clone(),
+            };
+
+            let mut runtime_guard = state.runtime.lock().map_err(|_| {
+                backup_command_error(
+                    "preflight",
+                    "runtime_state_unavailable",
+                    "CoffeePOS cannot access the managed runtime for backup.",
+                    "Restart CoffeePOS Desktop before retrying backup.",
+                )
+            })?;
+            if runtime_guard.is_none() {
+                *runtime_guard = Some(
+                    RuntimeManager::from_development(&project_root, &manifest, root.clone())
+                        .map_err(|error| {
+                            backup_command_error(
+                                "preflight",
+                                "runtime_state_unavailable",
+                                &error.message,
+                                &error.recovery,
+                            )
+                        })?,
+                );
+            }
+            let runtime = runtime_guard.as_mut().ok_or_else(|| {
+                backup_command_error(
+                    "preflight",
+                    "runtime_state_unavailable",
+                    "CoffeePOS runtime manager is unavailable for backup.",
+                    "Restart CoffeePOS Desktop before retrying backup.",
+                )
+            })?;
+            if runtime.backup_maintenance_active() {
+                backup_database::retry_database_backup_cleanup(runtime).map_err(|error| {
+                    backup_command_error(
+                        "cleanup",
+                        &error.code,
+                        &error.message,
+                        &error.recovery,
+                    )
+                })?;
+                backup::recover_interrupted_backup(&root)?;
+            }
+
+            let (destination, upload_files, upload_bytes, warnings) =
+                backup::preflight_before_quiesce(&context, &destination)?;
+            if let Ok(mut guard) = state.backup.lock() {
+                guard.update(backup::BackupProgress {
+                    operation_id: worker_operation_id.clone(),
+                    stage: backup::BackupStage::Preflight,
+                    processed_files: 0,
+                    estimated_files: upload_files.saturating_add(3),
+                    processed_bytes: 0,
+                    estimated_bytes: upload_bytes,
+                    warnings: backup::warning_codes(&warnings),
+                });
+            }
+            let progress_state = &state;
+            backup::run_backup(
+                runtime,
+                backup::BackupRunRequest {
+                    context: &context,
+                    destination: &destination,
+                    operation_id: &worker_operation_id,
+                    backup_password: backup_password.as_str(),
+                    cancelled: worker_cancelled.as_ref(),
+                    warnings,
+                },
+                |progress| {
+                    if let Ok(mut guard) = progress_state.backup.lock() {
+                        guard.update(progress);
+                    }
+                },
+            )?;
+            Ok(destination.path.clone())
+        })
+        .await;
+        state.lifecycle_requested.store(false, Ordering::Release);
+
+        match result {
+            Ok(Ok(destination)) => {
+                let warnings = state
+                    .backup
+                    .lock()
+                    .ok()
+                    .map(|guard| guard.status.warnings.clone())
+                    .unwrap_or_default();
+                if let Ok(mut guard) = state.backup.lock() {
+                    guard.finish_success(&operation_id, destination, warnings);
+                }
+                Ok(BackupResult {
+                    operation_id,
+                    status: "succeeded".into(),
+                })
+            }
+            Ok(Err(error)) if error.code == "cancelled" => {
+                if let Ok(mut guard) = state.backup.lock() {
+                    guard.finish_cancelled(&operation_id);
+                }
+                Ok(BackupResult {
+                    operation_id,
+                    status: "cancelled".into(),
+                })
+            }
+            Ok(Err(error)) => {
+                if let Ok(mut guard) = state.backup.lock() {
+                    guard.finish_failed(&operation_id, error.clone());
+                }
+                Err(error)
+            }
+            Err(_) => {
+                let error = backup_command_error(
+                    "cleanup",
+                    "backup_worker_failed",
+                    "CoffeePOS backup worker terminated unexpectedly.",
+                    "Keep CoffeePOS open, reload the application so interrupted-backup recovery can run, then inspect runtime health.",
+                );
+                if let Ok(mut guard) = state.backup.lock() {
+                    guard.finish_failed(&operation_id, error.clone());
+                }
+                Err(error)
+            }
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = app;
+        let _ = backup_password;
+        Err(backup_command_error(
+            "preflight",
+            "runtime_artifacts_unavailable",
+            "Portable backup creation is not available until managed runtime artifacts are packaged for this build.",
+            "Use the qualified Windows development build until runtime packaging is completed.",
+        ))
+    }
+}
+
+#[tauri::command]
 async fn get_log_catalog(app: tauri::AppHandle) -> Result<LogCatalog, LogErrorInfo> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<ShellState>();
@@ -800,6 +1179,28 @@ fn get_shell_info(
     app: tauri::AppHandle,
     state: State<'_, ShellState>,
 ) -> Result<ShellInfo, String> {
+    let backup_active = state
+        .backup
+        .lock()
+        .map_err(|_| "Backup state unavailable. Restart CoffeePOS Desktop.".to_string())?
+        .active();
+    // An active backup owns the runtime mutex for its full maintenance window. WebView reloads
+    // still need shell metadata so they can reconnect to get_backup_status/cancel_backup instead
+    // of blocking behind that mutex until the backup is already over.
+    let fresh_runtime = if backup_active {
+        false
+    } else {
+        state
+            .runtime
+            .lock()
+            .map_err(|_| "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string())?
+            .is_none()
+    };
+    if fresh_runtime && !backup_active {
+        let root = application_data_root(&app)?;
+        backup::recover_interrupted_backup(&root)
+            .map_err(|error| format!("{} {}", error.message, error.recovery))?;
+    }
     with_store(&app, &state, |_| Ok(()))
 }
 
@@ -809,6 +1210,7 @@ fn save_app_settings(
     state: State<'_, ShellState>,
     startup_view: StartupView,
 ) -> Result<ShellInfo, String> {
+    let _lifecycle_guard = try_lifecycle(&state, "save application settings")?;
     with_store(&app, &state, |store| store.save_startup_view(startup_view))
 }
 
@@ -1157,6 +1559,12 @@ async fn apply_repair(
             let runtime = runtime_guard
                 .as_mut()
                 .ok_or_else(|| "Runtime manager unavailable. Retry startup.".to_string())?;
+            if runtime.backup_maintenance_active() {
+                return Err(
+                    "Database backup maintenance is active. Finish or cancel the current backup cleanup before applying repair."
+                        .into(),
+                );
+            }
             let before_runtime = runtime.refresh();
             let runtime_was_running = before_runtime.state == RuntimeState::Running;
             let machine_auth_failed = matches!(
@@ -1765,6 +2173,12 @@ fn provision_wordpress(
         let runtime = runtime_guard
             .as_mut()
             .ok_or_else(|| "Runtime manager unavailable. Retry startup.".to_string())?;
+        if runtime.backup_maintenance_active() {
+            return Err(
+                "Database backup maintenance is active. Finish or cancel the current backup cleanup before provisioning CoffeePOS."
+                    .into(),
+            );
+        }
         runtime.stop().map_err(|error| error.to_string())?;
         let (resolved, runtime_root) = runtime.provisioning_context();
         let mut provisioner =
@@ -1858,6 +2272,10 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            get_backup_status,
+            create_backup,
+            cancel_backup,
+            open_backup_folder,
             inspect_backup,
             validate_backup,
             get_log_catalog,

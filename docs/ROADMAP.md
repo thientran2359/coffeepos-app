@@ -56,10 +56,11 @@ Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ng
 | 6.2 — Runtime performance and responsiveness | 🟡 Đã triển khai, chờ manual acceptance | Caddy 2.11.4 + PHP FastCGI 4 workers + OPcache; async lifecycle/status-health split; dynamic p50 134 ms, 4 parallel 144 ms vs 537 ms sequential; staged lifecycle/concurrency smoke pass |
 | 6.3 — Repair flow | 🟡 Đã triển khai, chờ manual acceptance | Hệ thống → Sửa chữa; read-only plan + stale guard; managed file/core/plugin atomic repair + crash journal; admin reset/pending machine-token recovery; DB mismatch preflight blocked trước mutation; lightweight checks pass; xem [PHASE-06.3](PHASE-06.3.md) |
 | 6.4 — Log viewer/export | ✅ Hoàn thành Windows-first | Hệ thống → Nhật ký; native 10-source allowlist + bounded paging; viewer/export fail-closed redaction; support bundle schema 1 + Windows Save As; 11 focused Rust tests + UI checks pass; xem [PHASE-06.4](PHASE-06.4.md) |
-| 7.1 — Backup format | 📘 Đã có đặc tả, chưa triển khai | Encrypted portable container + manifest/inventory/checksum + compatibility/secret policy; xem [PHASE-07.1](PHASE-07.1.md) |
-| 7.2 — Database backup | 📘 Đã có đặc tả, chưa triển khai | Managed mariadb-dump + maintenance snapshot + disposable restore verification; xem [PHASE-07.2](PHASE-07.2.md) |
-| 7.3 — Uploads/config backup | 📘 Đã có đặc tả, chưa triển khai | Complete encrypted backup + native Save As/progress + same-snapshot uploads/config; xem [PHASE-07.3](PHASE-07.3.md) |
+| 7.1 — Backup format | ✅ Hoàn thành Windows-first | Encrypted portable container + strict manifest/inventory/checksum/path/compatibility validation + native inspect/validate; focused tests pass; xem [PHASE-07.1](PHASE-07.1.md) |
+| 7.2 — Database backup | ✅ Hoàn thành Windows-first | Managed mariadb-dump + maintenance snapshot + disposable import/fingerprint verification + crash-safe child cleanup; focused tests pass; xem [PHASE-07.2](PHASE-07.2.md) |
+| 7.3 — Uploads/config backup | ✅ Hoàn thành Windows-first | Complete encrypted backup + native Save As/progress/cancel + same-snapshot uploads/config/admin secret + crash recovery/final validation; real disposable-store smoke pass; xem [PHASE-07.3](PHASE-07.3.md) |
 | 7.4 — Restore | 📘 Đã có đặc tả, chưa triển khai | Inspect + recovery snapshot + isolated staging + target secrets + cutover/rollback; xem [PHASE-07.4](PHASE-07.4.md) |
+| 7.5 — Desktop localization | 📘 Đã có đặc tả, chưa triển khai | Tiếng Việt/English; first-run language chooser + persisted Settings hot-switch + full Desktop-shell i18n; xem [PHASE-07.5](PHASE-07.5.md) |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -273,7 +274,7 @@ Trong **Hệ thống → Nhật ký**, cho phép xem diagnostic logs theo native
 
 **Hoàn thành Windows-first 2026-09-19:** native có catalog/read/export commands với 10 log source cố định, canonical containment, paging 200 dòng + byte/scan bounds, stale/mid-line cursor rejection và loại trailing line đang ghi dở. Viewer/export đều exact-redact protected DB/admin/machine/pending secrets và fail closed nếu secret file tồn tại nhưng không giải mã được; export normalize data-root/USERPROFILE case-insensitive trên Windows. Support bundle schema 1 chỉ lấy safe runtime/health/provisioning/repair projections + allowlisted log tails, giới hạn 2 MiB/source và 20 MiB uncompressed, staged temp + atomic finalize, native Save As và duplicate-export guard. UI **Hệ thống → Nhật ký** có source selector, empty/error states, refresh/load-older/export gating. Rust logs tests 11/11, cargo check/fmt và UI lint/build pass. User đã xác nhận Phase 6.4 hoàn thành trước khi chuyển sang lập đặc tả Phase 7.
 
-## Phase 7 — Backup / Restore
+## Phase 7 — Backup / Restore và Desktop localization
 
 ### Phase 7.1 — Backup format
 
@@ -294,6 +295,10 @@ Nghiệm thu database + uploads/config cùng một mốc dữ liệu: chặn wri
 Inspect/validate → pre-restore recovery backup → isolated staging → target-local secrets → migrations → staging health → atomic cutover → active health. **Done khi** restore E2E sang Windows profile khác pass và failure/crash vẫn giữ hoặc rollback được trạng thái trước đó. Xem [PHASE-07.4.md](PHASE-07.4.md).
 
 Trước thay dữ liệu active phải có backup current state đã validate. Target khôi phục phải có đúng artifact tương thích và kiểm archive trước extract. Chạy health staging ở môi trường cách ly; chỉ chuyển active khi đạt. Test restore sang profile Windows khác, failure ở từng bước thay thế và giữ bản gốc đến khi xác nhận thành công; Windows ↔ macOS chỉ được công bố sau acceptance trên cả hai target.
+
+### Phase 7.5 — Desktop localization
+
+Thêm hai locale Desktop `vi` / `en`. Fresh profile chọn language trước Welcome/setup; installed store đổi trong **Cấu hình** và hot-switch UI không restart runtime. Locale được persist như preference của target profile, không copy qua portable backup/restore và không tự đổi WordPress/POS locale. Sweep toàn bộ user-facing Desktop shell hiện có sang translation keys, gồm onboarding, Tổng quan/Cấu hình/Hệ thống, diagnostics/repair/logs, backup/restore, tray/close và actionable error copy. **Done khi** fresh + installed Windows flows cho cả hai locale pass, legacy config/recovery vẫn mở an toàn và target locale được giữ qua cross-profile restore. Xem [PHASE-07.5.md](PHASE-07.5.md).
 
 ## Phase 8 — LAN Mode
 
@@ -345,4 +350,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6** và **Phase 6.1–6.3** đã triển khai theo trạng thái ghi ở bảng trên; **Phase 6.4** đã được user xác nhận hoàn thành Windows-first. Bộ đặc tả **Phase 7.1–7.4** đã được tạo; implementation tiếp theo bắt đầu từ **Phase 7.1 — Backup format**.
+Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6** và **Phase 6.1–6.3** đã triển khai theo trạng thái ghi ở bảng trên; **Phase 6.4** đã được user xác nhận hoàn thành Windows-first. Bộ đặc tả **Phase 7.1–7.5** đã được tạo; implementation Phase 7 tiếp tục theo thứ tự dependency của các subphase và Phase 7.5 thực hiện sau restore 7.4 để sweep đầy đủ các surface Desktop hiện có.

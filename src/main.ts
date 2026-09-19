@@ -103,7 +103,7 @@ interface ProvisioningInfo {
 }
 
 type InstalledView = "home" | "settings" | "diagnostics";
-type SystemSection = "diagnostics" | "repair" | "logs";
+type SystemSection = "diagnostics" | "repair" | "logs" | "backup";
 type RepairClassification = "repairable" | "requires_input" | "blocked";
 
 interface RepairItem {
@@ -168,6 +168,37 @@ interface SupportBundleResult {
   status: "exported" | "cancelled";
   destination?: string | null;
 }
+
+interface BackupErrorInfo {
+  component: string;
+  action: string;
+  code: string;
+  message: string;
+  recovery: string;
+}
+
+interface BackupStatus {
+  operation_id: string | null;
+  stage: string;
+  processed_files: number;
+  estimated_files: number;
+  processed_bytes: number;
+  estimated_bytes: number;
+  started_at: number | null;
+  finished_at: number | null;
+  cancelled: boolean;
+  succeeded: boolean;
+  failed: boolean;
+  warnings: string[];
+  last_error: BackupErrorInfo | null;
+}
+
+interface BackupResult {
+  operation_id: string;
+  status: string;
+}
+
+type BackupView = "landing" | "password" | "progress" | "success" | "failure";
 
 type SetupStep = "welcome" | "details" | "review" | "progress" | "complete";
 
@@ -279,6 +310,32 @@ const logLoadOlder = element<HTMLButtonElement>("log-load-older");
 const logRefresh = element<HTMLButtonElement>("log-refresh");
 const logExport = element<HTMLButtonElement>("log-export");
 const logExportStatus = element("log-export-status");
+const backupCard = element("backup");
+const backupState = element("backup-state");
+const backupViews = Array.from(document.querySelectorAll<HTMLElement>("[data-backup-view]"));
+const backupLastSuccess = element("backup-last-success");
+const backupLastSuccessTime = element("backup-last-success-time");
+const backupCreate = element<HTMLButtonElement>("backup-create");
+const backupLandingStatus = element("backup-landing-status");
+const backupPasswordForm = element<HTMLFormElement>("backup-password-form");
+const backupPassword = element<HTMLInputElement>("backup-password");
+const backupPasswordConfirm = element<HTMLInputElement>("backup-password-confirm");
+const backupPasswordError = element("backup-password-error");
+const backupPasswordCancel = element<HTMLButtonElement>("backup-password-cancel");
+const backupChooseDestination = element<HTMLButtonElement>("backup-choose-destination");
+const backupProgressTitle = element("backup-progress-title");
+const backupProgressStage = element("backup-progress-stage");
+const backupProgress = element<HTMLProgressElement>("backup-progress");
+const backupProgressCount = element("backup-progress-count");
+const backupCancel = element<HTMLButtonElement>("backup-cancel");
+const backupProgressStatus = element("backup-progress-status");
+const backupOpenFolder = element<HTMLButtonElement>("backup-open-folder");
+const backupCreateAnother = element<HTMLButtonElement>("backup-create-another");
+const backupSuccessWarning = element("backup-success-warning");
+const backupSuccessStatus = element("backup-success-status");
+const backupFailureMessage = element("backup-failure-message");
+const backupFailureRecovery = element("backup-failure-recovery");
+const backupRetry = element<HTMLButtonElement>("backup-retry");
 
 let provisioningBusy = false;
 let runtimeBusy = false;
@@ -314,9 +371,15 @@ let currentLogTruncated = false;
 let currentLogRedactionCount = 0;
 let logOperation: "catalog" | "read" | "older" | null = null;
 let logExportBusy = false;
+let currentBackupStatus: BackupStatus | null = null;
+let currentBackupView: BackupView = "landing";
+let backupOperation: "create" | "cancel" | "open_folder" | null = null;
+let backupPollTimer: number | null = null;
+let backupStatusRefreshBusy = false;
 
 const LOG_PAGE_MAX_LINES = 200;
 const LOG_VIEW_MAX_LINES = 1000;
+const BACKUP_POLL_INTERVAL_MS = 750;
 
 function getLogCatalog(): Promise<LogCatalog> {
   return invoke<LogCatalog>("get_log_catalog");
@@ -343,6 +406,342 @@ function nativeErrorText(error: unknown): string {
   } catch {
     return String(error);
   }
+}
+
+function backupErrorInfo(error: unknown): BackupErrorInfo | null {
+  if (!error || typeof error !== "object") return null;
+  const value = error as Record<string, unknown>;
+  if (typeof value.message !== "string") return null;
+  return {
+    component: typeof value.component === "string" ? value.component : "backup",
+    action: typeof value.action === "string" ? value.action : "create",
+    code: typeof value.code === "string" ? value.code : "backup_failed",
+    message: value.message,
+    recovery: typeof value.recovery === "string" ? value.recovery : "",
+  };
+}
+
+function backupIsActive(status = currentBackupStatus): boolean {
+  return !!status?.operation_id && !status.cancelled && !status.succeeded && !status.failed;
+}
+
+function backupSystemBusy(): boolean {
+  return backupOperation === "create" || backupOperation === "cancel" || backupIsActive();
+}
+
+function formatBackupTimestamp(value: number | null | undefined): string {
+  if (!value || !Number.isFinite(value)) return "—";
+  const milliseconds = value < 10_000_000_000 ? value * 1000 : value;
+  const date = new Date(milliseconds);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat("vi-VN", {
+    dateStyle: "short",
+    timeStyle: "short",
+  }).format(date);
+}
+
+function formatBackupBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let amount = value;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  return `${amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
+}
+
+function backupStageLabel(stage: string): string {
+  const labels: Record<string, string> = {
+    planned: "Đang chuẩn bị sao lưu",
+    selecting_destination: "Đang chờ chọn nơi lưu",
+    preflight: "Đang kiểm tra điều kiện sao lưu",
+    quiesce: "Đang tạm dừng dịch vụ cửa hàng",
+    database: "Đang sao lưu cơ sở dữ liệu",
+    uploads: "Đang sao lưu hình ảnh tải lên",
+    archive: "Đang tạo file sao lưu mã hóa",
+    validate: "Đang kiểm tra file sao lưu",
+    finalize: "Đang hoàn tất file sao lưu",
+    cleanup: "Đang dọn dữ liệu tạm",
+    resume: "Đang khôi phục trạng thái cửa hàng",
+  };
+  return labels[stage] ?? "Đang xử lý dữ liệu cửa hàng";
+}
+
+function selectBackupView(view: BackupView, moveFocus = false): void {
+  currentBackupView = view;
+  for (const panel of backupViews) panel.hidden = panel.dataset.backupView !== view;
+  if (!moveFocus) return;
+  if (view === "password") backupPassword.focus();
+  else element<HTMLElement>("backup-title").focus();
+}
+
+function clearBackupPasswordFields(): void {
+  backupPassword.value = "";
+  backupPasswordConfirm.value = "";
+  backupPassword.removeAttribute("aria-invalid");
+  backupPasswordConfirm.removeAttribute("aria-invalid");
+  backupPasswordError.textContent = "";
+  backupPasswordError.hidden = true;
+}
+
+function setBackupControls(): void {
+  const active = backupIsActive();
+  const mutating = backupOperation === "create" || backupOperation === "cancel";
+  const eligible = currentProvisioning?.state === "ready" && !repairRouteRequired;
+  backupCard.setAttribute("aria-busy", active || mutating ? "true" : "false");
+  backupCreate.disabled = !eligible || backupSystemBusy();
+  backupPassword.disabled = mutating || active;
+  backupPasswordConfirm.disabled = mutating || active;
+  backupPasswordCancel.disabled = mutating || active;
+  backupChooseDestination.disabled = !eligible || mutating || active;
+  backupCancel.disabled = !active || backupOperation === "cancel";
+  backupOpenFolder.disabled = backupOperation === "open_folder" || !currentBackupStatus?.succeeded || !currentBackupStatus.operation_id;
+  backupCreateAnother.disabled = backupSystemBusy();
+  backupRetry.disabled = backupSystemBusy() || !eligible;
+}
+
+function syncOperationControls(): void {
+  setBackupControls();
+  setRuntimeControls(currentRuntime);
+  setHealthControls();
+  setRepairControls();
+  settingsSave.disabled = settingsBusy || backupSystemBusy();
+  renderHome();
+}
+
+function renderBackupProgress(status: BackupStatus): void {
+  const processedFiles = Math.max(0, status.processed_files ?? 0);
+  const estimatedFiles = Math.max(0, status.estimated_files ?? 0);
+  const processedBytes = Math.max(0, status.processed_bytes ?? 0);
+  const estimatedBytes = Math.max(0, status.estimated_bytes ?? 0);
+  setTextIfChanged(backupProgressStage, backupStageLabel(status.stage));
+  if (estimatedFiles > 0) {
+    backupProgress.max = estimatedFiles;
+    backupProgress.value = Math.min(processedFiles, estimatedFiles);
+    setTextIfChanged(
+      backupProgressCount,
+      `Đã xử lý ${processedFiles.toLocaleString("vi-VN")} / ${estimatedFiles.toLocaleString("vi-VN")} tệp.`,
+    );
+  } else if (estimatedBytes > 0) {
+    backupProgress.max = estimatedBytes;
+    backupProgress.value = Math.min(processedBytes, estimatedBytes);
+    setTextIfChanged(
+      backupProgressCount,
+      `Đã xử lý ${formatBackupBytes(processedBytes)} / ${formatBackupBytes(estimatedBytes)}.`,
+    );
+  } else {
+    backupProgress.max = 1;
+    backupProgress.removeAttribute("value");
+    setTextIfChanged(backupProgressCount, "Đang chờ thông tin tiến độ từ hệ thống.");
+  }
+}
+
+function renderBackupStatus(status: BackupStatus): void {
+  currentBackupStatus = status;
+  const unmanagedSiteCodeExcluded = status.warnings.some(
+    (warning) => warning === "unmanaged_site_code_not_included" || warning === "unmanaged_extensions_excluded",
+  );
+  backupSuccessWarning.hidden = !status.succeeded || !unmanagedSiteCodeExcluded;
+  const lastSuccess = status.succeeded ? status.finished_at : null;
+  backupLastSuccess.hidden = !lastSuccess;
+  if (lastSuccess) setTextIfChanged(backupLastSuccessTime, formatBackupTimestamp(lastSuccess));
+
+  if (status.succeeded) {
+    setTextIfChanged(backupState, "Đã hoàn thành");
+    setTextIfChanged(backupSuccessStatus, "");
+    selectBackupView("success");
+  } else if (status.failed) {
+    setTextIfChanged(backupState, "Có lỗi");
+    setTextIfChanged(backupFailureMessage, status.last_error?.message ?? "CoffeePOS chưa thể hoàn tất thao tác sao lưu.");
+    setTextIfChanged(backupFailureRecovery, status.last_error?.recovery ?? "");
+    selectBackupView("failure");
+  } else if (status.cancelled) {
+    setTextIfChanged(backupState, "Đã hủy");
+    setTextIfChanged(backupLandingStatus, "Đã hủy sao lưu. Không có file backup mới được hoàn tất.");
+    selectBackupView("landing");
+  } else if (backupIsActive(status)) {
+    setTextIfChanged(backupState, "Đang sao lưu");
+    setTextIfChanged(backupProgressTitle, "Đang sao lưu…");
+    setTextIfChanged(backupProgressStatus, backupOperation === "cancel" ? "Đã yêu cầu hủy. CoffeePOS đang dọn dữ liệu tạm an toàn…" : "");
+    renderBackupProgress(status);
+    selectBackupView("progress");
+  } else if (currentBackupView !== "password" || backupOperation === null) {
+    setTextIfChanged(backupState, "Sẵn sàng");
+    if (currentBackupView !== "password") selectBackupView("landing");
+  }
+  syncOperationControls();
+}
+
+function showBackupFailure(error: unknown): void {
+  const structured = backupErrorInfo(error);
+  currentBackupStatus = {
+    operation_id: currentBackupStatus?.operation_id ?? null,
+    stage: "failed",
+    processed_files: currentBackupStatus?.processed_files ?? 0,
+    estimated_files: currentBackupStatus?.estimated_files ?? 0,
+    processed_bytes: currentBackupStatus?.processed_bytes ?? 0,
+    estimated_bytes: currentBackupStatus?.estimated_bytes ?? 0,
+    started_at: currentBackupStatus?.started_at ?? null,
+    finished_at: null,
+    cancelled: false,
+    succeeded: false,
+    failed: true,
+    warnings: [],
+    last_error: structured,
+  };
+  setTextIfChanged(backupState, "Có lỗi");
+  setTextIfChanged(backupFailureMessage, structured?.message ?? nativeErrorText(error));
+  setTextIfChanged(backupFailureRecovery, structured?.recovery ?? "");
+  selectBackupView("failure", true);
+  syncOperationControls();
+}
+
+function stopBackupPolling(): void {
+  if (backupPollTimer === null) return;
+  window.clearInterval(backupPollTimer);
+  backupPollTimer = null;
+}
+
+function ensureBackupPolling(): void {
+  if (backupPollTimer !== null) return;
+  backupPollTimer = window.setInterval(() => {
+    void refreshBackupStatus();
+  }, BACKUP_POLL_INTERVAL_MS);
+}
+
+async function refreshBackupStatus(moveFocus = false): Promise<BackupStatus | null> {
+  if (!isTauri()) return null;
+  if (backupStatusRefreshBusy) return currentBackupStatus;
+  backupStatusRefreshBusy = true;
+  const wasActive = backupIsActive();
+  try {
+    const status = await invoke<BackupStatus>("get_backup_status");
+    renderBackupStatus(status);
+    if (backupIsActive(status) || backupOperation === "create" || backupOperation === "cancel") ensureBackupPolling();
+    else stopBackupPolling();
+    if (wasActive && !backupIsActive(status) && backupOperation === null) void refreshRuntime();
+    if (moveFocus) element<HTMLElement>("backup-title").focus();
+    return status;
+  } catch (error) {
+    if (backupSystemBusy()) {
+      setTextIfChanged(backupProgressStatus, "Không thể cập nhật tiến độ tạm thời. CoffeePOS vẫn giữ thao tác sao lưu hiện tại.");
+      ensureBackupPolling();
+      return currentBackupStatus;
+    }
+    stopBackupPolling();
+    if (currentSystemSection === "backup") showBackupFailure(error);
+    return null;
+  } finally {
+    backupStatusRefreshBusy = false;
+  }
+}
+
+function validateBackupPassword(): string | null {
+  backupPasswordError.hidden = true;
+  backupPasswordError.textContent = "";
+  backupPassword.removeAttribute("aria-invalid");
+  backupPasswordConfirm.removeAttribute("aria-invalid");
+  const password = backupPassword.value;
+  if (password.length === 0) {
+    backupPassword.setAttribute("aria-invalid", "true");
+    setTextIfChanged(backupPasswordError, "Nhập mật khẩu cho bản sao lưu.");
+    backupPasswordError.hidden = false;
+    backupPassword.focus();
+    return null;
+  }
+  if (password !== backupPasswordConfirm.value) {
+    backupPasswordConfirm.setAttribute("aria-invalid", "true");
+    setTextIfChanged(backupPasswordError, "Hai lần nhập mật khẩu chưa khớp.");
+    backupPasswordError.hidden = false;
+    backupPasswordConfirm.focus();
+    return null;
+  }
+  return password;
+}
+
+async function createBackup(): Promise<void> {
+  if (!isTauri() || backupSystemBusy() || currentProvisioning?.state !== "ready" || repairRouteRequired) return;
+  let password = validateBackupPassword();
+  if (password === null) return;
+  backupOperation = "create";
+  setTextIfChanged(backupState, "Đang chuẩn bị");
+  setTextIfChanged(backupProgressStage, "Chọn nơi lưu trong cửa sổ Save As của Windows.");
+  setTextIfChanged(backupProgressCount, "CoffeePOS sẽ bắt đầu snapshot sau khi bạn chọn vị trí lưu.");
+  setTextIfChanged(backupProgressStatus, "");
+  backupProgress.max = 1;
+  backupProgress.removeAttribute("value");
+  selectBackupView("progress");
+  syncOperationControls();
+  ensureBackupPolling();
+  const createPromise = invoke<BackupResult>("create_backup", { backupPassword: password });
+  clearBackupPasswordFields();
+  password = "";
+  try {
+    await createPromise;
+    const status = await refreshBackupStatus();
+    if (status && !status.operation_id && !status.succeeded && !status.failed) {
+      setTextIfChanged(backupState, "Sẵn sàng");
+      setTextIfChanged(backupLandingStatus, "");
+      selectBackupView("landing");
+    }
+  } catch (error) {
+    const status = await refreshBackupStatus();
+    if (!status?.failed && !backupIsActive(status)) showBackupFailure(error);
+  } finally {
+    backupOperation = null;
+    const status = await refreshBackupStatus();
+    if (!backupIsActive(status)) {
+      stopBackupPolling();
+      await refreshRuntime();
+    }
+    syncOperationControls();
+  }
+}
+
+async function cancelBackup(): Promise<void> {
+  const operationId = currentBackupStatus?.operation_id;
+  if (!isTauri() || !operationId || !backupIsActive() || backupOperation) return;
+  backupOperation = "cancel";
+  setTextIfChanged(backupProgressStatus, "Đang yêu cầu hủy sao lưu…");
+  syncOperationControls();
+  try {
+    await invoke<unknown>("cancel_backup", { operationId });
+    ensureBackupPolling();
+  } catch (error) {
+    setTextIfChanged(backupProgressStatus, backupErrorInfo(error)?.message ?? nativeErrorText(error));
+  } finally {
+    backupOperation = null;
+    await refreshBackupStatus();
+    syncOperationControls();
+  }
+}
+
+async function openBackupFolder(): Promise<void> {
+  const operationId = currentBackupStatus?.operation_id;
+  if (!isTauri() || !operationId || !currentBackupStatus?.succeeded || backupOperation) return;
+  backupOperation = "open_folder";
+  setTextIfChanged(backupSuccessStatus, "Đang mở thư mục…");
+  setBackupControls();
+  try {
+    await invoke<void>("open_backup_folder", { operationId });
+    setTextIfChanged(backupSuccessStatus, "Đã yêu cầu Windows mở thư mục chứa file sao lưu.");
+  } catch (error) {
+    setTextIfChanged(backupSuccessStatus, backupErrorInfo(error)?.message ?? nativeErrorText(error));
+  } finally {
+    backupOperation = null;
+    setBackupControls();
+  }
+}
+
+function showBackupPasswordStep(): void {
+  if (backupSystemBusy() || currentProvisioning?.state !== "ready" || repairRouteRequired) return;
+  clearBackupPasswordFields();
+  setTextIfChanged(backupLandingStatus, "");
+  setTextIfChanged(backupState, "Sẵn sàng");
+  selectBackupView("password", true);
+  setBackupControls();
 }
 
 function structuredErrorText(error: RuntimeErrorInfo): string {
@@ -418,6 +817,7 @@ function setHealthControls(): void {
     || bootstrapBusy
     || runtimeBusy
     || provisioningBusy
+    || backupSystemBusy()
     || currentProvisioning?.state !== "ready"
     || currentRuntime?.state !== "running";
 }
@@ -477,7 +877,7 @@ function renderHealthCommandError(error: unknown): void {
 }
 
 async function refreshHealthDiagnostics(): Promise<void> {
-  if (!isTauri() || diagnosticsBusy || repairOperation || bootstrapBusy || runtimeBusy || provisioningBusy || currentProvisioning?.state !== "ready") return;
+  if (!isTauri() || diagnosticsBusy || repairOperation || bootstrapBusy || runtimeBusy || provisioningBusy || backupSystemBusy() || currentProvisioning?.state !== "ready") return;
   diagnosticsBusy = true;
   setRuntimeControls(currentRuntime);
   renderHealthChecking();
@@ -504,7 +904,7 @@ function repairClassificationLabel(classification: RepairClassification): string
 }
 
 function setRepairControls(): void {
-  const busy = repairOperation !== null || bootstrapBusy || provisioningBusy || runtimeBusy || diagnosticsBusy;
+  const busy = repairOperation !== null || bootstrapBusy || provisioningBusy || runtimeBusy || diagnosticsBusy || backupSystemBusy();
   const eligible = currentProvisioning?.state === "ready" || currentProvisioning?.state === "needs_repair";
   repairInspect.disabled = busy || !eligible;
   repairApply.disabled = busy || !eligible || !currentRepairPlan?.can_apply;
@@ -611,7 +1011,7 @@ function renderRepairCommandError(error: unknown): void {
 }
 
 async function refreshRepairPlan(): Promise<void> {
-  if (!isTauri() || repairOperation || bootstrapBusy || provisioningBusy || runtimeBusy || diagnosticsBusy) return;
+  if (!isTauri() || repairOperation || bootstrapBusy || provisioningBusy || runtimeBusy || diagnosticsBusy || backupSystemBusy()) return;
   if (currentProvisioning?.state !== "ready" && currentProvisioning?.state !== "needs_repair") return;
   repairOperation = "inspect";
   currentRepairPlan = null;
@@ -707,7 +1107,7 @@ function renderRepairResult(result: RepairApplyResult, previousPlan: RepairPlan)
 
 async function applyRepair(): Promise<void> {
   const plan = currentRepairPlan;
-  if (!isTauri() || !plan || !plan.can_apply || repairOperation || bootstrapBusy || provisioningBusy || runtimeBusy || diagnosticsBusy) return;
+  if (!isTauri() || !plan || !plan.can_apply || repairOperation || bootstrapBusy || provisioningBusy || runtimeBusy || diagnosticsBusy || backupSystemBusy()) return;
   const needsAdminPassword = plan.items.some((item) => item.input_kind === "admin_password");
   let adminPassword: string | null = null;
   if (needsAdminPassword) {
@@ -1154,10 +1554,15 @@ function viewHeading(view: InstalledView): HTMLElement {
 function systemSectionHeading(section: SystemSection): HTMLElement {
   if (section === "repair") return element<HTMLElement>("repair-title");
   if (section === "logs") return element<HTMLElement>("logs-title");
+  if (section === "backup") return element<HTMLElement>("backup-title");
   return element<HTMLElement>("health-diagnostics-title");
 }
 
 function selectSystemSection(section: SystemSection, moveFocus = true, refresh = true): void {
+  if (currentSystemSection === "backup" && section !== "backup" && currentBackupView === "password") {
+    clearBackupPasswordFields();
+    selectBackupView("landing");
+  }
   currentSystemSection = section;
   for (const button of systemSectionButtons) {
     button.setAttribute("aria-current", button.dataset.systemSection === section ? "page" : "false");
@@ -1168,6 +1573,7 @@ function selectSystemSection(section: SystemSection, moveFocus = true, refresh =
   if (moveFocus) systemSectionHeading(section).focus();
   if (!refresh || currentView !== "diagnostics") return;
   if (section === "logs") void refreshLogCatalogAndTail(true);
+  else if (section === "backup") void refreshBackupStatus();
   else if (section === "diagnostics") void refreshHealthDiagnostics();
 }
 
@@ -1186,6 +1592,7 @@ function selectInstalledView(view: InstalledView, moveFocus = true): void {
   if (moveFocus) viewHeading(view).focus();
   if (view === "diagnostics" && moveFocus) {
     if (currentSystemSection === "logs") void refreshLogCatalogAndTail(true);
+    else if (currentSystemSection === "backup") void refreshBackupStatus();
     else if (currentSystemSection === "diagnostics") void refreshHealthDiagnostics();
   }
 }
@@ -1252,6 +1659,14 @@ function renderHome(): void {
     setTextIfChanged(homeStatus, "Cửa hàng cần được kiểm tra an toàn");
     setTextIfChanged(homeDetail, "Mở Hệ thống → Sửa chữa để xem repair plan. CoffeePOS sẽ giữ nguyên dữ liệu khi ownership hoặc authority chưa đủ.");
     setTextIfChanged(homeDiagnostics, "Mở Sửa chữa");
+    setHomeAction(null);
+    return;
+  }
+  if (backupSystemBusy()) {
+    setTextIfChanged(homeState, "Đang sao lưu");
+    setTextIfChanged(homeStatus, "CoffeePOS đang sao lưu cửa hàng");
+    setTextIfChanged(homeDetail, "POS tạm dừng trong khi CoffeePOS tạo snapshot nhất quán. Mở Sao lưu và khôi phục để xem tiến độ.");
+    setTextIfChanged(homeDiagnostics, "Mở Sao lưu");
     setHomeAction(null);
     return;
   }
@@ -1382,7 +1797,7 @@ function renderHome(): void {
 }
 
 function setRuntimeControls(info: RuntimeInfo | null): void {
-  if (provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation !== null || repairRouteRequired || !info) {
+  if (provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation !== null || backupSystemBusy() || repairRouteRequired || !info) {
     runtimeStart.disabled = true;
     runtimeStop.disabled = true;
     runtimeRestart.disabled = true;
@@ -1545,6 +1960,7 @@ async function renderProvisioningWithRepairRouting(
   }
   renderProvisioning(info, commandError);
   setRepairControls();
+  setBackupControls();
 }
 
 async function refreshProvisioning(commandError?: string): Promise<boolean> {
@@ -1560,7 +1976,7 @@ async function refreshProvisioning(commandError?: string): Promise<boolean> {
 }
 
 async function refreshRuntime(): Promise<void> {
-  if (runtimeRefreshBusy) return;
+  if (runtimeRefreshBusy || backupSystemBusy()) return;
   runtimeRefreshBusy = true;
   try {
     runtimeLoadError = null;
@@ -1577,7 +1993,7 @@ async function refreshRuntime(): Promise<void> {
 }
 
 async function refreshRuntimeMaintenance(): Promise<void> {
-  if (runtimeMaintenanceBusy || runtimeBusy || provisioningBusy || diagnosticsBusy || repairOperation) return;
+  if (runtimeMaintenanceBusy || runtimeBusy || provisioningBusy || diagnosticsBusy || repairOperation || backupSystemBusy()) return;
   runtimeMaintenanceBusy = true;
   try {
     renderRuntime(await invoke<RuntimeInfo>("refresh_runtime_maintenance"));
@@ -1589,7 +2005,7 @@ async function refreshRuntimeMaintenance(): Promise<void> {
 }
 
 async function provision(): Promise<void> {
-  if (provisioningBusy || runtimeBusy) return;
+  if (provisioningBusy || runtimeBusy || backupSystemBusy()) return;
   provisioningBusy = true;
   selectSetupStep("progress", true);
   const installingInfo: ProvisioningInfo = currentProvisioning ?? {
@@ -1640,7 +2056,7 @@ async function copyAdminPassword(status: HTMLElement, button: HTMLButtonElement)
 }
 
 async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restart_runtime" | "retry_runtime_health"): Promise<void> {
-  if (provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation || repairRouteRequired || currentProvisioning?.state !== "ready") return;
+  if (provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation || backupSystemBusy() || repairRouteRequired || currentProvisioning?.state !== "ready") return;
   runtimeBusy = true;
   runtimeTransition = command === "stop_runtime" ? "stopping" : command === "retry_runtime_health" ? "checking" : "starting";
   if (currentProvisioning) renderProvisioning(currentProvisioning);
@@ -1686,7 +2102,7 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
 }
 
 async function runHomeAction(): Promise<void> {
-  if (homeAction.disabled || provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation || posOpenBusy) return;
+  if (homeAction.disabled || provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation || backupSystemBusy() || posOpenBusy) return;
   if (homeActionKind === "start") {
     await runtimeAction("start_runtime");
   } else if (homeActionKind === "retry_health") {
@@ -1701,7 +2117,7 @@ async function runHomeAction(): Promise<void> {
 }
 
 async function saveAppSettings(): Promise<void> {
-  if (settingsBusy) return;
+  if (settingsBusy || backupSystemBusy()) return;
   settingsBusy = true;
   settingsSave.disabled = true;
   setTextIfChanged(settingsSaveStatus, "Đang lưu…");
@@ -1713,12 +2129,12 @@ async function saveAppSettings(): Promise<void> {
     setTextIfChanged(settingsSaveStatus, nativeErrorText(error));
   } finally {
     settingsBusy = false;
-    settingsSave.disabled = false;
+    settingsSave.disabled = backupSystemBusy();
   }
 }
 
 async function openManagedWordPress(): Promise<void> {
-  if (provisioningBusy || runtimeBusy || repairOperation || repairRouteRequired || openWordPress.disabled) return;
+  if (provisioningBusy || runtimeBusy || repairOperation || backupSystemBusy() || repairRouteRequired || openWordPress.disabled) return;
   openWordPress.disabled = true;
   openWordPressStatus.textContent = "Đang mở WordPress bằng địa chỉ runtime hiện tại…";
   try {
@@ -1733,7 +2149,7 @@ async function openManagedWordPress(): Promise<void> {
 }
 
 async function openPos(): Promise<void> {
-  if (provisioningBusy || runtimeBusy || repairOperation || repairRouteRequired || posOpenBusy || currentProvisioning?.state !== "ready") return;
+  if (provisioningBusy || runtimeBusy || repairOperation || backupSystemBusy() || repairRouteRequired || posOpenBusy || currentProvisioning?.state !== "ready") return;
   posOpenBusy = true;
   renderHome();
   setTextIfChanged(homeOpenStatus, "Đang yêu cầu mở POS trong trình duyệt…");
@@ -1778,14 +2194,18 @@ async function bootstrap(): Promise<void> {
       return;
     }
 
+    // Reconnect to an active native backup before provisioning/runtime reads. The backup worker
+    // intentionally owns those lifecycle locks for the full maintenance window, while status and
+    // cancellation stay lock-independent so a WebView reload can resume progress immediately.
+    await refreshBackupStatus();
     const provisioningLoaded = await refreshProvisioning();
     if (!provisioningLoaded) return;
     if (currentProvisioning?.state === "not_installed") {
       await refreshSetupInfo();
       if (currentProvisioning) renderProvisioning(currentProvisioning);
     }
-    await refreshRuntime();
-    if (currentProvisioning?.state === "ready" && !repairRouteRequired && currentRuntime?.state === "stopped") {
+    if (!backupSystemBusy()) await refreshRuntime();
+    if (currentProvisioning?.state === "ready" && !repairRouteRequired && !backupSystemBusy() && currentRuntime?.state === "stopped") {
       await runtimeAction("start_runtime");
     }
   } finally {
@@ -1793,6 +2213,7 @@ async function bootstrap(): Promise<void> {
     if (!retry.hidden) retry.disabled = false;
     if (currentView === "diagnostics") {
       if (currentSystemSection === "logs") void refreshLogCatalogAndTail(true);
+      else if (currentSystemSection === "backup") void refreshBackupStatus();
       else if (currentSystemSection === "diagnostics") void refreshHealthDiagnostics();
     }
   }
@@ -1833,7 +2254,10 @@ for (const button of systemSectionButtons) {
 }
 
 homeAction.addEventListener("click", () => void runHomeAction());
-homeDiagnostics.addEventListener("click", () => selectInstalledView("diagnostics", true));
+homeDiagnostics.addEventListener("click", () => {
+  selectInstalledView("diagnostics", true);
+  if (backupSystemBusy()) selectSystemSection("backup", true, true);
+});
 runtimeStart.addEventListener("click", () => void runtimeAction("start_runtime"));
 runtimeStop.addEventListener("click", () => void runtimeAction("stop_runtime"));
 runtimeRestart.addEventListener("click", () => void runtimeAction("restart_runtime"));
@@ -1857,6 +2281,21 @@ logSource.addEventListener("change", () => {
 logRefresh.addEventListener("click", () => void refreshLogCatalogAndTail(true));
 logLoadOlder.addEventListener("click", () => void loadOlderLogLines());
 logExport.addEventListener("click", () => void exportLogsSupportBundle());
+backupCreate.addEventListener("click", () => showBackupPasswordStep());
+backupCreateAnother.addEventListener("click", () => showBackupPasswordStep());
+backupRetry.addEventListener("click", () => showBackupPasswordStep());
+backupPasswordCancel.addEventListener("click", () => {
+  clearBackupPasswordFields();
+  setTextIfChanged(backupState, "Sẵn sàng");
+  selectBackupView("landing", true);
+  setBackupControls();
+});
+backupPasswordForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void createBackup();
+});
+backupCancel.addEventListener("click", () => void cancelBackup());
+backupOpenFolder.addEventListener("click", () => void openBackupFolder());
 openWordPress.addEventListener("click", () => void openManagedWordPress());
 
 setupForm.addEventListener("submit", async (event) => {
@@ -1888,13 +2327,13 @@ setupForm.addEventListener("submit", async (event) => {
 });
 
 window.setInterval(() => {
-  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !provisioningBusy && !runtimeBusy && !diagnosticsBusy && !repairOperation) {
+  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !provisioningBusy && !runtimeBusy && !diagnosticsBusy && !repairOperation && !backupSystemBusy()) {
     void refreshRuntime();
   }
 }, 2000);
 
 window.setInterval(() => {
-  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !repairOperation) {
+  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !repairOperation && !backupSystemBusy()) {
     void refreshRuntimeMaintenance();
   }
 }, 5000);

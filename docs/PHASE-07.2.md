@@ -2,7 +2,7 @@
 
 Phase 7.2 tạo primitive logical backup cho MariaDB của managed CoffeePOS store. Database phải được dump bằng tool đã pin từ runtime artifact, trong một maintenance window không còn POS request/cron writer, và dump phải có thể import vào database test để chứng minh không chỉ tạo ra một file SQL “có vẻ hợp lệ”.
 
-> **Trạng thái:** đặc tả đã chốt cho implementation Phase 7.2. Phase này tạo database artifact + snapshot lifecycle primitive; complete encrypted backup thuộc Phase 7.3.
+> **Trạng thái:** implemented và validated trên Windows ngày 2026-09-19. Phase này tạo database artifact + snapshot lifecycle primitive; complete encrypted backup thuộc Phase 7.3.
 
 ## Mục tiêu
 
@@ -309,6 +309,14 @@ Không chạy failure test trên store vận hành thật.
 - Online zero-downtime backup.
 - Scheduled backup.
 - Production runtime bundling: Phase 9.1.
+
+## Implementation status — 2026-09-19
+
+- Runtime manifest schema 3 pin `mariadb-dump.exe` + `mariadb.exe` import/verification tool dưới managed MariaDB artifact; resolver reject missing/path escape.
+- Native database backup session quiesce runtime, giữ Web/PHP/cron stopped, chạy MariaDB-only trên dynamic loopback port, dùng existing Job containment/readiness/cleanup và restore `runtime_was_running` khi lease cleanup.
+- WordPress DB secret chỉ được decrypt trong native memory; MariaDB client/dump dùng private `--defaults-extra-file` nằm trong current-user-only Windows DACL staging. Password không đi qua argv, `MYSQL_PWD`, log hoặc IPC.
+- Logical dump được hash SHA-256 + size, sau đó import bằng pinned client vào disposable MariaDB; table/trigger set và WordPress/WooCommerce/CoffeePOS baseline được so sánh trước khi snapshot được xem là verified.
+- Focused unit tests, manifest resolver tests, real MariaDB dump/import sentinel test và disposable provisioned-store Running/Stopped smoke đều pass; failure-path smoke gồm duplicate-backup/start/restart guard, pre-maintenance cancel và protected DB credential sai.
 
 ## Definition of Done
 

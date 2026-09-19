@@ -6,6 +6,10 @@
   "permissions": [
     "allow-inspect-backup",
     "allow-validate-backup",
+    "allow-get-backup-status",
+    "allow-create-backup",
+    "allow-cancel-backup",
+    "allow-open-backup-folder",
     "allow-get-log-catalog",
     "allow-read-log-page",
     "allow-export-support-bundle",

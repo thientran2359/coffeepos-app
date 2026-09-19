@@ -3,6 +3,10 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "inspect_backup",
             "validate_backup",
+            "get_backup_status",
+            "create_backup",
+            "cancel_backup",
+            "open_backup_folder",
             "get_log_catalog",
             "read_log_page",
             "export_support_bundle",
