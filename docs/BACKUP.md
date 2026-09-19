@@ -1,11 +1,20 @@
 # Backup / restore — hợp đồng Phase 7.x
 
-Chưa triển khai. Roadmap chia backup/restore thành Phase 7.1–7.4; xem [ROADMAP.md](ROADMAP.md). Backup portable gồm logical database dump, uploads, cấu hình cần phục hồi và metadata exact component/schema versions, checksums. Không bundle PHP/MariaDB binaries hoặc WordPress core trong backup dữ liệu.
+Phase 7 được tách thành bốn milestone độc lập:
 
-Restore phải validate archive paths (chặn traversal/symlinks thoát root), checksums và compatibility trước khi thay dữ liệu. Dừng runtime, backup current state, restore vào staging, chạy explicit migrations, health check, rồi chuyển active store. Thất bại giữ khả năng phục hồi trạng thái trước; downgrade schema chỉ khi có đường rollback đã kiểm chứng.
+- [Phase 7.1 — Backup format](PHASE-07.1.md): encrypted portable container, manifest/inventory/checksum, compatibility và secret portability.
+- [Phase 7.2 — Database backup](PHASE-07.2.md): logical MariaDB dump bằng exact managed tool, maintenance snapshot và restore-to-disposable verification.
+- [Phase 7.3 — Uploads/config backup](PHASE-07.3.md): complete encrypted user backup gồm database + uploads + portable store config + administrator secret trong cùng snapshot.
+- [Phase 7.4 — Restore](PHASE-07.4.md): inspect → recovery backup → isolated staging → migrations/health → cutover → rollback/crash recovery.
 
-Credential không xuất plaintext tùy tiện trong backup. Chính sách encryption/key recovery phải chốt trước implementation. Copy live MariaDB datadir không được coi là backup portable Windows ↔ macOS.
+## Contract chung
 
-Phase 7 dùng dump/import tools từ development artifact đã pin/verify; Phase 9.1 mới bundle production. Snapshot database và uploads/config phải nhất quán: chặn writers/request/jobs trong thời gian tạo backup hoặc chứng minh cơ chế tương đương. Archive chỉ được đánh dấu hoàn tất khi tất cả thành phần đã validate.
+Portable backup là **store-data backup**, không phải image của runtime. Không bundle PHP/Caddy/MariaDB binaries, WordPress core, managed plugin code hoặc live MariaDB datadir.
 
-Portable restore cần tái tạo secrets/config cho profile đích; không coi copy DPAPI blob của profile cũ là giải pháp chuyển máy. Test restore sang profile Windows khác trước; cross-platform restore chỉ được công bố khi có acceptance cả Windows lẫn macOS. Bản current-state backup đã validate phải tồn tại trước khi chuyển active store; lỗi staging/migration/health không được làm mất bản gốc.
+User backup schema 1 dùng encrypted container; DPAPI blob của source profile không được copy sang backup. Target restore tạo lại database credential, WordPress salts và machine token rồi protect bằng secret store của target profile. Administrator password được mang theo chỉ bên trong encrypted payload để giữ flow đăng nhập/Copy admin password sau cross-profile restore.
+
+Database + uploads/config phải thuộc cùng một maintenance snapshot: Caddy/PHP/cron không ghi trong khoảng từ database dump tới khi uploads/config đã được capture. Initial Phase 7 chấp nhận POS downtime ngắn để ưu tiên consistency.
+
+Restore luôn validate encryption, archive schema, path safety, checksums và compatibility trước mutation. Existing store phải có validated pre-restore recovery snapshot; restored store được dựng trong isolated staging, dùng target-local credentials, pass health rồi mới cutover. Interrupted cutover dùng restore journal để resume/rollback; daily startup bị gate cho tới khi transaction được reconcile.
+
+Phase 7 dùng dump/import tools từ development artifact đã pin/verify; Phase 9.1 mới bundle production. Windows cross-profile restore là acceptance của 7.4. Windows ↔ macOS chỉ được công bố sau khi có acceptance trên cả hai target.

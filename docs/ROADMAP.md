@@ -55,7 +55,11 @@ Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ng
 | 6.1 — Health diagnostics | 🟡 Đã triển khai, chờ manual acceptance | Live authenticated Database/PHP probes; WordPress readiness + CoffeePOS machine-health mapping cho đủ 5 component; recovery action rõ ràng; lightweight checks pass |
 | 6.2 — Runtime performance and responsiveness | 🟡 Đã triển khai, chờ manual acceptance | Caddy 2.11.4 + PHP FastCGI 4 workers + OPcache; async lifecycle/status-health split; dynamic p50 134 ms, 4 parallel 144 ms vs 537 ms sequential; staged lifecycle/concurrency smoke pass |
 | 6.3 — Repair flow | 🟡 Đã triển khai, chờ manual acceptance | Hệ thống → Sửa chữa; read-only plan + stale guard; managed file/core/plugin atomic repair + crash journal; admin reset/pending machine-token recovery; DB mismatch preflight blocked trước mutation; lightweight checks pass; xem [PHASE-06.3](PHASE-06.3.md) |
-| 6.4 — Log viewer/export | 🟡 Đã triển khai, chờ manual acceptance | Hệ thống → Nhật ký; native 10-source allowlist + bounded paging; viewer/export fail-closed redaction; support bundle schema 1 + Windows Save As; 11 focused Rust tests + UI checks pass; xem [PHASE-06.4](PHASE-06.4.md) |
+| 6.4 — Log viewer/export | ✅ Hoàn thành Windows-first | Hệ thống → Nhật ký; native 10-source allowlist + bounded paging; viewer/export fail-closed redaction; support bundle schema 1 + Windows Save As; 11 focused Rust tests + UI checks pass; xem [PHASE-06.4](PHASE-06.4.md) |
+| 7.1 — Backup format | 📘 Đã có đặc tả, chưa triển khai | Encrypted portable container + manifest/inventory/checksum + compatibility/secret policy; xem [PHASE-07.1](PHASE-07.1.md) |
+| 7.2 — Database backup | 📘 Đã có đặc tả, chưa triển khai | Managed mariadb-dump + maintenance snapshot + disposable restore verification; xem [PHASE-07.2](PHASE-07.2.md) |
+| 7.3 — Uploads/config backup | 📘 Đã có đặc tả, chưa triển khai | Complete encrypted backup + native Save As/progress + same-snapshot uploads/config; xem [PHASE-07.3](PHASE-07.3.md) |
+| 7.4 — Restore | 📘 Đã có đặc tả, chưa triển khai | Inspect + recovery snapshot + isolated staging + target secrets + cutover/rollback; xem [PHASE-07.4](PHASE-07.4.md) |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -267,27 +271,27 @@ Trong **Hệ thống**, repair các file/config/plugin managed bị thiếu ho�
 
 Trong **Hệ thống → Nhật ký**, cho phép xem diagnostic logs theo native allowlist + bounded paging và export support bundle schema-versioned. Viewer chỉ nhận text đã redact; export chạy redaction lần nữa, normalize path, giới hạn kích thước và chỉ lấy safe diagnostic projections + allowlisted logs. Không copy database/uploads/site/config/protected secrets và không start/stop runtime chỉ để export. **Done khi** fixture secret canary không xuất hiện trong viewer/bundle, support bundle đủ evidence cho runtime/provisioning/repair failure phổ biến và manual Windows smoke pass cho running/stopped/cancel/error. Xem [PHASE-06.4.md](PHASE-06.4.md).
 
-**Đã triển khai 2026-09-19, chờ manual acceptance:** native có catalog/read/export commands với 10 log source cố định, canonical containment, paging 200 dòng + byte/scan bounds, stale/mid-line cursor rejection và loại trailing line đang ghi dở. Viewer/export đều exact-redact protected DB/admin/machine/pending secrets và fail closed nếu secret file tồn tại nhưng không giải mã được; export normalize data-root/USERPROFILE case-insensitive trên Windows. Support bundle schema 1 chỉ lấy safe runtime/health/provisioning/repair projections + allowlisted log tails, giới hạn 2 MiB/source và 20 MiB uncompressed, staged temp + atomic finalize, native Save As và duplicate-export guard. UI **Hệ thống → Nhật ký** có source selector, empty/error states, refresh/load-older/export gating. Rust logs tests 11/11, cargo check/fmt và UI lint/build pass; Save As/export trên app Windows thật còn chờ manual smoke.
+**Hoàn thành Windows-first 2026-09-19:** native có catalog/read/export commands với 10 log source cố định, canonical containment, paging 200 dòng + byte/scan bounds, stale/mid-line cursor rejection và loại trailing line đang ghi dở. Viewer/export đều exact-redact protected DB/admin/machine/pending secrets và fail closed nếu secret file tồn tại nhưng không giải mã được; export normalize data-root/USERPROFILE case-insensitive trên Windows. Support bundle schema 1 chỉ lấy safe runtime/health/provisioning/repair projections + allowlisted log tails, giới hạn 2 MiB/source và 20 MiB uncompressed, staged temp + atomic finalize, native Save As và duplicate-export guard. UI **Hệ thống → Nhật ký** có source selector, empty/error states, refresh/load-older/export gating. Rust logs tests 11/11, cargo check/fmt và UI lint/build pass. User đã xác nhận Phase 6.4 hoàn thành trước khi chuyển sang lập đặc tả Phase 7.
 
 ## Phase 7 — Backup / Restore
 
 ### Phase 7.1 — Backup format
 
-Chốt archive schema, component/schema versions, checksums và compatibility rules. **Done khi** backup có thể validate độc lập trước restore.
+Chốt encrypted archive schema, component/schema versions, checksums, path rules, portable-secret policy và compatibility rules. **Done khi** backup có thể decrypt/inspect/validate độc lập trước restore và corrupt/incompatible archive fail closed. Xem [PHASE-07.1.md](PHASE-07.1.md).
 
 ### Phase 7.2 — Database backup
 
-Logical dump MariaDB bằng tool từ development artifact đã pin/verify; production bundle được hoàn thiện ở 9.1. **Done khi** dump/restore database test tái tạo dữ liệu mong đợi và chọn được chính sách snapshot nhất quán với uploads/config.
+Logical dump MariaDB bằng exact tool từ development artifact đã pin/verify; production bundle được hoàn thiện ở 9.1. Runtime vào maintenance, giữ Caddy/PHP/cron stopped và dùng database-only process cho dump. **Done khi** dump/import trên disposable database tái tạo dữ liệu mong đợi, credential không lộ và failure/cancel không để orphan. Xem [PHASE-07.2.md](PHASE-07.2.md).
 
 ### Phase 7.3 — Uploads và CoffeePOS config backup
 
-Đưa uploads và cấu hình cần thiết vào backup, không bundle runtime/core binaries. **Done khi** backup chứa đủ store data ngoài database.
+Đưa uploads, portable store config và administrator secret vào encrypted backup, không bundle runtime/core binaries/raw DPAPI config. **Done khi** backup hoàn chỉnh giữ database + uploads/config trong cùng maintenance snapshot, final archive validate pass và runtime quay về previous state. Xem [PHASE-07.3.md](PHASE-07.3.md).
 
 Nghiệm thu database + uploads/config cùng một mốc dữ liệu: chặn writer/request/jobs trong thời gian snapshot hoặc dùng cơ chế nhất quán đã chứng minh. Backup không được báo thành công nếu chỉ hoàn tất một phần. Chốt encryption/key recovery và cách tái tạo secrets cho profile/máy đích; copy blob DPAPI của máy cũ không đủ cho portable restore.
 
 ### Phase 7.4 — Restore
 
-Validate → stop runtime → stage restore → migrations → health → activate. **Done khi** restore E2E pass và restore failure vẫn giữ được trạng thái trước đó.
+Inspect/validate → pre-restore recovery backup → isolated staging → target-local secrets → migrations → staging health → atomic cutover → active health. **Done khi** restore E2E sang Windows profile khác pass và failure/crash vẫn giữ hoặc rollback được trạng thái trước đó. Xem [PHASE-07.4.md](PHASE-07.4.md).
 
 Trước thay dữ liệu active phải có backup current state đã validate. Target khôi phục phải có đúng artifact tương thích và kiểm archive trước extract. Chạy health staging ở môi trường cách ly; chỉ chuyển active khi đạt. Test restore sang profile Windows khác, failure ở từng bước thay thế và giữ bản gốc đến khi xác nhận thành công; Windows ↔ macOS chỉ được công bố sau acceptance trên cả hai target.
 
@@ -341,4 +345,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6** và **Phase 6.1–6.4** đã triển khai, pass focused/lightweight automated validation và còn manual acceptance theo Definition of Done tương ứng. Sau khi smoke-test các mốc này, roadmap tiếp tục với **Phase 7.1 — Backup format**.
+Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6** và **Phase 6.1–6.3** đã triển khai theo trạng thái ghi ở bảng trên; **Phase 6.4** đã được user xác nhận hoàn thành Windows-first. Bộ đặc tả **Phase 7.1–7.4** đã được tạo; implementation tiếp theo bắt đầu từ **Phase 7.1 — Backup format**.
