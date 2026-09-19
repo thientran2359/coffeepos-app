@@ -54,7 +54,8 @@ Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ng
 | 5.6 — Minimize, exit and shutdown | 🟡 Đã triển khai, chờ manual acceptance | Minimize giữ runtime; Close/Alt+F4 native confirm; bounded PHP request drain + MariaDB shutdown; Windows Job Object crash containment; lightweight checks pass |
 | 6.1 — Health diagnostics | 🟡 Đã triển khai, chờ manual acceptance | Live authenticated Database/PHP probes; WordPress readiness + CoffeePOS machine-health mapping cho đủ 5 component; recovery action rõ ràng; lightweight checks pass |
 | 6.2 — Runtime performance and responsiveness | 🟡 Đã triển khai, chờ manual acceptance | Caddy 2.11.4 + PHP FastCGI 4 workers + OPcache; async lifecycle/status-health split; dynamic p50 134 ms, 4 parallel 144 ms vs 537 ms sequential; staged lifecycle/concurrency smoke pass |
-| 6.3+ | ⏳ Chưa bắt đầu | Repair flow rồi Log viewer/export |
+| 6.3 — Repair flow | 🟡 Đã triển khai, chờ manual acceptance | Hệ thống → Sửa chữa; read-only plan + stale guard; managed file/core/plugin atomic repair + crash journal; admin reset/pending machine-token recovery; DB mismatch preflight blocked trước mutation; lightweight checks pass; xem [PHASE-06.3](PHASE-06.3.md) |
+| 6.4 — Log viewer/export | ⏳ Chưa bắt đầu | Xem/export diagnostic logs đã redact secret |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -234,11 +235,11 @@ Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3–5.6, Phase 6.1 heal
 
 ### Phase 5.6 — Thu nhỏ, thoát và shutdown
 
-**Scope:** thu nhỏ giữ runtime; thoát dừng runtime với thông báo ảnh hưởng POS/thiết bị và lựa chọn ở lại. Đóng tab trình duyệt không dừng server. Tray/background mode ngoài scope trừ khi có contract riêng.
+**Scope:** Minimize ẩn shell xuống system tray và giữ runtime. Close/Alt+F4 mở shutdown confirmation như trước; tray mở lại shell hoặc thực hiện **Thoát hoàn toàn**. Close/Alt+F4 và tray exit dùng chung bounded shutdown contract. Đóng tab trình duyệt không dừng server.
 
 **Done khi:** close/cancel/minimize/relaunch và crash không để process mồ côi; bounded drain/timeout được kiểm với request/đơn test đang chạy; kiểm recovery không tạo đơn trùng. Không hứa graceful shutdown khi mất điện/kill; không coi đóng app là chốt ca hoặc tự thay payment state.
 
-**Đã triển khai 2026-09-18, chờ manual acceptance:** Tauri intercept CloseRequested của main window và prevent-close trước khi shutdown. Khi runtime active, native Windows confirmation cho lựa chọn ở lại hoặc dừng và thoát; lifecycle/provisioning đang bận thì close bị từ chối. Runtime stop bật admission marker trước stopping; PHP chạy qua runtime router wrapper do Desktop quản lý nên request mới nhận 503 trước WordPress/CoffeePOS, còn drain probe nội bộ được phép đi qua để chờ pre-existing queue tối đa 3 giây. Sau đó giữ graceful MariaDB SHUTDOWN + forced-cleanup fallback hiện có; stale marker được clear trước mỗi PHP start. App chỉ exit khi không còn managed child; stop error còn child giữ cửa sổ mở. Minimize không có stop hook nên runtime tiếp tục chạy. Windows kill-on-close Job Object tiếp tục bảo đảm child không mồ côi khi desktop crash/kill, nhưng không được mô tả là graceful. Lightweight UI/Rust checks và staged PHP admission-gate check đều pass; native close/minimize, in-flight POS order/request, relaunch và crash containment để manual smoke-test. Xem [PHASE-05.6.md](PHASE-05.6.md).
+**Đã triển khai 2026-09-19, chờ manual acceptance:** Tauri tạo tray icon từ icon ứng dụng; Minimize phát hiện trạng thái minimized rồi hide cửa sổ và reset minimized state trong lúc ẩn, nên runtime/POS tiếp tục chạy nền. Close/Alt+F4 prevent-close rồi gọi cùng `request_full_exit` với tray **Thoát hoàn toàn**: lifecycle mutex + confirmation hiện có → bounded drain → graceful MariaDB SHUTDOWN + forced-cleanup fallback; app chỉ exit khi không còn managed child, còn cancel/busy/failure giữ hoặc mở lại shell. Tray có **Mở CoffeePOS** và double-click trái để restore. Windows kill-on-close Job Object tiếp tục bảo đảm child không mồ côi khi desktop crash/kill, nhưng không được mô tả là graceful. Cargo check/diff/fmt pass; native Win32 smoke xác nhận Minimize hide-to-tray giữ process alive. Close/Alt+F4 dialog, tray menu và in-flight request để user manual smoke-test trước khi chốt acceptance. Xem [PHASE-05.6.md](PHASE-05.6.md).
 
 **Gate cuối Phase 5:** người thử hoàn tất setup → login/bán hàng → đóng/mở → dùng store cũ → xử lý lỗi thông thường mà không dùng terminal/wp-admin. Ghi rõ người thử, mức hỗ trợ, bằng chứng và giới hạn; developer acceptance không tự thay user usability test.
 
@@ -256,11 +257,11 @@ Hiển thị component health cho Database / PHP / WordPress / WooCommerce / Cof
 
 Đưa lifecycle/readiness/health I/O khỏi Tauri UI thread; tách fast runtime status khỏi application-health probe; bật OPcache; thay serving path POS single-process `php -S` bằng local web-serving/FastCGI worker model có concurrency và được Desktop pin/quản lý. Giữ loopback/dynamic port, machine-health, provisioning, Phase 5.6 admission/drain và Windows Job Object semantics. **Done khi** app vẫn phản hồi trong start/restart, status poll không tự tạo WordPress request, OPcache active, benchmark cùng máy cải thiện rõ ràng và 4 request động concurrent không còn serialize gần tuyến tính. Xem [PHASE-06.2.md](PHASE-06.2.md).
 
-**Đã triển khai 2026-09-19, chờ manual acceptance:** runtime Windows development pin Caddy 2.11.4 và dùng một PHP 8.4.25 NTS `php-cgi` master với 4 FastCGI workers; Caddy serve static/uploads, proxy PHP trên private loopback và graceful-drain qua admin loopback động. OPcache được bật và readiness HTTP kiểm trực tiếp web SAPI. `get_runtime_info` trở thành fast process/cached-health snapshot; cron + application health chuyển sang maintenance riêng; lifecycle/diagnostics/close shutdown blocking work chạy ngoài Tauri UI thread. Disposable-store lifecycle smoke pass, không orphan. Warm dynamic benchmark đạt p50 134 ms/p95 140 ms; 4 sequential 537 ms vs 4 parallel 144 ms; static p50 <1 ms/p95 1 ms. Automated checks pass; resize/navigation/repaint trong lúc auto-start/restart để người dùng manual smoke-test. Xem [PHASE-06.2.md](PHASE-06.2.md).
+**Đã triển khai 2026-09-19, chờ manual acceptance:** runtime Windows development pin Caddy 2.11.4 và dùng một PHP 8.4.25 NTS `php-cgi` master với 4 FastCGI workers; Caddy serve static/uploads, proxy PHP trên private loopback và graceful-drain qua admin loopback động. OPcache được bật và readiness HTTP kiểm trực tiếp web SAPI. `get_runtime_info` trở thành fast process/cached-health snapshot; cron + application health chuyển sang maintenance riêng; lifecycle/diagnostics/close shutdown blocking work chạy ngoài Tauri UI thread. Disposable-store lifecycle smoke pass, không orphan. Các final warm benchmark đạt p50 138–144 ms/p95 151–314 ms; 4 WordPress request tuần tự 562–738 ms vs 4 song song 145–189 ms; probe PHP cố định 250 ms/request đạt 1.03–1.07 s tuần tự vs 258–269 ms song song; static p50 0–1 ms/p95 1 ms. Automated checks pass; resize/navigation/repaint trong lúc auto-start/restart để người dùng manual smoke-test. Xem [PHASE-06.2.md](PHASE-06.2.md).
 
 ### Phase 6.3 — Repair flow
 
-Trong **Hệ thống**, repair các file/config/plugin managed bị thiếu hoặc hỏng trong phạm vi có thể khôi phục an toàn. **Done khi** repair không xóa dữ liệu store và từ chối tự động sửa trường hợp ownership/compatibility không rõ.
+Trong **Hệ thống**, repair các file/config/plugin managed bị thiếu hoặc hỏng trong phạm vi có thể khôi phục an toàn. Flow inspect trước, lập repair plan có `repairable / requires_input / blocked`, rồi mới apply dưới lifecycle guard. Same-version managed file/plugin repair dùng pinned artifact + staging/atomic swap/verify; credential repair chỉ chạy khi có authority/transaction rõ; partial WordPress hoặc ownership/compatibility không đủ phải preserve và từ chối tự động sửa. **Done khi** repair không xóa dữ liệu store, giữ uploads/business data/secrets, recover được sau interruption và final provisioning + health verify pass. Xem [PHASE-06.3.md](PHASE-06.3.md).
 
 ### Phase 6.4 — Log viewer/export
 
@@ -338,4 +339,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6**, **Phase 6.1** và **Phase 6.2** đã triển khai, pass focused/lightweight automated validation và còn manual acceptance. Mốc implementation tiếp theo sau acceptance này là **Phase 6.3 — Repair flow**.
+Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6** và **Phase 6.1–6.3** đã triển khai, pass focused/lightweight automated validation và còn manual acceptance. Sau khi smoke-test các mốc này, roadmap tiếp tục với **Phase 6.4 — Log viewer/export**.

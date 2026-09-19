@@ -10,17 +10,24 @@ mod secret;
 use config::{AppConfig, StartupView, Store};
 #[cfg(debug_assertions)]
 use provisioning::Provisioner;
-use provisioning::ProvisioningInfo;
+use provisioning::{
+    ProvisioningInfo, RepairApplyResult, RepairItemStatus, RepairPlan, RepairResultStatus,
+};
 #[cfg(debug_assertions)]
 use provisioning::{
     ProvisioningState, WORDPRESS_ADMIN_EMAIL, WORDPRESS_ADMIN_SECRET, WORDPRESS_ADMIN_USER,
 };
 use runtime::{HealthDiagnosticsInfo, RuntimeInfo, RuntimeManager, RuntimeState};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, State};
+
+const TRAY_OPEN_ID: &str = "tray-open";
+const TRAY_EXIT_ID: &str = "tray-exit";
 
 #[derive(Default)]
 struct ShellState {
@@ -65,6 +72,12 @@ struct SetupInfo {
     admin_email: String,
     password_configured: bool,
     editable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepairInputs {
+    admin_password: Option<String>,
 }
 
 #[cfg(debug_assertions)]
@@ -274,6 +287,22 @@ fn try_lifecycle<'a>(state: &'a ShellState, operation: &str) -> Result<MutexGuar
     }
 }
 
+#[cfg(debug_assertions)]
+fn try_provisioning<'a>(
+    state: &'a ShellState,
+    operation: &str,
+) -> Result<MutexGuard<'a, ()>, String> {
+    match state.provisioning.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(TryLockError::WouldBlock) => Err(format!(
+            "Provisioning is busy while trying to {operation}. Wait for the current install/repair operation to finish, then retry."
+        )),
+        Err(TryLockError::Poisoned(_)) => Err(
+            "Provisioning state unavailable. Restart CoffeePOS Desktop before retrying.".into(),
+        ),
+    }
+}
+
 async fn run_runtime_blocking<T, F>(
     app: tauri::AppHandle,
     lifecycle_operation: &'static str,
@@ -283,13 +312,14 @@ where
     T: Send + 'static,
     F: FnOnce(&mut RuntimeManager) -> Result<T, runtime::RuntimeErrorInfo> + Send + 'static,
 {
-    let state = app.state::<ShellState>();
-    if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
-        return Err(format!(
-            "Runtime lifecycle is busy while trying to {lifecycle_operation}. Wait for the current operation to finish, then retry."
-        ));
+    {
+        let state = app.state::<ShellState>();
+        if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
+            return Err(format!(
+                "Runtime lifecycle is busy while trying to {lifecycle_operation}. Wait for the current operation to finish, then retry."
+            ));
+        }
     }
-    drop(state);
 
     let worker_app = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -353,6 +383,132 @@ fn show_shutdown_notice(title: &str, message: &str, error: bool) {
 
 #[cfg(not(windows))]
 fn show_shutdown_notice(_title: &str, _message: &str, _error: bool) {}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+fn request_full_exit(app: tauri::AppHandle) {
+    let state = app.state::<ShellState>();
+    if state.exit_authorized.load(Ordering::Acquire) {
+        return;
+    }
+    if state.shutdown_in_progress.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
+        state.shutdown_in_progress.store(false, Ordering::Release);
+        show_main_window(&app);
+        show_shutdown_notice(
+            "CoffeePOS đang bận",
+            "CoffeePOS đang hoàn tất một thao tác hệ thống. Hãy thử thoát lại sau khi thao tác hiện tại kết thúc.",
+            false,
+        );
+        return;
+    }
+
+    let lifecycle_guard = match state.lifecycle.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) => {
+            state.lifecycle_requested.store(false, Ordering::Release);
+            state.shutdown_in_progress.store(false, Ordering::Release);
+            show_main_window(&app);
+            show_shutdown_notice(
+                "CoffeePOS đang bận",
+                "CoffeePOS đang hoàn tất cài đặt hoặc thay đổi trạng thái hệ thống. Hãy chờ thao tác hiện tại kết thúc rồi thử thoát lại.",
+                false,
+            );
+            return;
+        }
+        Err(TryLockError::Poisoned(_)) => {
+            state.lifecycle_requested.store(false, Ordering::Release);
+            state.shutdown_in_progress.store(false, Ordering::Release);
+            show_main_window(&app);
+            show_shutdown_notice(
+                "Không thể thoát an toàn",
+                "Trạng thái vòng đời runtime không còn khả dụng. Hãy giữ ứng dụng mở và kiểm tra Chẩn đoán trước khi thử lại.",
+                true,
+            );
+            return;
+        }
+    };
+
+    let runtime_guard = match state.runtime.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) => {
+            state.lifecycle_requested.store(false, Ordering::Release);
+            state.shutdown_in_progress.store(false, Ordering::Release);
+            show_main_window(&app);
+            show_shutdown_notice(
+                "CoffeePOS đang bận",
+                "CoffeePOS đang cập nhật trạng thái hệ thống. Hãy thử thoát lại sau khi thao tác hiện tại kết thúc.",
+                false,
+            );
+            return;
+        }
+        Err(TryLockError::Poisoned(_)) => {
+            state.lifecycle_requested.store(false, Ordering::Release);
+            state.shutdown_in_progress.store(false, Ordering::Release);
+            show_main_window(&app);
+            show_shutdown_notice(
+                "Không thể thoát an toàn",
+                "Không thể đọc trạng thái runtime để dừng cửa hàng an toàn. Hãy giữ ứng dụng mở và thử lại.",
+                true,
+            );
+            return;
+        }
+    };
+
+    if let Some(runtime) = runtime_guard.as_ref() {
+        if runtime.requires_exit_confirmation() && !confirm_runtime_exit() {
+            drop(runtime_guard);
+            drop(lifecycle_guard);
+            state.lifecycle_requested.store(false, Ordering::Release);
+            state.shutdown_in_progress.store(false, Ordering::Release);
+            return;
+        }
+    }
+    drop(runtime_guard);
+    drop(lifecycle_guard);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<ShellState>();
+        let result = (|| -> Result<(), String> {
+            let _lifecycle_guard = try_lifecycle(&state, "stop the runtime for exit")?;
+            let mut runtime_guard = state
+                .runtime
+                .lock()
+                .map_err(|_| "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string())?;
+            if let Some(runtime) = runtime_guard.as_mut() {
+                if let Err(error) = runtime.stop() {
+                    if runtime.requires_exit_confirmation() {
+                        return Err(format!(
+                            "CoffeePOS chưa dừng hoàn toàn nên ứng dụng vẫn mở để tránh bỏ lại tiến trình.\n\n{error}"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                state.exit_authorized.store(true, Ordering::Release);
+                app.exit(0);
+            }
+            Err(message) => {
+                state.lifecycle_requested.store(false, Ordering::Release);
+                state.shutdown_in_progress.store(false, Ordering::Release);
+                show_main_window(&app);
+                show_shutdown_notice("Chưa thể dừng cửa hàng", &message, true);
+            }
+        }
+    });
+}
 
 #[tauri::command]
 fn get_shell_info(
@@ -592,6 +748,509 @@ async fn get_health_diagnostics(app: tauri::AppHandle) -> Result<HealthDiagnosti
         Ok(runtime.health_diagnostics())
     })
     .await
+}
+
+#[cfg(debug_assertions)]
+fn validate_repair_admin_password_input(password: &str) -> Result<(), String> {
+    let count = password.chars().count();
+    if !(12..=128).contains(&count) || password.chars().any(char::is_control) {
+        return Err(
+            "Administrator password must contain 12–128 characters without control characters."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn diagnostics_all_healthy(info: &HealthDiagnosticsInfo) -> bool {
+    use runtime::ComponentHealthState;
+    [
+        &info.database,
+        &info.php,
+        &info.wordpress,
+        &info.woocommerce,
+        &info.coffeepos,
+    ]
+    .into_iter()
+    .all(|component| component.state == ComponentHealthState::Healthy)
+}
+
+#[tauri::command]
+async fn get_repair_plan(app: tauri::AppHandle) -> Result<RepairPlan, String> {
+    #[cfg(debug_assertions)]
+    {
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<ShellState>();
+            let _lifecycle_guard = try_lifecycle(&state, "inspect the repair plan")?;
+            let _provisioning_guard = try_provisioning(&state, "inspect the repair plan")?;
+            let root = data_root(&app, &state)?;
+            let (project_root, manifest) = development_runtime_paths()?;
+            let mut runtime_guard = state
+                .runtime
+                .lock()
+                .map_err(|_| "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string())?;
+            if runtime_guard.is_none() {
+                *runtime_guard = Some(
+                    RuntimeManager::from_development(&project_root, &manifest, root.clone())
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            let runtime = runtime_guard
+                .as_mut()
+                .ok_or_else(|| "Runtime manager unavailable. Retry startup.".to_string())?;
+            let runtime_info = runtime.refresh();
+            let runtime_was_running = runtime_info.state == RuntimeState::Running;
+            let machine_auth_failed = matches!(
+                runtime_info.coffeepos_health.failure_kind,
+                Some(runtime::CoffeePosHealthFailureKind::Authentication)
+            );
+            let (resolved, runtime_root) = runtime.provisioning_context();
+            drop(runtime_guard);
+            let provisioner =
+                Provisioner::from_development(&project_root, &manifest, resolved, runtime_root)
+                    .map_err(|error| error.to_string())?;
+            Ok(provisioner.repair_plan(runtime_was_running, machine_auth_failed))
+        })
+        .await
+        .map_err(|error| format!("Repair-plan worker failed: {error}."))?
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = app;
+        Err("Repair is currently qualified only for the Windows development build until runtime resources are packaged.".into())
+    }
+}
+
+#[tauri::command]
+async fn apply_repair(
+    app: tauri::AppHandle,
+    plan_id: String,
+    inputs: Option<RepairInputs>,
+) -> Result<RepairApplyResult, String> {
+    #[cfg(debug_assertions)]
+    {
+        {
+            let state = app.state::<ShellState>();
+            if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
+                return Err(
+                    "Runtime lifecycle is busy. Wait for the current operation to finish, then retry repair."
+                        .into(),
+                );
+            }
+        }
+        let admin_password = inputs.and_then(|value| value.admin_password);
+        let worker_app = app.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let state = worker_app.state::<ShellState>();
+            let _lifecycle_guard = try_lifecycle(&state, "apply the repair plan")?;
+            let _provisioning_guard = try_provisioning(&state, "apply the repair plan")?;
+            let root = data_root(&worker_app, &state)?;
+            let shell = with_store(&worker_app, &state, |_| Ok(()))?;
+            let store_name = shell.config.store_name.clone();
+            let admin_username = shell
+                .config
+                .setup_admin_username
+                .clone()
+                .unwrap_or_else(|| WORDPRESS_ADMIN_USER.into());
+            let admin_email = shell
+                .config
+                .setup_admin_email
+                .clone()
+                .unwrap_or_else(|| WORDPRESS_ADMIN_EMAIL.into());
+            let (project_root, manifest) = development_runtime_paths()?;
+            let mut runtime_guard = state
+                .runtime
+                .lock()
+                .map_err(|_| "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string())?;
+            if runtime_guard.is_none() {
+                *runtime_guard = Some(
+                    RuntimeManager::from_development(&project_root, &manifest, root.clone())
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            let runtime = runtime_guard
+                .as_mut()
+                .ok_or_else(|| "Runtime manager unavailable. Retry startup.".to_string())?;
+            let before_runtime = runtime.refresh();
+            let runtime_was_running = before_runtime.state == RuntimeState::Running;
+            let machine_auth_failed = matches!(
+                before_runtime.coffeepos_health.failure_kind,
+                Some(runtime::CoffeePosHealthFailureKind::Authentication)
+            );
+            let (resolved, runtime_root) = runtime.provisioning_context();
+            let mut provisioner =
+                Provisioner::from_development(&project_root, &manifest, resolved, runtime_root)
+                    .map_err(|error| error.to_string())?;
+            provisioner
+                .configure_initial_admin(&admin_username, &admin_email)
+                .map_err(|error| error.to_string())?;
+            let current_plan = provisioner.repair_plan(runtime_was_running, machine_auth_failed);
+            if current_plan.plan_id != plan_id {
+                let error = runtime::RuntimeErrorInfo {
+                    component: "repair".into(),
+                    operation: "apply plan".into(),
+                    message: "The store changed after this repair plan was inspected.".into(),
+                    recovery: "Inspect the repair plan again before applying any changes.".into(),
+                };
+                return Ok(RepairApplyResult {
+                    plan_id,
+                    status: RepairResultStatus::Stale,
+                    items: Vec::new(),
+                    provisioning_info: provisioner.inspect(),
+                    health_diagnostics: None,
+                    last_error: Some(error),
+                });
+            }
+            if !current_plan.can_apply {
+                return Err(
+                    "This repair plan contains no safe automatic action. Review the blocked items instead of applying it."
+                        .into(),
+                );
+            }
+            if current_plan.items.len() == 1
+                && current_plan.items[0].id == "repair_transaction"
+            {
+                if runtime.refresh().state == RuntimeState::Running {
+                    runtime.stop().map_err(|error| error.to_string())?;
+                }
+                let recovered = provisioner
+                    .recover_interrupted_repair(&current_plan.plan_id)
+                    .map_err(|error| error.to_string())?;
+                return Ok(RepairApplyResult {
+                    plan_id: current_plan.plan_id,
+                    status: RepairResultStatus::Partial,
+                    items: vec![recovered],
+                    provisioning_info: provisioner.inspect(),
+                    health_diagnostics: None,
+                    last_error: None,
+                });
+            }
+            let requires_admin_password = current_plan
+                .items
+                .iter()
+                .any(|item| item.input_kind.as_deref() == Some("admin_password"));
+            if requires_admin_password {
+                let password = admin_password.as_deref().ok_or_else(|| {
+                    "Enter a replacement administrator password before applying this repair."
+                        .to_string()
+                })?;
+                validate_repair_admin_password_input(password)?;
+            }
+
+            let live_database_port = if runtime_was_running {
+                match before_runtime.database_port {
+                    Some(port) => Some(port),
+                    None => {
+                        let error = runtime::RuntimeErrorInfo {
+                            component: "database".into(),
+                            operation: "verify repair database credentials".into(),
+                            message: "The running runtime has no managed MariaDB port for credential verification.".into(),
+                            recovery: "Restart the runtime and inspect the repair plan again. Repair mutation has not started.".into(),
+                        };
+                        return Ok(RepairApplyResult {
+                            plan_id: current_plan.plan_id,
+                            status: RepairResultStatus::Partial,
+                            items: vec![provisioning::RepairItemResult {
+                                id: "database_credentials".into(),
+                                status: RepairItemStatus::Blocked,
+                                message: error.message.clone(),
+                            }],
+                            provisioning_info: provisioner.inspect(),
+                            health_diagnostics: None,
+                            last_error: Some(error),
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+            if let Err(error) =
+                provisioner.verify_database_credentials_for_repair(live_database_port)
+            {
+                return Ok(RepairApplyResult {
+                    plan_id: current_plan.plan_id,
+                    status: RepairResultStatus::Partial,
+                    items: vec![provisioning::RepairItemResult {
+                        id: "database_credentials".into(),
+                        status: RepairItemStatus::Blocked,
+                        message: error.message.clone(),
+                    }],
+                    provisioning_info: provisioner.inspect(),
+                    health_diagnostics: None,
+                    last_error: Some(error),
+                });
+            }
+
+            let needs_offline = current_plan.items.iter().any(|item| {
+                item.requires_runtime_stop
+                    && matches!(
+                        item.classification,
+                        provisioning::RepairClassification::Repairable
+                            | provisioning::RepairClassification::RequiresInput
+                    )
+            });
+            if needs_offline {
+                runtime.stop().map_err(|error| error.to_string())?;
+            }
+            if let Err(error) = provisioner.begin_repair(&current_plan) {
+                if runtime_was_running && runtime.refresh().state != RuntimeState::Running {
+                    let _ = runtime.start();
+                }
+                return Err(error.to_string());
+            }
+            if needs_offline {
+                if let Err(error) =
+                    provisioner.mark_repair_runtime_stopped(&current_plan.plan_id)
+                {
+                    if runtime_was_running && runtime.refresh().state != RuntimeState::Running {
+                        let _ = runtime.start();
+                    }
+                    return Ok(RepairApplyResult {
+                        plan_id: current_plan.plan_id,
+                        status: RepairResultStatus::Partial,
+                        items: Vec::new(),
+                        provisioning_info: provisioner.inspect(),
+                        health_diagnostics: None,
+                        last_error: Some(error),
+                    });
+                }
+            }
+
+            let mut item_results = match provisioner.apply_offline_repairs(&current_plan) {
+                Ok(results) => results,
+                Err(error) => {
+                    let failure = match provisioner.rollback_pending_plugin_repairs() {
+                        Ok(()) => error,
+                        Err(rollback_error) => runtime::RuntimeErrorInfo {
+                            component: "repair".into(),
+                            operation: "rollback partial offline repair".into(),
+                            message: format!(
+                                "Offline repair failed ({}), and a pending plugin rollback also failed: {}",
+                                error.message, rollback_error.message
+                            ),
+                            recovery: "The runtime remains stopped. Preserve config/repair.json plus all repair staging/backup evidence and reconcile the managed plugin trees explicitly before starting the store.".into(),
+                        },
+                    };
+                    return Ok(RepairApplyResult {
+                        plan_id: current_plan.plan_id,
+                        status: RepairResultStatus::Partial,
+                        items: Vec::new(),
+                        provisioning_info: provisioner.inspect(),
+                        health_diagnostics: None,
+                        last_error: Some(runtime::RuntimeErrorInfo {
+                            recovery: format!(
+                                "{} The runtime remains stopped because repair did not reach online verification.",
+                                failure.recovery
+                            ),
+                            ..failure
+                        }),
+                    });
+                }
+            };
+
+            let repaired_woocommerce = item_results.iter().any(|item| {
+                item.id == "woocommerce_plugin" && item.status == RepairItemStatus::Repaired
+            });
+            let repaired_coffeepos = item_results.iter().any(|item| {
+                item.id == "coffeepos_plugin" && item.status == RepairItemStatus::Repaired
+            });
+            let has_online_item = current_plan.items.iter().any(|item| {
+                matches!(
+                    item.id.as_str(),
+                    "wordpress_admin_password" | "machine_token_pending"
+                ) && item.classification != provisioning::RepairClassification::Blocked
+            });
+            let has_repaired_offline = item_results
+                .iter()
+                .any(|item| item.status == RepairItemStatus::Repaired);
+            let has_blocked = current_plan.items.iter().any(|item| {
+                item.classification == provisioning::RepairClassification::Blocked
+            });
+            let needs_online_verification = has_online_item || has_repaired_offline;
+
+            let mut health_diagnostics = None;
+            let mut failure: Option<runtime::RuntimeErrorInfo> = None;
+            if needs_online_verification {
+                let runtime_info = match runtime.start() {
+                    Ok(info) => Some(info),
+                    Err(error) => {
+                        failure = Some(error);
+                        None
+                    }
+                };
+                if let Some(runtime_info) = runtime_info.as_ref() {
+                    if failure.is_none() && (repaired_woocommerce || repaired_coffeepos) {
+                        match provisioner.verify_repaired_plugins(
+                            runtime_info,
+                            &store_name,
+                            repaired_woocommerce,
+                            repaired_coffeepos,
+                        ) {
+                            Ok(()) => {}
+                            Err(verifier_error) => {
+                                match runtime.stop() {
+                                    Ok(_) => {
+                                        if let Err(rollback_error) = provisioner.rollback_repaired_plugins(
+                                            repaired_woocommerce,
+                                            repaired_coffeepos,
+                                        ) {
+                                            failure = Some(runtime::RuntimeErrorInfo {
+                                                component: "repair".into(),
+                                                operation: "rollback repaired plugins".into(),
+                                                message: format!(
+                                                    "Plugin verification failed ({}), and rollback also failed: {}",
+                                                    verifier_error.message, rollback_error.message
+                                                ),
+                                                recovery: "Preserve config/repair.json plus all repair staging/backup directories. Do not start another repair until the plugin trees are reconciled explicitly.".into(),
+                                            });
+                                        } else {
+                                            failure = Some(verifier_error);
+                                        }
+                                    }
+                                    Err(stop_error) => {
+                                        failure = Some(runtime::RuntimeErrorInfo {
+                                            component: "repair".into(),
+                                            operation: "prepare plugin rollback".into(),
+                                            message: format!(
+                                                "Plugin verification failed ({}), but the runtime could not be stopped safely for rollback: {}",
+                                                verifier_error.message, stop_error.message
+                                            ),
+                                            recovery: "The pre-repair plugin backup is preserved. Stop the managed runtime cleanly before attempting explicit recovery; do not mutate live plugin files while Caddy/PHP are serving requests.".into(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if failure.is_none()
+                        && current_plan
+                            .items
+                            .iter()
+                            .any(|item| item.id == "wordpress_admin_password")
+                    {
+                        match provisioner
+                            .repair_admin_password(runtime_info, admin_password.as_deref())
+                        {
+                            Ok(Some(result)) => {
+                                item_results.retain(|item| item.id != result.id);
+                                item_results.push(result);
+                            }
+                            Ok(None) => {}
+                            Err(error) => failure = Some(error),
+                        }
+                    }
+                    if failure.is_none()
+                        && current_plan
+                            .items
+                            .iter()
+                            .any(|item| item.id == "machine_token_pending")
+                    {
+                        match provisioner.recover_pending_machine_token(runtime_info) {
+                            Ok(Some(result)) => {
+                                item_results.retain(|item| item.id != result.id);
+                                item_results.push(result);
+                            }
+                            Ok(None) => {}
+                            Err(error) => failure = Some(error),
+                        }
+                    }
+                    if failure.is_none() {
+                        let diagnostics = runtime.health_diagnostics();
+                        if !has_blocked && !diagnostics_all_healthy(&diagnostics) {
+                            failure = Some(runtime::RuntimeErrorInfo {
+                                component: "repair".into(),
+                                operation: "verify repaired store".into(),
+                                message: "Repair mutations completed, but the final component health snapshot is not fully healthy.".into(),
+                                recovery: "Keep the repaired files and inspect Hệ thống → Chẩn đoán before retrying the remaining repair.".into(),
+                            });
+                        }
+                        health_diagnostics = Some(diagnostics);
+                    }
+                }
+            }
+
+            if failure.is_none() {
+                if let Err(error) = provisioner.mark_repair_verified(&current_plan.plan_id) {
+                    failure = Some(error);
+                }
+            }
+            if failure.is_none() {
+                if let Err(error) = provisioner
+                    .commit_repaired_plugins(repaired_woocommerce, repaired_coffeepos)
+                {
+                    failure = Some(error);
+                }
+            }
+            if failure.is_none() {
+                if let Err(error) = provisioner.mark_repair_committed(&current_plan.plan_id) {
+                    failure = Some(error);
+                }
+            }
+
+            if failure.is_some() {
+                if runtime.refresh().state == RuntimeState::Running {
+                    if let Err(stop_error) = runtime.stop() {
+                        let previous = failure.take().expect("failure checked above");
+                        failure = Some(runtime::RuntimeErrorInfo {
+                            component: "repair".into(),
+                            operation: "stop runtime after repair failure".into(),
+                            message: format!(
+                                "Repair failed ({}), and the runtime could not be stopped afterward: {}",
+                                previous.message, stop_error.message
+                            ),
+                            recovery: format!(
+                                "{} {} Preserve config/repair.json and repair backup evidence; do not continue selling until the interrupted transaction is recovered.",
+                                previous.recovery, stop_error.recovery
+                            ),
+                        });
+                    }
+                }
+            } else if !runtime_was_running && runtime.refresh().state == RuntimeState::Running {
+                if let Err(error) = runtime.stop() {
+                    failure = Some(error);
+                }
+            } else if runtime_was_running && runtime.refresh().state != RuntimeState::Running {
+                if let Err(error) = runtime.start() {
+                    failure = Some(error);
+                }
+            }
+
+            if failure.is_none() {
+                if let Err(error) = provisioner.finish_repair(&current_plan.plan_id) {
+                    failure = Some(error);
+                }
+            }
+            let provisioning_info = provisioner.inspect();
+            let fully_ready = provisioning_info.state == ProvisioningState::Ready
+                && !has_blocked
+                && failure.is_none();
+            Ok(RepairApplyResult {
+                plan_id: current_plan.plan_id,
+                status: if fully_ready {
+                    RepairResultStatus::Repaired
+                } else {
+                    RepairResultStatus::Partial
+                },
+                items: item_results,
+                provisioning_info,
+                health_diagnostics,
+                last_error: failure,
+            })
+        })
+        .await;
+        app.state::<ShellState>()
+            .lifecycle_requested
+            .store(false, Ordering::Release);
+        result.map_err(|error| format!("Repair worker failed: {error}."))?
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = app;
+        let _ = plan_id;
+        let _ = inputs;
+        Err("Repair is currently qualified only for the Windows development build until runtime resources are packaged.".into())
+    }
 }
 
 #[tauri::command]
@@ -855,121 +1514,63 @@ fn provision_wordpress(
 fn main() {
     tauri::Builder::default()
         .manage(ShellState::default())
+        .setup(|app| {
+            let open_item =
+                MenuItem::with_id(app, TRAY_OPEN_ID, "Mở CoffeePOS", true, None::<&str>)?;
+            let exit_item =
+                MenuItem::with_id(app, TRAY_EXIT_ID, "Thoát hoàn toàn", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open_item, &exit_item])?;
+            let mut tray = TrayIconBuilder::with_id("coffeepos-main")
+                .menu(&menu)
+                .tooltip("CoffeePOS")
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| {
+                    if event.id() == TRAY_OPEN_ID {
+                        show_main_window(app);
+                    } else if event.id() == TRAY_EXIT_ID {
+                        request_full_exit(app.clone());
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
+                        }
+                    ) {
+                        show_main_window(tray.app_handle());
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            tray.build(app)?;
+            Ok(())
+        })
         .on_window_event(|window, event| {
             if window.label() != "main" {
                 return;
             }
-            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
-                return;
-            };
-            let state = window.state::<ShellState>();
-            if state.exit_authorized.load(Ordering::Acquire) {
-                return;
-            }
-            api.prevent_close();
-            if state.shutdown_in_progress.swap(true, Ordering::AcqRel) {
-                return;
-            }
-            if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
-                state.shutdown_in_progress.store(false, Ordering::Release);
-                show_shutdown_notice(
-                    "CoffeePOS đang bận",
-                    "CoffeePOS đang hoàn tất một thao tác hệ thống. Hãy thử thoát lại sau khi thao tác hiện tại kết thúc.",
-                    false,
-                );
-                return;
-            }
-
-            let lifecycle_guard = match state.lifecycle.try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::WouldBlock) => {
-                    state.lifecycle_requested.store(false, Ordering::Release);
-                    state.shutdown_in_progress.store(false, Ordering::Release);
-                    show_shutdown_notice(
-                        "CoffeePOS đang bận",
-                        "CoffeePOS đang hoàn tất cài đặt hoặc thay đổi trạng thái hệ thống. Hãy chờ thao tác hiện tại kết thúc rồi thử thoát lại.",
-                        false,
-                    );
-                    return;
-                }
-                Err(TryLockError::Poisoned(_)) => {
-                    state.lifecycle_requested.store(false, Ordering::Release);
-                    state.shutdown_in_progress.store(false, Ordering::Release);
-                    show_shutdown_notice(
-                        "Không thể thoát an toàn",
-                        "Trạng thái vòng đời runtime không còn khả dụng. Hãy giữ ứng dụng mở và kiểm tra Chẩn đoán trước khi thử lại.",
-                        true,
-                    );
-                    return;
-                }
-            };
-
-            let runtime_guard = match state.runtime.try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::WouldBlock) => {
-                    state.lifecycle_requested.store(false, Ordering::Release);
-                    state.shutdown_in_progress.store(false, Ordering::Release);
-                    show_shutdown_notice(
-                        "CoffeePOS đang bận",
-                        "CoffeePOS đang cập nhật trạng thái hệ thống. Hãy thử thoát lại sau khi thao tác hiện tại kết thúc.",
-                        false,
-                    );
-                    return;
-                }
-                Err(TryLockError::Poisoned(_)) => {
-                    state.lifecycle_requested.store(false, Ordering::Release);
-                    state.shutdown_in_progress.store(false, Ordering::Release);
-                    show_shutdown_notice(
-                        "Không thể thoát an toàn",
-                        "Không thể đọc trạng thái runtime để dừng cửa hàng an toàn. Hãy giữ ứng dụng mở và thử lại.",
-                        true,
-                    );
-                    return;
-                }
-            };
-
-            if let Some(runtime) = runtime_guard.as_ref() {
-                if runtime.requires_exit_confirmation() && !confirm_runtime_exit() {
-                    drop(runtime_guard);
-                    drop(lifecycle_guard);
-                    state.lifecycle_requested.store(false, Ordering::Release);
-                    state.shutdown_in_progress.store(false, Ordering::Release);
-                    return;
-                }
-            }
-            drop(runtime_guard);
-            drop(lifecycle_guard);
-            let app = window.app_handle().clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                let state = app.state::<ShellState>();
-                let result = (|| -> Result<(), String> {
-                    let _lifecycle_guard = try_lifecycle(&state, "stop the runtime for exit")?;
-                    let mut runtime_guard = state.runtime.lock().map_err(|_| {
-                        "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string()
-                    })?;
-                    if let Some(runtime) = runtime_guard.as_mut() {
-                        if let Err(error) = runtime.stop() {
-                            if runtime.requires_exit_confirmation() {
-                                return Err(format!(
-                                    "CoffeePOS chưa dừng hoàn toàn nên ứng dụng vẫn mở để tránh bỏ lại tiến trình.\n\n{error}"
-                                ));
-                            }
-                        }
-                    }
-                    Ok(())
-                })();
-                match result {
-                    Ok(()) => {
-                        state.exit_authorized.store(true, Ordering::Release);
-                        app.exit(0);
-                    }
-                    Err(message) => {
-                        state.lifecycle_requested.store(false, Ordering::Release);
-                        state.shutdown_in_progress.store(false, Ordering::Release);
-                        show_shutdown_notice("Chưa thể dừng cửa hàng", &message, true);
+            match event {
+                tauri::WindowEvent::Resized(_) => {
+                    if window.is_minimized().unwrap_or(false) {
+                        let _ = window.hide();
+                        // Reset the native minimized state while the window stays hidden. This
+                        // prevents a stale minimize resize from immediately hiding a tray restore.
+                        let _ = window.unminimize();
                     }
                 }
-            });
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    let state = window.state::<ShellState>();
+                    if state.exit_authorized.load(Ordering::Acquire) {
+                        return;
+                    }
+                    api.prevent_close();
+                    request_full_exit(window.app_handle().clone());
+                }
+                _ => {}
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_shell_info,
@@ -984,6 +1585,8 @@ fn main() {
             retry_runtime_health,
             refresh_runtime_maintenance,
             get_health_diagnostics,
+            get_repair_plan,
+            apply_repair,
             open_wordpress,
             open_pos,
             get_provisioning_info,

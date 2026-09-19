@@ -117,7 +117,7 @@ Cả hai lựa chọn đều phải nghiệm thu login → POS → đơn test �
 
 Phase 5.5 tự khởi động runtime khi mở app trên store đã cài; không tự bật app cùng Windows trong scope này. Không tự mở thêm tab POS mỗi lần refresh/health poll.
 
-Baseline 5.6 đã triển khai Windows-first: thu nhỏ dùng hành vi cửa sổ mặc định và giữ runtime hoạt động; Close/Alt+F4 bị native intercept trước khi đóng. Khi runtime active, Windows confirmation giải thích POS/thiết bị sẽ mất kết nối, mặc định an toàn là ở lại; chọn dừng và thoát bật admission gate trả 503 cho request mới, bounded-drain request đã được nhận, stop runtime rồi mới authorize app exit. Lifecycle đang bận hoặc forced cleanup còn child thì app ở lại. Không dùng xác nhận cho điều hướng thông thường. Tray/background mode vẫn ngoài scope.
+Baseline 5.6 Windows-first dùng system tray cho Minimize: bấm **—** ẩn shell khỏi taskbar nhưng giữ runtime hoạt động. Close/Alt+F4 giữ shutdown UX cũ và dùng cùng path với tray **Thoát hoàn toàn**: khi runtime active, Windows confirmation xuất hiện; chọn thoát mới bật admission gate, bounded-drain request đã được nhận, stop runtime rồi authorize app exit. Tray vẫn có **Mở CoffeePOS** và **Thoát hoàn toàn**. Lifecycle đang bận hoặc forced cleanup còn child thì shell được giữ/mở lại để người dùng xử lý.
 
 Đóng app không thay chốt ca. Khi dùng browser, không khẳng định mọi phiên bán hàng đã kết thúc vì shell không quan sát được tab. Bounded shutdown, request đang chạy và crash recovery thuộc native/plugin contracts; UI phản ánh thật, không hứa chống mất điện hoàn toàn.
 

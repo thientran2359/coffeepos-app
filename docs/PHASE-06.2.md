@@ -131,9 +131,9 @@ Scheduling/UI responsiveness đã đổi như sau:
 Acceptance dùng bản copy disposable của store development đang dừng, không sửa store gốc. Kết quả runtime mới:
 
 - `start → stop → restart-from-stopped → restart-while-running → stop`: **PASS 1/1**; WordPress và CoffeePOS machine-health đều healthy, graceful Caddy drain hoàn tất và sau test không còn `caddy`, `php-cgi` hoặc `mariadbd` process;
-- warm `/wp-login.php`: **p50 134 ms, p95 140 ms**. Baseline trước Phase 6.2 khoảng `0.88–0.90s`, có mẫu gần `1.96s`, nên p50 trên cùng máy cải thiện hơn 6×;
-- 4 dynamic request tuần tự: **537 ms**; 4 request song song: **144 ms**, chứng minh worker pool không còn serialize gần tuyến tính;
-- static CoffeePOS JS sau warm-up: **p50 <1 ms, p95 1 ms**;
+- các benchmark warm cuối `/wp-login.php` nằm trong **p50 138–144 ms, p95 151–314 ms**. Baseline trước Phase 6.2 khoảng `0.88–0.90s`, có mẫu gần `1.96s`, nên p50 trên cùng máy vẫn cải thiện hơn 6× ngay khi tính cả run có contention từ app development đang mở;
+- 4 WordPress dynamic request tuần tự: **562–738 ms**; 4 request song song: **145–189 ms**. Probe PHP động cố định 250 ms/request cho kết quả **1.03–1.07 s tuần tự vs 258–269 ms song song**, xác nhận 4 FastCGI workers thực sự xử lý concurrent thay vì chỉ hưởng cache WordPress;
+- static CoffeePOS JS sau warm-up: **p50 0–1 ms, p95 1 ms**;
 - runtime staging xác minh PHP/FastCGI/Caddy/OPcache; WordPress 7.1, WooCommerce 11.1.0 và CoffeePOS 1.0.1 artifacts đã được restage lại và checksum pass sau khi thay runtime target.
 
 Focused validation pass: Rust `cargo check`, `cargo fmt --check`, Phase 6.2 manifest/drain tests, ignored staged lifecycle/concurrency smoke, TypeScript lint/build, `npm run doctor` và `git diff --check`. Clippy pass cho code hiện tại khi bỏ qua `clippy::derivable_impls`, là lint có sẵn ở `config.rs` ngoài scope Phase 6.2. Chưa dùng kết quả automated này để tự thay manual UX smoke-test của người dùng.

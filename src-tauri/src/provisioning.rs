@@ -1,15 +1,18 @@
 use crate::runtime::{
     choose_loopback_port, configure_child_command, probe_coffeepos_health,
     probe_coffeepos_health_with_token, run_command_bounded, wait_for_child_exit,
-    CoffeePosHealthState, ProcessContainment, ResolvedRuntime, RuntimeErrorInfo, RuntimeInfo,
-    DATABASE_NAME, DATABASE_RUNTIME_SECRET, DATABASE_RUNTIME_USER, DATABASE_WORDPRESS_SECRET,
-    DATABASE_WORDPRESS_USER, MACHINE_TOKEN_PENDING_SECRET, MACHINE_TOKEN_SECRET,
+    CoffeePosHealthState, HealthDiagnosticsInfo, ProcessContainment, ResolvedRuntime,
+    RuntimeErrorInfo, RuntimeInfo, DATABASE_NAME, DATABASE_RUNTIME_SECRET, DATABASE_RUNTIME_USER,
+    DATABASE_WORDPRESS_SECRET, DATABASE_WORDPRESS_USER, MACHINE_TOKEN_PENDING_SECRET,
+    MACHINE_TOKEN_SECRET,
 };
 use crate::secret;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -40,6 +43,14 @@ const COFFEEPOS_PHASE_4_10_SHA256: &str =
     "67e3f268ffd29946cfb4fdce13d6e7ad12caaf3ca7af007cff2177940d8e4a64";
 const COFFEEPOS_UPGRADE_BACKUP: &str = "coffeepos.previous";
 const MANAGED_PLUGIN_OWNERSHIP_FILE: &str = ".coffeepos-managed.json";
+const REPAIR_SCHEMA_VERSION: u32 = 2;
+const REPAIR_JOURNAL: &str = "config/repair.json";
+const REPAIR_ADMIN_PENDING_SECRET: &str = "config/wordpress-admin.repair.pending.secret";
+const WOOCOMMERCE_REPAIR_STAGING: &str = "woocommerce.repairing";
+const WOOCOMMERCE_REPAIR_BACKUP: &str = "woocommerce.repair-backup";
+const COFFEEPOS_REPAIR_STAGING: &str = "coffeepos.repairing";
+const COFFEEPOS_REPAIR_BACKUP: &str = "coffeepos.repair-backup";
+const REPAIR_ORIGINAL_MISSING_MARKER: &str = ".coffeepos-repair-original-missing";
 const COFFEEPOS_REQUIRED_FILES: [&str; 4] = [
     "coffeepos.php",
     "readme.txt",
@@ -70,6 +81,93 @@ pub struct ProvisioningInfo {
     pub admin_username: Option<String>,
     pub can_retry: bool,
     pub last_error: Option<RuntimeErrorInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairClassification {
+    Repairable,
+    RequiresInput,
+    Blocked,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RepairItem {
+    pub id: String,
+    pub component: String,
+    pub target: String,
+    pub classification: RepairClassification,
+    pub action: String,
+    pub reason: String,
+    pub impact: String,
+    pub requires_runtime_stop: bool,
+    pub input_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RepairPlan {
+    pub plan_id: String,
+    pub generated_at: u64,
+    pub store_state: ProvisioningState,
+    pub runtime_was_running: bool,
+    pub items: Vec<RepairItem>,
+    pub can_apply: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairItemStatus {
+    Repaired,
+    Skipped,
+    Blocked,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RepairItemResult {
+    pub id: String,
+    pub status: RepairItemStatus,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairResultStatus {
+    Repaired,
+    Partial,
+    Stale,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RepairApplyResult {
+    pub plan_id: String,
+    pub status: RepairResultStatus,
+    pub items: Vec<RepairItemResult>,
+    pub provisioning_info: ProvisioningInfo,
+    pub health_diagnostics: Option<HealthDiagnosticsInfo>,
+    pub last_error: Option<RuntimeErrorInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RepairJournalStage {
+    Planned,
+    RuntimeStopped,
+    Staged,
+    Swapped,
+    Verified,
+    Committed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairJournal {
+    schema_version: u32,
+    plan_id: String,
+    item_ids: Vec<String>,
+    completed_item_ids: Vec<String>,
+    active_item_id: Option<String>,
+    runtime_was_running: bool,
+    stage: RepairJournalStage,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -415,6 +513,1403 @@ impl Provisioner {
             .map(|blocker| blocker.error()))
     }
 
+    pub fn verify_database_credentials_for_repair(
+        &self,
+        live_database_port: Option<u16>,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let Some(journal) = self.load_journal()? else {
+            return Ok(());
+        };
+        if journal.stage < ProvisioningStage::DatabaseReady {
+            return Ok(());
+        }
+
+        let runtime_password = secret::load(&self.data_root.join(DATABASE_RUNTIME_SECRET))
+            .map_err(|error| {
+                provisioning_error(
+                    "verify repair database credentials",
+                    error,
+                    "Preserve the MariaDB datadir and restore the matching protected runtime database credential before repair.",
+                )
+            })?;
+        let wordpress_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+            .map_err(|error| {
+                provisioning_error(
+                    "verify repair database credentials",
+                    error,
+                    "Preserve the MariaDB datadir and restore the matching protected WordPress database credential before repair.",
+                )
+            })?;
+
+        if let Some(port) = live_database_port {
+            let endpoint = DatabaseEndpoint::Tcp(port);
+            self.require_repair_database_account(
+                &endpoint,
+                DATABASE_RUNTIME_USER,
+                &runtime_password,
+                None,
+                "runtime",
+            )?;
+            self.require_repair_database_account(
+                &endpoint,
+                DATABASE_WORDPRESS_USER,
+                &wordpress_password,
+                Some(DATABASE_NAME),
+                "WordPress",
+            )?;
+            return Ok(());
+        }
+
+        let port = choose_loopback_port(&[])?;
+        let endpoint = DatabaseEndpoint::Tcp(port);
+        let mut database = self.spawn_database(&endpoint)?;
+        let verification = (|| {
+            self.wait_for_database_user(
+                &mut database,
+                &endpoint,
+                DATABASE_RUNTIME_USER,
+                &runtime_password,
+                None,
+            )?;
+            self.wait_for_database_user(
+                &mut database,
+                &endpoint,
+                DATABASE_WORDPRESS_USER,
+                &wordpress_password,
+                Some(DATABASE_NAME),
+            )?;
+            Ok(())
+        })();
+        let cleanup =
+            self.stop_repair_preflight_database(&mut database, &endpoint, &runtime_password);
+
+        match (verification, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(error), Err(cleanup_error)) => Err(provisioning_error(
+                "verify repair database credentials",
+                format!(
+                    "Database credential verification failed ({}), and the temporary MariaDB preflight process could not be cleaned up safely: {}",
+                    error.message, cleanup_error.message
+                ),
+                "Do not start repair mutation. Preserve the MariaDB datadir, stop the remaining MariaDB process explicitly, then retry credential verification.",
+            )),
+        }
+    }
+
+    pub fn repair_plan(&self, runtime_was_running: bool, machine_auth_failed: bool) -> RepairPlan {
+        for (relative, label) in [
+            ("config", "repair configuration"),
+            ("site", "WordPress site"),
+            ("database", "MariaDB data"),
+        ] {
+            if let Err(error) =
+                ensure_repair_path_safe(&self.data_root, &self.data_root.join(relative), label)
+            {
+                return RepairPlan {
+                    plan_id: format!("repair-blocked-{relative}"),
+                    generated_at: unix_timestamp(),
+                    store_state: ProvisioningState::NeedsRepair,
+                    runtime_was_running,
+                    items: vec![repair_item(
+                        "unsafe_store_path",
+                        "repair",
+                        label,
+                        RepairClassification::Blocked,
+                        "Preserve the redirected managed path",
+                        &error.message,
+                        &error.recovery,
+                        false,
+                    )],
+                    can_apply: false,
+                };
+            }
+        }
+        let inspection = self.inspect();
+        match self.load_repair_journal() {
+            Ok(Some(repair_journal)) => {
+                let recovery_check = self.validate_interrupted_repair(&repair_journal);
+                let (classification, action, reason, impact) = match recovery_check {
+                    Ok(()) => (
+                        RepairClassification::Repairable,
+                        if matches!(
+                            repair_journal.stage,
+                            RepairJournalStage::Verified | RepairJournalStage::Committed
+                        ) {
+                            "Finish the verified repair transaction"
+                        } else {
+                            "Recover the interrupted repair transaction"
+                        },
+                        format!(
+                            "Repair transaction '{}' was interrupted at stage {:?}; CoffeePOS has enough owned journal/backup evidence to recover deterministically.",
+                            repair_journal.plan_id, repair_journal.stage
+                        ),
+                        if matches!(
+                            repair_journal.stage,
+                            RepairJournalStage::Verified | RepairJournalStage::Committed
+                        ) {
+                            "Verified live repair results are kept; remaining owned backup cleanup is committed idempotently before the journal is removed.".to_string()
+                        } else {
+                            "Unverified plugin swaps are rolled back while the runtime is stopped. Atomic managed-file changes and protected pending credentials are preserved, then the store is inspected again.".to_string()
+                        },
+                    ),
+                    Err(error) => (
+                        RepairClassification::Blocked,
+                        "Preserve the interrupted repair transaction",
+                        error.message,
+                        error.recovery,
+                    ),
+                };
+                let item = repair_item(
+                    "repair_transaction",
+                    "repair",
+                    "Repair transaction",
+                    classification.clone(),
+                    action,
+                    &reason,
+                    &impact,
+                    true,
+                );
+                return RepairPlan {
+                    plan_id: repair_recovery_plan_id(&self.data_root, &repair_journal),
+                    generated_at: unix_timestamp(),
+                    store_state: inspection.state,
+                    runtime_was_running: repair_journal.runtime_was_running,
+                    items: vec![item],
+                    can_apply: classification == RepairClassification::Repairable,
+                };
+            }
+            Err(error) => {
+                let item = repair_item(
+                    "repair_transaction",
+                    "repair",
+                    "Repair transaction",
+                    RepairClassification::Blocked,
+                    "Preserve the unreadable repair transaction",
+                    &error.message,
+                    "CoffeePOS will not start another mutation while config/repair.json cannot be validated.",
+                    false,
+                );
+                return self.finish_repair_plan(inspection.state, runtime_was_running, vec![item]);
+            }
+            Ok(None) => {}
+        }
+        let mut items = Vec::new();
+        let journal = match self.load_journal() {
+            Ok(Some(journal)) => journal,
+            Ok(None) => {
+                if inspection.state == ProvisioningState::NeedsRepair {
+                    items.push(repair_item(
+                        "store_ownership",
+                        "wordpress",
+                        "Managed store ownership",
+                        RepairClassification::Blocked,
+                        "Preserve the existing store",
+                        "CoffeePOS cannot prove this non-empty store belongs to the current provisioning journal.",
+                        "No files or database data will be changed.",
+                        false,
+                    ));
+                }
+                return self.finish_repair_plan(inspection.state, runtime_was_running, items);
+            }
+            Err(error) => {
+                items.push(repair_item(
+                    "provisioning_journal",
+                    "wordpress",
+                    "Provisioning journal",
+                    RepairClassification::Blocked,
+                    "Preserve and restore the provisioning journal",
+                    &error.message,
+                    "Repair will not guess ownership while config/provisioning.json is unreadable.",
+                    false,
+                ));
+                return self.finish_repair_plan(inspection.state, runtime_was_running, items);
+            }
+        };
+
+        if let Some(blocker) = journal.recovery_blocker.as_ref() {
+            let error = blocker.error();
+            items.push(repair_item(
+                "partial_wordpress_install",
+                "wordpress",
+                "WordPress database installation",
+                RepairClassification::Blocked,
+                "Preserve the partial WordPress tables",
+                &error.message,
+                "CoffeePOS will not drop, recreate, or overwrite existing wp_* tables automatically.",
+                false,
+            ));
+            return self.finish_repair_plan(inspection.state, runtime_was_running, items);
+        }
+
+        if journal.stage >= ProvisioningStage::DatabaseReady {
+            let runtime_db_ready =
+                protected_secret_ready(&self.data_root.join(DATABASE_RUNTIME_SECRET));
+            let wordpress_db_ready =
+                protected_secret_ready(&self.data_root.join(DATABASE_WORDPRESS_SECRET));
+            if !runtime_db_ready || !wordpress_db_ready {
+                items.push(repair_item(
+                    "database_credentials",
+                    "database",
+                    "Database credentials",
+                    RepairClassification::Blocked,
+                    "Restore the matching protected database credentials",
+                    "The provisioning journal says the database accounts already exist, but one or more protected credentials are missing or unreadable.",
+                    "The MariaDB datadir is preserved. Repair will not reinitialize MariaDB or bypass authentication.",
+                    false,
+                ));
+                return self.finish_repair_plan(inspection.state, runtime_was_running, items);
+            }
+        }
+
+        if journal.stage >= ProvisioningStage::WordPressInstalled {
+            let admin_active = protected_secret_ready(&self.data_root.join(WORDPRESS_ADMIN_SECRET));
+            let admin_pending =
+                protected_secret_ready(&self.data_root.join(REPAIR_ADMIN_PENDING_SECRET));
+            if !admin_active || admin_pending {
+                items.push(repair_item(
+                    "wordpress_admin_password",
+                    "wordpress",
+                    "WordPress administrator password",
+                    if admin_pending {
+                        RepairClassification::Repairable
+                    } else {
+                        RepairClassification::RequiresInput
+                    },
+                    if admin_pending {
+                        "Resume the pending administrator-password repair"
+                    } else {
+                        "Set a replacement administrator password"
+                    },
+                    if admin_pending {
+                        "A protected pending administrator password remains from an interrupted repair and can be verified/promoted idempotently."
+                    } else {
+                        "The protected administrator password is missing or unreadable; WordPress hashes cannot recover the previous plaintext password."
+                    },
+                    "Only the existing administrator account password is changed; store data and account identity are preserved.",
+                    false,
+                ));
+            }
+        }
+
+        if journal.stage >= ProvisioningStage::SiteReady {
+            self.plan_wordpress_files(&journal, &mut items);
+        }
+
+        if journal.stage >= ProvisioningStage::WooCommerceProvisioned {
+            self.plan_plugin_repair(
+                &journal,
+                &mut items,
+                "woocommerce_plugin",
+                "woocommerce",
+                "WooCommerce plugin",
+                WOOCOMMERCE_PLUGIN_SLUG,
+                &self.woocommerce.version,
+                &self.woocommerce.archive_sha256,
+                WOOCOMMERCE_OWNERSHIP_SCHEMA_VERSION,
+                journal.woocommerce_version.as_deref(),
+                &self.woocommerce.plugin_root,
+            );
+        }
+
+        if journal.stage >= ProvisioningStage::CoffeePosProvisioned {
+            self.plan_plugin_repair(
+                &journal,
+                &mut items,
+                "coffeepos_plugin",
+                "coffeepos",
+                "CoffeePOS plugin",
+                COFFEEPOS_PLUGIN_SLUG,
+                &self.coffeepos.version,
+                &self.coffeepos.archive_sha256,
+                COFFEEPOS_OWNERSHIP_SCHEMA_VERSION,
+                journal.coffeepos_version.as_deref(),
+                &self.coffeepos.plugin_root,
+            );
+        }
+
+        if journal.stage >= ProvisioningStage::MachineHealthBootstrapped {
+            let active = protected_machine_token_ready(&self.data_root.join(MACHINE_TOKEN_SECRET));
+            let pending =
+                protected_machine_token_ready(&self.data_root.join(MACHINE_TOKEN_PENDING_SECRET));
+            if !active || machine_auth_failed {
+                items.push(repair_item(
+                    if pending {
+                        "machine_token_pending"
+                    } else {
+                        "machine_token"
+                    },
+                    "coffeepos",
+                    "CoffeePOS machine credential",
+                    if pending {
+                        RepairClassification::Repairable
+                    } else {
+                        RepairClassification::Blocked
+                    },
+                    if pending {
+                        "Verify and promote the pending machine credential"
+                    } else {
+                        "Preserve the server credential hash"
+                    },
+                    if pending {
+                        "The active protected token is unavailable, but a pending protected token from an interrupted transaction is available for endpoint verification."
+                    } else if machine_auth_failed {
+                        "The active protected machine credential exists, but the cached CoffeePOS health result reports an authentication failure and there is no pending credential authority."
+                    } else {
+                        "The active machine credential is missing or unreadable and no accepted pending authority is available."
+                    },
+                    if pending {
+                        "Repair will start the managed runtime only for verification and promote the pending token only if CoffeePOS accepts it."
+                    } else {
+                        "CoffeePOS will not overwrite the server-side hash without an independently verified recovery transaction."
+                    },
+                    false,
+                ));
+            }
+        }
+
+        self.finish_repair_plan(inspection.state, runtime_was_running, items)
+    }
+
+    fn finish_repair_plan(
+        &self,
+        store_state: ProvisioningState,
+        runtime_was_running: bool,
+        items: Vec<RepairItem>,
+    ) -> RepairPlan {
+        let plan_id = repair_plan_id(
+            &self.data_root,
+            &store_state,
+            &items,
+            &self.wordpress.core_root,
+            &self.woocommerce.plugin_root,
+            &self.coffeepos.plugin_root,
+        );
+        let can_apply = items.iter().any(|item| {
+            matches!(
+                item.classification,
+                RepairClassification::Repairable | RepairClassification::RequiresInput
+            )
+        });
+        RepairPlan {
+            plan_id,
+            generated_at: unix_timestamp(),
+            store_state,
+            runtime_was_running,
+            items,
+            can_apply,
+        }
+    }
+
+    fn plan_wordpress_files(&self, journal: &ProvisioningJournal, items: &mut Vec<RepairItem>) {
+        let site = self.data_root.join("site");
+        let config_path = site.join("wp-config.php");
+        let config_path_safety =
+            ensure_repair_path_safe(&self.data_root, &config_path, "wp-config.php");
+        if let Err(error) = config_path_safety {
+            items.push(repair_item(
+                "wordpress_config",
+                "wordpress",
+                "wp-config.php",
+                RepairClassification::Blocked,
+                "Preserve the redirected configuration path",
+                &error.message,
+                &error.recovery,
+                true,
+            ));
+        } else {
+            match fs::read_to_string(&config_path) {
+            Ok(contents) if contents.contains(MANAGED_CONFIG_MARKER) => {
+                if !contents.contains("define('DISABLE_WP_CRON', true);") {
+                    let repairable = contents.contains("define('AUTOMATIC_UPDATER_DISABLED', true);");
+                    items.push(repair_item(
+                        "wordpress_config",
+                        "wordpress",
+                        "wp-config.php",
+                        if repairable {
+                            RepairClassification::Repairable
+                        } else {
+                            RepairClassification::Blocked
+                        },
+                        if repairable {
+                            "Restore the managed runtime anchor"
+                        } else {
+                            "Preserve the unexpected managed configuration"
+                        },
+                        if repairable {
+                            "The CoffeePOS-managed config is missing DISABLE_WP_CRON but still has the exact updater anchor required for the safe migration."
+                        } else {
+                            "The managed marker exists but the expected config layout is not recognizable enough for an automatic rewrite."
+                        },
+                        "Existing database settings and WordPress salts are preserved.",
+                        true,
+                    ));
+                }
+            }
+            Ok(_) => items.push(repair_item(
+                "wordpress_config",
+                "wordpress",
+                "wp-config.php",
+                RepairClassification::Blocked,
+                "Preserve the unmanaged configuration",
+                "wp-config.php exists but is not marked as CoffeePOS-managed.",
+                "CoffeePOS will not adopt or overwrite an unmanaged WordPress configuration.",
+                true,
+            )),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && journal.stage >= ProvisioningStage::WordPressInstalled =>
+            {
+                items.push(repair_item(
+                    "wordpress_config",
+                    "wordpress",
+                    "wp-config.php",
+                    RepairClassification::RequiresInput,
+                    "Recreate the managed WordPress configuration",
+                    "The installed managed store journal is valid, but wp-config.php is missing.",
+                    "CoffeePOS will reuse the protected database credentials and generate new WordPress salts. Existing WordPress browser sessions will be signed out; pressing Sửa chữa confirms this impact.",
+                    true,
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => items.push(repair_item(
+                "wordpress_config",
+                "wordpress",
+                "wp-config.php",
+                RepairClassification::Blocked,
+                "Fix filesystem access before repair",
+                &format!("Cannot read wp-config.php: {error}."),
+                "No configuration changes are made while the existing file cannot be inspected.",
+                true,
+            )),
+        }
+        }
+
+        plan_managed_file(
+            &self.data_root,
+            items,
+            "wordpress_router",
+            "wordpress",
+            "WordPress router",
+            &self.data_root.join("config/wordpress-router.php"),
+            MANAGED_ROUTER_MARKER,
+            WORDPRESS_ROUTER.as_bytes(),
+        );
+        plan_managed_file(
+            &self.data_root,
+            items,
+            "wordpress_uploads_bridge",
+            "wordpress",
+            "WordPress uploads bridge",
+            &site.join("wp-content/mu-plugins/coffeepos-desktop-runtime.php"),
+            MANAGED_MU_PLUGIN_MARKER,
+            WORDPRESS_UPLOADS_MU_PLUGIN.as_bytes(),
+        );
+
+        if journal.wordpress_version != self.wordpress.version {
+            items.push(repair_item(
+                "wordpress_core",
+                "wordpress",
+                "WordPress core",
+                RepairClassification::Blocked,
+                "Use an explicit WordPress upgrade/downgrade flow",
+                &format!(
+                    "Managed store journal records WordPress {}, while the pinned baseline is {}.",
+                    journal.wordpress_version, self.wordpress.version
+                ),
+                "Repair never upgrades or downgrades WordPress implicitly.",
+                true,
+            ));
+        } else if let Err(error) = ensure_repair_path_safe(&self.data_root, &site, "WordPress core")
+        {
+            items.push(repair_item(
+                "wordpress_core",
+                "wordpress",
+                "WordPress core",
+                RepairClassification::Blocked,
+                "Preserve the redirected WordPress site path",
+                &error.message,
+                &error.recovery,
+                true,
+            ));
+        } else if managed_config_exists(&site) {
+            match baseline_tree_differs(
+                &self.data_root,
+                &self.wordpress.core_root,
+                &site,
+                Some("wp-content"),
+            ) {
+                Ok(true) => items.push(repair_item(
+                    "wordpress_core",
+                    "wordpress",
+                    "WordPress core",
+                    RepairClassification::Repairable,
+                    "Restore the pinned WordPress core files",
+                    "One or more managed WordPress core files are missing or differ from the pinned same-version baseline.",
+                    "Only baseline core paths are overlaid atomically; wp-content, wp-config.php, uploads, and extra files are preserved.",
+                    true,
+                )),
+                Ok(false) => {}
+                Err(error) => items.push(repair_item(
+                    "wordpress_core",
+                    "wordpress",
+                    "WordPress core",
+                    RepairClassification::Blocked,
+                    "Fix filesystem access before repair",
+                    &error.message,
+                    "No WordPress core file is changed while ownership/baseline inspection is incomplete.",
+                    true,
+                )),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_plugin_repair(
+        &self,
+        _journal: &ProvisioningJournal,
+        items: &mut Vec<RepairItem>,
+        id: &str,
+        component: &str,
+        label: &str,
+        slug: &str,
+        expected_version: &str,
+        expected_hash: &str,
+        expected_schema: u32,
+        journal_version: Option<&str>,
+        baseline_root: &Path,
+    ) {
+        if journal_version != Some(expected_version) {
+            items.push(repair_item(
+                id,
+                component,
+                label,
+                RepairClassification::Blocked,
+                "Use an explicit plugin upgrade/downgrade flow",
+                &format!(
+                    "Provisioning journal version {:?} does not match pinned {label} {expected_version}.",
+                    journal_version
+                ),
+                "Repair never changes plugin versions implicitly.",
+                true,
+            ));
+            return;
+        }
+
+        let destination = self.data_root.join("site/wp-content/plugins").join(slug);
+        if let Err(error) = ensure_repair_path_safe(&self.data_root, &destination, label) {
+            items.push(repair_item(
+                id,
+                component,
+                label,
+                RepairClassification::Blocked,
+                "Preserve the redirected plugin path",
+                &error.message,
+                &error.recovery,
+                true,
+            ));
+            return;
+        }
+        if !destination.exists() {
+            items.push(repair_item(
+                id,
+                component,
+                label,
+                RepairClassification::Repairable,
+                "Restore the exact managed plugin",
+                "The provisioning journal proves this exact plugin version was managed, but the destination directory is missing.",
+                "The pinned same-version artifact is restored; database/plugin business data is not deleted or migrated.",
+                true,
+            ));
+            return;
+        }
+        if !destination.is_dir() {
+            items.push(repair_item(
+                id,
+                component,
+                label,
+                RepairClassification::Blocked,
+                "Preserve the conflicting destination",
+                "The managed plugin destination exists but is not a directory.",
+                "CoffeePOS will not replace an unexpected filesystem object.",
+                true,
+            ));
+            return;
+        }
+        if let Err(error) = ensure_repair_tree_safe(&self.data_root, &destination, label) {
+            items.push(repair_item(
+                id,
+                component,
+                label,
+                RepairClassification::Blocked,
+                "Preserve the redirected plugin tree",
+                &error.message,
+                &error.recovery,
+                true,
+            ));
+            return;
+        }
+
+        let ownership_path = destination.join(MANAGED_PLUGIN_OWNERSHIP_FILE);
+        let ownership = fs::read(&ownership_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ManagedPluginOwnership>(&bytes).ok());
+        let Some(ownership) = ownership else {
+            items.push(repair_item(
+                id,
+                component,
+                label,
+                RepairClassification::Blocked,
+                "Preserve the plugin directory",
+                "The existing plugin directory does not have readable CoffeePOS ownership metadata.",
+                "Repair will not adopt or overwrite a plugin whose ownership cannot be proven.",
+                true,
+            ));
+            return;
+        };
+        if ownership.schema_version != expected_schema
+            || ownership.plugin != slug
+            || ownership.version != expected_version
+            || !ownership.archive_sha256.eq_ignore_ascii_case(expected_hash)
+        {
+            items.push(repair_item(
+                id,
+                component,
+                label,
+                RepairClassification::Blocked,
+                "Preserve the incompatible managed plugin",
+                "Plugin ownership metadata does not match the pinned same-version baseline.",
+                "Use an explicit adoption/upgrade flow; Phase 6.3 will not rewrite incompatible ownership metadata.",
+                true,
+            ));
+            return;
+        }
+
+        match baseline_tree_differs(
+            &self.data_root,
+            baseline_root,
+            &destination,
+            Some(MANAGED_PLUGIN_OWNERSHIP_FILE),
+        ) {
+            Ok(true) => items.push(repair_item(
+                id,
+                component,
+                label,
+                RepairClassification::Repairable,
+                "Restore the pinned same-version plugin files",
+                "The plugin is proven CoffeePOS-managed but one or more baseline files are missing or modified.",
+                "Repair stages a copy of the current directory, overlays the pinned baseline, then swaps atomically so extra managed-directory files are preserved.",
+                true,
+            )),
+            Ok(false) => {}
+            Err(error) => items.push(repair_item(
+                id,
+                component,
+                label,
+                RepairClassification::Blocked,
+                "Fix filesystem access before repair",
+                &error.message,
+                "No plugin files are changed while baseline comparison is incomplete.",
+                true,
+            )),
+        }
+    }
+
+    fn validate_interrupted_repair(&self, journal: &RepairJournal) -> Result<(), RuntimeErrorInfo> {
+        for (path, label) in [
+            (
+                self.data_root.join(WOOCOMMERCE_REPAIR_STAGING),
+                "WooCommerce repair staging",
+            ),
+            (
+                self.data_root.join(WOOCOMMERCE_REPAIR_BACKUP),
+                "WooCommerce repair backup",
+            ),
+            (
+                self.data_root.join(COFFEEPOS_REPAIR_STAGING),
+                "CoffeePOS repair staging",
+            ),
+            (
+                self.data_root.join(COFFEEPOS_REPAIR_BACKUP),
+                "CoffeePOS repair backup",
+            ),
+        ] {
+            ensure_repair_path_safe(&self.data_root, &path, label)?;
+            if path.is_dir() {
+                ensure_repair_tree_safe(&self.data_root, &path, label)?;
+            }
+        }
+
+        if matches!(
+            journal.stage,
+            RepairJournalStage::Verified | RepairJournalStage::Committed
+        ) {
+            return Ok(());
+        }
+
+        for (item_id, backup_name, label) in [
+            (
+                "woocommerce_plugin",
+                WOOCOMMERCE_REPAIR_BACKUP,
+                "WooCommerce",
+            ),
+            ("coffeepos_plugin", COFFEEPOS_REPAIR_BACKUP, "CoffeePOS"),
+        ] {
+            let completed = journal.completed_item_ids.iter().any(|id| id == item_id);
+            let active = journal.active_item_id.as_deref() == Some(item_id);
+            let backup_exists = self.data_root.join(backup_name).exists();
+            if completed && !backup_exists {
+                return Err(provisioning_error(
+                    "recover interrupted repair",
+                    format!(
+                        "{label} was recorded as swapped, but its owned pre-repair backup/sentinel is missing."
+                    ),
+                    "Preserve the live plugin and repair journal. CoffeePOS cannot infer the pre-repair state after rollback evidence was lost.",
+                ));
+            }
+            if active && !backup_exists {
+                return Err(provisioning_error(
+                    "recover interrupted repair",
+                    format!(
+                        "{label} repair was interrupted while active, but no owned rollback evidence is available."
+                    ),
+                    "Preserve the live plugin and repair journal. Resolve the ambiguous plugin state explicitly before continuing repair.",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn recover_interrupted_repair(
+        &self,
+        recovery_plan_id: &str,
+    ) -> Result<RepairItemResult, RuntimeErrorInfo> {
+        let journal = self.load_repair_journal()?.ok_or_else(|| {
+            provisioning_error(
+                "recover interrupted repair",
+                "Repair transaction state is missing.",
+                "Inspect the store again before starting another repair.",
+            )
+        })?;
+        self.validate_interrupted_repair(&journal)?;
+        let current_recovery_id = repair_recovery_plan_id(&self.data_root, &journal);
+        if current_recovery_id != recovery_plan_id {
+            return Err(provisioning_error(
+                "recover interrupted repair",
+                "Repair recovery evidence changed after the recovery plan was inspected.",
+                "Inspect the repair plan again before moving or deleting any owned backup evidence.",
+            ));
+        }
+
+        match journal.stage {
+            RepairJournalStage::Verified => {
+                commit_pending_plugin_repair_backups(&self.data_root)?;
+            }
+            RepairJournalStage::Committed => {}
+            RepairJournalStage::Planned
+            | RepairJournalStage::RuntimeStopped
+            | RepairJournalStage::Staged
+            | RepairJournalStage::Swapped => {
+                rollback_pending_plugin_repair_trees(&self.data_root)?;
+            }
+        }
+
+        self.advance_repair_journal(&journal.plan_id, RepairJournalStage::Committed)?;
+        self.finish_repair(&journal.plan_id)?;
+        Ok(RepairItemResult {
+            id: "repair_transaction".into(),
+            status: RepairItemStatus::Repaired,
+            message: if matches!(
+                journal.stage,
+                RepairJournalStage::Verified | RepairJournalStage::Committed
+            ) {
+                "Verified interrupted repair transaction committed and cleaned up. Inspect the store again before continuing normal operation."
+                    .into()
+            } else {
+                "Interrupted repair transaction recovered to a deterministic safe state. Unverified plugin swaps were rolled back; inspect the store again for any remaining repair items."
+                    .into()
+            },
+        })
+    }
+
+    pub fn begin_repair(&self, plan: &RepairPlan) -> Result<(), RuntimeErrorInfo> {
+        if let Some(existing) = self.load_repair_journal()? {
+            return Err(provisioning_error(
+                "start repair transaction",
+                format!(
+                    "Repair transaction '{}' is already present at stage {:?}.",
+                    existing.plan_id, existing.stage
+                ),
+                "Preserve the existing repair journal and recover that transaction before starting a new repair.",
+            ));
+        }
+        let journal = RepairJournal {
+            schema_version: REPAIR_SCHEMA_VERSION,
+            plan_id: plan.plan_id.clone(),
+            item_ids: plan.items.iter().map(|item| item.id.clone()).collect(),
+            completed_item_ids: Vec::new(),
+            active_item_id: None,
+            runtime_was_running: plan.runtime_was_running,
+            stage: RepairJournalStage::Planned,
+        };
+        self.persist_repair_journal(&journal)
+    }
+
+    pub fn mark_repair_runtime_stopped(&self, plan_id: &str) -> Result<(), RuntimeErrorInfo> {
+        self.advance_repair_journal(plan_id, RepairJournalStage::RuntimeStopped)
+    }
+
+    pub fn apply_offline_repairs(
+        &self,
+        plan: &RepairPlan,
+    ) -> Result<Vec<RepairItemResult>, RuntimeErrorInfo> {
+        self.advance_repair_journal(&plan.plan_id, RepairJournalStage::Staged)?;
+        let mut results = Vec::with_capacity(plan.items.len());
+        for item in &plan.items {
+            if item.classification == RepairClassification::Blocked {
+                results.push(RepairItemResult {
+                    id: item.id.clone(),
+                    status: RepairItemStatus::Blocked,
+                    message: item.reason.clone(),
+                });
+                continue;
+            }
+            if matches!(
+                item.id.as_str(),
+                "wordpress_admin_password" | "machine_token_pending"
+            ) {
+                results.push(RepairItemResult {
+                    id: item.id.clone(),
+                    status: RepairItemStatus::Skipped,
+                    message: "This repair item requires the managed runtime for verification."
+                        .into(),
+                });
+                continue;
+            }
+
+            let plugin_item = matches!(item.id.as_str(), "woocommerce_plugin" | "coffeepos_plugin");
+            if !plugin_item {
+                self.mark_repair_item_started(&plan.plan_id, &item.id)?;
+            }
+            let repaired = match item.id.as_str() {
+                "wordpress_config" => {
+                    ensure_repair_path_safe(
+                        &self.data_root,
+                        &self.data_root.join("site/wp-config.php"),
+                        "wp-config.php",
+                    )?;
+                    self.ensure_wp_config()?;
+                    "Managed wp-config.php runtime anchor restored."
+                }
+                "wordpress_router" => {
+                    ensure_repair_path_safe(
+                        &self.data_root,
+                        &self.data_root.join("config/wordpress-router.php"),
+                        "WordPress router",
+                    )?;
+                    write_managed_file(
+                        &self.data_root.join("config/wordpress-router.php"),
+                        MANAGED_ROUTER_MARKER,
+                        WORDPRESS_ROUTER.as_bytes(),
+                        "WordPress router",
+                    )?;
+                    "Managed WordPress router restored."
+                }
+                "wordpress_uploads_bridge" => {
+                    let path = self
+                        .data_root
+                        .join("site/wp-content/mu-plugins/coffeepos-desktop-runtime.php");
+                    ensure_repair_path_safe(&self.data_root, &path, "WordPress uploads bridge")?;
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent).map_err(|error| {
+                            provisioning_error(
+                                "repair WordPress uploads bridge",
+                                format!("Cannot create mu-plugins directory: {error}."),
+                                "Check site permissions and retry repair.",
+                            )
+                        })?;
+                    }
+                    write_managed_file(
+                        &path,
+                        MANAGED_MU_PLUGIN_MARKER,
+                        WORDPRESS_UPLOADS_MU_PLUGIN.as_bytes(),
+                        "WordPress uploads bridge",
+                    )?;
+                    "Managed WordPress uploads bridge restored."
+                }
+                "wordpress_core" => {
+                    ensure_repair_path_safe(
+                        &self.data_root,
+                        &self.data_root.join("site"),
+                        "WordPress core",
+                    )?;
+                    overlay_baseline_tree(
+                        &self.data_root,
+                        &self.wordpress.core_root,
+                        &self.data_root.join("site"),
+                        Some("wp-content"),
+                        "WordPress core",
+                    )?;
+                    "Pinned same-version WordPress core files restored."
+                }
+                "woocommerce_plugin" => {
+                    repair_managed_plugin_tree(
+                        &self.data_root,
+                        WOOCOMMERCE_PLUGIN_SLUG,
+                        &self.woocommerce.version,
+                        &self.woocommerce.archive_sha256,
+                        WOOCOMMERCE_OWNERSHIP_SCHEMA_VERSION,
+                        &self.woocommerce.plugin_root,
+                        WOOCOMMERCE_REPAIR_STAGING,
+                        WOOCOMMERCE_REPAIR_BACKUP,
+                        "WooCommerce",
+                    )?;
+                    "Pinned same-version WooCommerce files restored."
+                }
+                "coffeepos_plugin" => {
+                    repair_managed_plugin_tree(
+                        &self.data_root,
+                        COFFEEPOS_PLUGIN_SLUG,
+                        &self.coffeepos.version,
+                        &self.coffeepos.archive_sha256,
+                        COFFEEPOS_OWNERSHIP_SCHEMA_VERSION,
+                        &self.coffeepos.plugin_root,
+                        COFFEEPOS_REPAIR_STAGING,
+                        COFFEEPOS_REPAIR_BACKUP,
+                        "CoffeePOS",
+                    )?;
+                    "Pinned same-version CoffeePOS files restored."
+                }
+                _ => {
+                    self.mark_repair_item_completed(&plan.plan_id, &item.id)?;
+                    results.push(RepairItemResult {
+                        id: item.id.clone(),
+                        status: RepairItemStatus::Skipped,
+                        message: "No automatic mutation is defined for this repair item.".into(),
+                    });
+                    continue;
+                }
+            };
+            if plugin_item {
+                self.mark_repair_item_started(&plan.plan_id, &item.id)?;
+            }
+            self.mark_repair_item_completed(&plan.plan_id, &item.id)?;
+            results.push(RepairItemResult {
+                id: item.id.clone(),
+                status: RepairItemStatus::Repaired,
+                message: repaired.into(),
+            });
+        }
+        self.advance_repair_journal(&plan.plan_id, RepairJournalStage::Swapped)?;
+        Ok(results)
+    }
+
+    pub fn repair_admin_password(
+        &self,
+        runtime_info: &RuntimeInfo,
+        replacement_password: Option<&str>,
+    ) -> Result<Option<RepairItemResult>, RuntimeErrorInfo> {
+        let pending_path = self.data_root.join(REPAIR_ADMIN_PENDING_SECRET);
+        let active_path = self.data_root.join(WORDPRESS_ADMIN_SECRET);
+        ensure_repair_path_safe(
+            &self.data_root,
+            &pending_path,
+            "administrator password repair credential",
+        )?;
+        ensure_repair_path_safe(
+            &self.data_root,
+            &active_path,
+            "administrator password credential",
+        )?;
+        if !pending_path.exists() && protected_secret_ready(&active_path) {
+            return Ok(None);
+        }
+
+        let password = if pending_path.is_file() {
+            secret::load(&pending_path).map_err(|error| {
+                provisioning_error(
+                    "resume administrator password repair",
+                    error,
+                    "Preserve the pending protected credential and retry with the same Windows user profile.",
+                )
+            })?
+        } else {
+            let password = replacement_password.ok_or_else(|| {
+                provisioning_error(
+                    "repair administrator password",
+                    "A replacement administrator password is required.",
+                    "Enter a 12–128 character replacement password and retry the repair.",
+                )
+            })?;
+            validate_admin_repair_password(password)?;
+            secret::store_password(&pending_path, password).map_err(|error| {
+                provisioning_error(
+                    "stage administrator password repair",
+                    error,
+                    "Check protected application-data storage and retry. The WordPress account has not been changed yet.",
+                )
+            })?;
+            password.to_string()
+        };
+
+        self.apply_admin_password_to_wordpress(runtime_info, &password)?;
+        secret::promote_staged_password(&pending_path, &active_path).map_err(|error| {
+            provisioning_error(
+                "promote administrator password repair",
+                error,
+                "WordPress already accepts the pending password. Preserve the pending protected credential and retry repair to finish promotion.",
+            )
+        })?;
+        Ok(Some(RepairItemResult {
+            id: "wordpress_admin_password".into(),
+            status: RepairItemStatus::Repaired,
+            message: "Existing WordPress administrator password reset and verified; protected credential promoted.".into(),
+        }))
+    }
+
+    pub fn recover_pending_machine_token(
+        &self,
+        runtime_info: &RuntimeInfo,
+    ) -> Result<Option<RepairItemResult>, RuntimeErrorInfo> {
+        let active_path = self.data_root.join(MACHINE_TOKEN_SECRET);
+        let pending_path = self.data_root.join(MACHINE_TOKEN_PENDING_SECRET);
+        ensure_repair_path_safe(
+            &self.data_root,
+            &active_path,
+            "CoffeePOS machine credential",
+        )?;
+        ensure_repair_path_safe(
+            &self.data_root,
+            &pending_path,
+            "CoffeePOS pending machine credential",
+        )?;
+        if !pending_path.is_file() && !protected_machine_token_ready(&active_path) {
+            return Ok(None);
+        }
+        let http_port = runtime_info.http_port.ok_or_else(|| {
+            provisioning_error(
+                "recover CoffeePOS machine credential",
+                "HTTP port is unavailable during pending credential recovery.",
+                "Start the managed runtime and retry repair.",
+            )
+        })?;
+        let health = probe_coffeepos_health(&self.data_root, http_port);
+        if !matches!(
+            health.state,
+            CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+        ) {
+            return Err(provisioning_error(
+                "recover CoffeePOS machine credential",
+                "Neither the active nor pending protected machine credential could be resolved to an accepted CoffeePOS endpoint credential.",
+                "Preserve the pending credential. CoffeePOS will not overwrite the server-side hash without independent recovery authority.",
+            ));
+        }
+        if !protected_machine_token_ready(&active_path) || pending_path.exists() {
+            return Err(provisioning_error(
+                "recover CoffeePOS machine credential",
+                "CoffeePOS accepted a machine credential, but protected credential promotion/cleanup is incomplete.",
+                "Preserve both protected credential files and retry repair; do not start another rotation.",
+            ));
+        }
+        Ok(Some(RepairItemResult {
+            id: "machine_token_pending".into(),
+            status: RepairItemStatus::Repaired,
+            message:
+                "Pending CoffeePOS machine credential verified against the endpoint and promoted."
+                    .into(),
+        }))
+    }
+
+    pub fn mark_repair_verified(&self, plan_id: &str) -> Result<(), RuntimeErrorInfo> {
+        self.advance_repair_journal(plan_id, RepairJournalStage::Verified)
+    }
+
+    pub fn mark_repair_committed(&self, plan_id: &str) -> Result<(), RuntimeErrorInfo> {
+        self.advance_repair_journal(plan_id, RepairJournalStage::Committed)
+    }
+
+    pub fn finish_repair(&self, plan_id: &str) -> Result<(), RuntimeErrorInfo> {
+        let journal = self.load_repair_journal()?.ok_or_else(|| {
+            provisioning_error(
+                "complete repair transaction",
+                "Repair transaction state is missing before final cleanup.",
+                "Inspect the store before starting another repair.",
+            )
+        })?;
+        if journal.plan_id != plan_id || journal.stage != RepairJournalStage::Committed {
+            return Err(provisioning_error(
+                "complete repair transaction",
+                "Repair transaction has not reached its committed state.",
+                "Preserve config/repair.json and resume transaction recovery instead of deleting the commit point.",
+            ));
+        }
+        let path = self.data_root.join(REPAIR_JOURNAL);
+        fs::remove_file(&path).map_err(|error| {
+            provisioning_error(
+                "complete repair transaction",
+                format!("Repair verified but its journal could not be removed: {error}."),
+                "Retry repair cleanup. Store data and the verified repaired files are preserved.",
+            )
+        })
+    }
+
+    fn repair_journal_path(&self) -> PathBuf {
+        self.data_root.join(REPAIR_JOURNAL)
+    }
+
+    fn load_repair_journal(&self) -> Result<Option<RepairJournal>, RuntimeErrorInfo> {
+        let path = self.repair_journal_path();
+        ensure_repair_path_safe(&self.data_root, &path, "repair journal")?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path).map_err(|error| {
+            provisioning_error(
+                "read repair journal",
+                format!("Cannot read repair transaction state: {error}."),
+                "Preserve config/repair.json and retry with the same store.",
+            )
+        })?;
+        let journal: RepairJournal = serde_json::from_slice(&bytes).map_err(|error| {
+            provisioning_error(
+                "read repair journal",
+                format!("Repair transaction state is invalid: {error}."),
+                "Preserve config/repair.json and repair the journal explicitly before starting another mutation.",
+            )
+        })?;
+        if journal.schema_version != REPAIR_SCHEMA_VERSION {
+            return Err(provisioning_error(
+                "read repair journal",
+                format!(
+                    "Repair journal schema {} is not supported by this Desktop build.",
+                    journal.schema_version
+                ),
+                "Use the matching CoffeePOS Desktop version or restore a compatible repair transaction state.",
+            ));
+        }
+        Ok(Some(journal))
+    }
+
+    fn persist_repair_journal(&self, journal: &RepairJournal) -> Result<(), RuntimeErrorInfo> {
+        ensure_repair_path_safe(
+            &self.data_root,
+            &self.repair_journal_path(),
+            "repair journal",
+        )?;
+        let mut bytes = serde_json::to_vec_pretty(journal).map_err(|error| {
+            provisioning_error(
+                "save repair journal",
+                format!("Cannot serialize repair transaction state: {error}."),
+                "Retry after checking application-data storage.",
+            )
+        })?;
+        bytes.push(b'\n');
+        atomic_write(&self.repair_journal_path(), &bytes, "repair journal")
+    }
+
+    fn advance_repair_journal(
+        &self,
+        plan_id: &str,
+        stage: RepairJournalStage,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let mut journal = self.load_repair_journal()?.ok_or_else(|| {
+            provisioning_error(
+                "advance repair transaction",
+                "Repair transaction state is missing.",
+                "Inspect the store again and start a new repair plan.",
+            )
+        })?;
+        if journal.plan_id != plan_id {
+            return Err(provisioning_error(
+                "advance repair transaction",
+                "Repair transaction belongs to a different plan.",
+                "Preserve the journal and inspect the store before starting another repair.",
+            ));
+        }
+        journal.stage = stage;
+        self.persist_repair_journal(&journal)
+    }
+
+    fn mark_repair_item_started(
+        &self,
+        plan_id: &str,
+        item_id: &str,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let mut journal = self.load_repair_journal()?.ok_or_else(|| {
+            provisioning_error(
+                "record repair item",
+                "Repair transaction state is missing.",
+                "Preserve the store and inspect the repair transaction before retrying.",
+            )
+        })?;
+        if journal.plan_id != plan_id || !journal.item_ids.iter().any(|id| id == item_id) {
+            return Err(provisioning_error(
+                "record repair item",
+                "Repair item does not belong to the active repair transaction.",
+                "Inspect the store again instead of applying stale repair state.",
+            ));
+        }
+        journal.active_item_id = Some(item_id.to_string());
+        self.persist_repair_journal(&journal)
+    }
+
+    fn mark_repair_item_completed(
+        &self,
+        plan_id: &str,
+        item_id: &str,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let mut journal = self.load_repair_journal()?.ok_or_else(|| {
+            provisioning_error(
+                "record repair item",
+                "Repair transaction state is missing.",
+                "Preserve the store and inspect the repair transaction before retrying.",
+            )
+        })?;
+        if journal.plan_id != plan_id || journal.active_item_id.as_deref() != Some(item_id) {
+            return Err(provisioning_error(
+                "record repair item",
+                "Repair item completion does not match the active transaction item.",
+                "Preserve the repair journal and recover the transaction before continuing.",
+            ));
+        }
+        if !journal.completed_item_ids.iter().any(|id| id == item_id) {
+            journal.completed_item_ids.push(item_id.to_string());
+        }
+        journal.active_item_id = None;
+        self.persist_repair_journal(&journal)
+    }
+
+    fn apply_admin_password_to_wordpress(
+        &self,
+        runtime_info: &RuntimeInfo,
+        password: &str,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let database_port = runtime_info.database_port.ok_or_else(|| {
+            provisioning_error(
+                "repair administrator password",
+                "MariaDB port is unavailable while updating the WordPress administrator.",
+                "Start the managed runtime and retry repair.",
+            )
+        })?;
+        let http_port = runtime_info.http_port.ok_or_else(|| {
+            provisioning_error(
+                "repair administrator password",
+                "HTTP port is unavailable while updating the WordPress administrator.",
+                "Start the managed runtime and retry repair.",
+            )
+        })?;
+        let journal = self.load_journal()?.ok_or_else(|| {
+            provisioning_error(
+                "repair administrator password",
+                "Provisioning journal is missing, so the administrator identity cannot be proven.",
+                "Preserve the store and restore the provisioning journal before resetting a password.",
+            )
+        })?;
+        let database_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+            .map_err(|error| {
+                provisioning_error(
+                    "repair administrator password",
+                    error,
+                    "Restore the matching WordPress database credential before resetting the administrator password.",
+                )
+            })?;
+        let script = self.write_admin_password_repair_script()?;
+        let mut command = Command::new(&self.runtime.php_executable);
+        command
+            .arg("-c")
+            .arg(&self.runtime.php_ini)
+            .arg(&script)
+            .env_remove("PHPRC")
+            .env("PHP_INI_SCAN_DIR", "")
+            .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
+            .env("COFFEEPOS_DB_PASSWORD", database_password)
+            .env(
+                "COFFEEPOS_SITE_URL",
+                format!("http://{LOOPBACK}:{http_port}"),
+            )
+            .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
+            .env("COFFEEPOS_SITE_ROOT", self.data_root.join("site"))
+            .env("COFFEEPOS_ADMIN_USERNAME", journal.admin_username)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .current_dir(self.data_root.join("site"));
+        configure_child_command(&mut command);
+        let mut child = command.spawn().map_err(|error| {
+            let _ = fs::remove_file(&script);
+            provisioning_error(
+                "repair administrator password",
+                format!("Cannot start pinned PHP for administrator-password repair: {error}."),
+                "Verify the pinned PHP runtime and retry; the pending protected password is preserved.",
+            )
+        })?;
+        if let Err(error) = self.containment.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&script);
+            return Err(error);
+        }
+        let stdin_result = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "PHP stdin unavailable"))
+            .and_then(|mut stdin| stdin.write_all(password.as_bytes()));
+        if let Err(error) = stdin_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&script);
+            return Err(provisioning_error(
+                "repair administrator password",
+                format!("Cannot pass the replacement administrator password over stdin: {error}."),
+                "Retry repair. The password is not placed in process arguments or logs.",
+            ));
+        }
+        let status = wait_for_child_exit(&mut child, Duration::from_secs(30));
+        let _ = fs::remove_file(&script);
+        let status = status?;
+        if !status.success() {
+            return Err(provisioning_error(
+                "repair administrator password",
+                format!("Administrator-password repair exited with status {status}."),
+                "The pending protected password is preserved. Inspect WordPress/runtime health and retry repair.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn write_admin_password_repair_script(&self) -> Result<PathBuf, RuntimeErrorInfo> {
+        let config = self.data_root.join("config");
+        let mut temporary = NamedTempFile::new_in(&config).map_err(|error| {
+            provisioning_error(
+                "prepare administrator password repair",
+                format!("Cannot create temporary administrator-password script: {error}."),
+                "Check application-data permissions and free disk space, then retry.",
+            )
+        })?;
+        temporary
+            .write_all(WORDPRESS_ADMIN_PASSWORD_REPAIR.as_bytes())
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|error| {
+                provisioning_error(
+                    "prepare administrator password repair",
+                    format!("Cannot write administrator-password repair script: {error}."),
+                    "Check application-data storage health and retry.",
+                )
+            })?;
+        let (_file, path) = temporary.keep().map_err(|error| {
+            provisioning_error(
+                "prepare administrator password repair",
+                format!(
+                    "Cannot retain administrator-password repair script: {}.",
+                    error.error
+                ),
+                "Check application-data permissions and retry.",
+            )
+        })?;
+        Ok(path)
+    }
+
     #[cfg(test)]
     fn replace_php_executable_for_test(&mut self, executable: PathBuf) -> PathBuf {
         std::mem::replace(&mut self.runtime.php_executable, executable)
@@ -437,6 +1932,48 @@ impl Provisioner {
                 };
             }
         };
+        match self.load_repair_journal() {
+            Ok(Some(repair_journal)) => {
+                return ProvisioningInfo {
+                    state: ProvisioningState::NeedsRepair,
+                    wordpress_version: self.wordpress.version.clone(),
+                    woocommerce_version: self.woocommerce.version.clone(),
+                    woocommerce_active: journal
+                        .as_ref()
+                        .map(|value| value.stage >= ProvisioningStage::WooCommerceActivated)
+                        .unwrap_or(false),
+                    coffeepos_version: self.coffeepos.version.clone(),
+                    coffeepos_active: journal
+                        .as_ref()
+                        .map(|value| value.stage >= ProvisioningStage::CoffeePosActivated)
+                        .unwrap_or(false),
+                    admin_username: journal.as_ref().map(|value| value.admin_username.clone()),
+                    can_retry: false,
+                    last_error: Some(provisioning_error(
+                        "recover repair transaction",
+                        format!(
+                            "A Phase 6.3 repair transaction is pending at stage {:?}.",
+                            repair_journal.stage
+                        ),
+                        "Open Hệ thống → Sửa chữa and recover the interrupted repair transaction before normal runtime startup.",
+                    )),
+                };
+            }
+            Err(error) => {
+                return ProvisioningInfo {
+                    state: ProvisioningState::NeedsRepair,
+                    wordpress_version: self.wordpress.version.clone(),
+                    woocommerce_version: self.woocommerce.version.clone(),
+                    woocommerce_active: false,
+                    coffeepos_version: self.coffeepos.version.clone(),
+                    coffeepos_active: false,
+                    admin_username: journal.as_ref().map(|value| value.admin_username.clone()),
+                    can_retry: false,
+                    last_error: Some(error),
+                };
+            }
+            Ok(None) => {}
+        }
         let runtime_database_credential_ready =
             secret::load(&self.data_root.join(DATABASE_RUNTIME_SECRET))
                 .map(|value| !value.is_empty())
@@ -1020,6 +2557,70 @@ impl Provisioner {
             ));
         }
         Ok(())
+    }
+
+    pub fn verify_repaired_plugins(
+        &self,
+        runtime_info: &RuntimeInfo,
+        store_name: &str,
+        verify_woocommerce: bool,
+        verify_coffeepos: bool,
+    ) -> Result<(), RuntimeErrorInfo> {
+        if verify_woocommerce {
+            self.activate_woocommerce(runtime_info)?;
+        }
+        if verify_coffeepos {
+            self.activate_coffeepos(runtime_info, store_name)?;
+        }
+        Ok(())
+    }
+
+    pub fn commit_repaired_plugins(
+        &self,
+        commit_woocommerce: bool,
+        commit_coffeepos: bool,
+    ) -> Result<(), RuntimeErrorInfo> {
+        if commit_woocommerce {
+            commit_managed_plugin_repair(
+                &self.data_root,
+                WOOCOMMERCE_REPAIR_BACKUP,
+                "WooCommerce",
+            )?;
+        }
+        if commit_coffeepos {
+            commit_managed_plugin_repair(&self.data_root, COFFEEPOS_REPAIR_BACKUP, "CoffeePOS")?;
+        }
+        Ok(())
+    }
+
+    pub fn rollback_repaired_plugins(
+        &self,
+        rollback_woocommerce: bool,
+        rollback_coffeepos: bool,
+    ) -> Result<(), RuntimeErrorInfo> {
+        if rollback_woocommerce {
+            rollback_managed_plugin_repair(
+                &self.data_root,
+                WOOCOMMERCE_PLUGIN_SLUG,
+                WOOCOMMERCE_REPAIR_STAGING,
+                WOOCOMMERCE_REPAIR_BACKUP,
+                "WooCommerce",
+            )?;
+        }
+        if rollback_coffeepos {
+            rollback_managed_plugin_repair(
+                &self.data_root,
+                COFFEEPOS_PLUGIN_SLUG,
+                COFFEEPOS_REPAIR_STAGING,
+                COFFEEPOS_REPAIR_BACKUP,
+                "CoffeePOS",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn rollback_pending_plugin_repairs(&self) -> Result<(), RuntimeErrorInfo> {
+        rollback_pending_plugin_repair_trees(&self.data_root)
     }
 
     fn bootstrap_machine_health(&self, runtime_info: &RuntimeInfo) -> Result<(), RuntimeErrorInfo> {
@@ -1876,6 +3477,77 @@ impl Provisioner {
             &self.containment,
         )
         .map(|status| status.success())
+    }
+
+    fn require_repair_database_account(
+        &self,
+        endpoint: &DatabaseEndpoint,
+        user: &str,
+        password: &str,
+        database_name: Option<&str>,
+        display_name: &str,
+    ) -> Result<(), RuntimeErrorInfo> {
+        if self.database_user_probe(endpoint, user, password, database_name)? {
+            Ok(())
+        } else {
+            Err(provisioning_error(
+                "verify repair database credentials",
+                format!(
+                    "MariaDB rejected the protected {display_name} database credential."
+                ),
+                "Preserve the MariaDB datadir and restore the matching protected credential. Repair will not rotate accounts, bypass authentication, or reinitialize the database.",
+            ))
+        }
+    }
+
+    fn stop_repair_preflight_database(
+        &self,
+        database: &mut Child,
+        endpoint: &DatabaseEndpoint,
+        runtime_password: &str,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let inspect_error = match database.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+
+        let graceful = inspect_error.is_none()
+            && self
+                .database_user_probe(endpoint, DATABASE_RUNTIME_USER, runtime_password, None)
+                .unwrap_or(false)
+            && self
+                .run_database_sql(
+                    endpoint,
+                    DATABASE_RUNTIME_USER,
+                    runtime_password,
+                    "SHUTDOWN;\n",
+                )
+                .is_ok();
+        if graceful && wait_for_child_exit(database, Duration::from_secs(10)).is_ok() {
+            return Ok(());
+        }
+
+        let kill_error = database.kill().err();
+        match wait_for_child_exit(database, Duration::from_secs(5)) {
+            Ok(_) => Ok(()),
+            Err(wait_error) => {
+                let inspect_detail = inspect_error
+                    .map(|error| format!(" Initial process-state inspection failed: {error}."))
+                    .unwrap_or_default();
+                let kill_detail = kill_error
+                    .map(|error| format!(" Termination request failed: {error}."))
+                    .unwrap_or_default();
+                Err(provisioning_error(
+                    "clean up repair database preflight",
+                    format!(
+                        "Temporary MariaDB preflight process could not be confirmed stopped.{}{} {}",
+                        inspect_detail, kill_detail, wait_error.message
+                    ),
+                    "Confirm no MariaDB process still owns the CoffeePOS datadir before retrying repair.",
+                ))
+            }
+        }
     }
 
     fn run_database_sql(
@@ -3908,6 +5580,1201 @@ fn managed_config_exists(site: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn ensure_repair_path_safe(
+    data_root: &Path,
+    target: &Path,
+    label: &str,
+) -> Result<(), RuntimeErrorInfo> {
+    let relative = target.strip_prefix(data_root).map_err(|_| {
+        provisioning_error(
+            format!("inspect {label} repair path"),
+            format!(
+                "Repair target {} is outside the managed store root.",
+                target.display()
+            ),
+            "Preserve the target and inspect the application-data path before retrying repair.",
+        )
+    })?;
+    let mut current = data_root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(provisioning_error(
+                format!("inspect {label} repair path"),
+                "Repair target contains a non-normal path component.",
+                "Preserve the target and inspect the application-data path before retrying repair.",
+            ));
+        };
+        current.push(name);
+        if !current.exists() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            provisioning_error(
+                format!("inspect {label} repair path"),
+                format!("Cannot inspect repair path {}: {error}.", current.display()),
+                "Fix application-data permissions before retrying repair.",
+            )
+        })?;
+        if metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata) {
+            return Err(provisioning_error(
+                format!("inspect {label} repair path"),
+                format!(
+                    "Repair target traverses a symbolic link/reparse point at {}.",
+                    current.display()
+                ),
+                "Preserve the path and resolve the link/junction explicitly; CoffeePOS will not mutate through redirected repair paths.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_repair_tree_safe(
+    data_root: &Path,
+    root: &Path,
+    label: &str,
+) -> Result<(), RuntimeErrorInfo> {
+    ensure_repair_path_safe(data_root, root, label)?;
+    if !root.exists() || !root.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root).map_err(|error| {
+        provisioning_error(
+            format!("inspect {label} repair tree"),
+            format!("Cannot enumerate managed tree {}: {error}.", root.display()),
+            "Fix application-data permissions before retrying repair.",
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            provisioning_error(
+                format!("inspect {label} repair tree"),
+                format!("Cannot enumerate managed tree entry: {error}."),
+                "Fix application-data permissions before retrying repair.",
+            )
+        })?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            provisioning_error(
+                format!("inspect {label} repair tree"),
+                format!("Cannot inspect managed path {}: {error}.", path.display()),
+                "Fix application-data permissions before retrying repair.",
+            )
+        })?;
+        if metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata) {
+            return Err(provisioning_error(
+                format!("inspect {label} repair tree"),
+                format!(
+                    "Managed repair tree contains a symbolic link/reparse point at {}.",
+                    path.display()
+                ),
+                "Preserve the tree and resolve the redirected path explicitly; CoffeePOS will not copy or replace through links/junctions.",
+            ));
+        }
+        if metadata.is_dir() {
+            ensure_repair_tree_safe(data_root, &path, label)?;
+        }
+    }
+    Ok(())
+}
+
+fn protected_secret_ready(path: &Path) -> bool {
+    path.is_file()
+        && secret::load(path)
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+}
+
+fn protected_machine_token_ready(path: &Path) -> bool {
+    path.is_file()
+        && secret::load(path)
+            .map(|token| {
+                token.len() == 64
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+            .unwrap_or(false)
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn repair_item(
+    id: &str,
+    component: &str,
+    target: &str,
+    classification: RepairClassification,
+    action: &str,
+    reason: &str,
+    impact: &str,
+    requires_runtime_stop: bool,
+) -> RepairItem {
+    let input_kind = (id == "wordpress_admin_password"
+        && classification == RepairClassification::RequiresInput)
+        .then(|| "admin_password".to_string());
+    RepairItem {
+        id: id.into(),
+        component: component.into(),
+        target: target.into(),
+        classification,
+        action: action.into(),
+        reason: reason.into(),
+        impact: impact.into(),
+        requires_runtime_stop,
+        input_kind,
+    }
+}
+
+fn repair_plan_id(
+    data_root: &Path,
+    store_state: &ProvisioningState,
+    items: &[RepairItem],
+    wordpress_baseline: &Path,
+    woocommerce_baseline: &Path,
+    coffeepos_baseline: &Path,
+) -> String {
+    let mut hash = 14_695_981_039_346_656_037_u64;
+    repair_hash_update(&mut hash, format!("{store_state:?}").as_bytes());
+    for item in items {
+        repair_hash_update(&mut hash, item.id.as_bytes());
+        repair_hash_update(&mut hash, format!("{:?}", item.classification).as_bytes());
+        repair_hash_update(&mut hash, item.reason.as_bytes());
+    }
+    for relative in [
+        "config/provisioning.json",
+        REPAIR_JOURNAL,
+        "site/wp-config.php",
+        "config/wordpress-router.php",
+        "site/wp-content/mu-plugins/coffeepos-desktop-runtime.php",
+        "site/wp-content/plugins/woocommerce/.coffeepos-managed.json",
+        "site/wp-content/plugins/coffeepos/.coffeepos-managed.json",
+        DATABASE_RUNTIME_SECRET,
+        DATABASE_WORDPRESS_SECRET,
+        WORDPRESS_ADMIN_SECRET,
+        REPAIR_ADMIN_PENDING_SECRET,
+        MACHINE_TOKEN_SECRET,
+        MACHINE_TOKEN_PENDING_SECRET,
+    ] {
+        let path = data_root.join(relative);
+        repair_hash_update(&mut hash, relative.as_bytes());
+        if let Err(error) = ensure_repair_path_safe(data_root, &path, "repair-plan evidence") {
+            repair_hash_update(&mut hash, b"unsafe-path:");
+            repair_hash_update(&mut hash, error.message.as_bytes());
+            continue;
+        }
+        match fs::read(&path) {
+            Ok(bytes) => repair_hash_update(&mut hash, &bytes),
+            Err(error) => {
+                repair_hash_update(&mut hash, format!("missing:{:?}", error.kind()).as_bytes())
+            }
+        }
+    }
+    if items.iter().any(|item| item.id == "wordpress_core") {
+        hash_baseline_target_evidence(
+            &mut hash,
+            data_root,
+            wordpress_baseline,
+            wordpress_baseline,
+            &data_root.join("site"),
+            Some("wp-content"),
+        );
+    }
+    if items.iter().any(|item| item.id == "woocommerce_plugin") {
+        hash_baseline_target_evidence(
+            &mut hash,
+            data_root,
+            woocommerce_baseline,
+            woocommerce_baseline,
+            &data_root.join("site/wp-content/plugins/woocommerce"),
+            Some(MANAGED_PLUGIN_OWNERSHIP_FILE),
+        );
+    }
+    if items.iter().any(|item| item.id == "coffeepos_plugin") {
+        hash_baseline_target_evidence(
+            &mut hash,
+            data_root,
+            coffeepos_baseline,
+            coffeepos_baseline,
+            &data_root.join("site/wp-content/plugins/coffeepos"),
+            Some(MANAGED_PLUGIN_OWNERSHIP_FILE),
+        );
+    }
+    format!("repair-{hash:016x}")
+}
+
+fn repair_recovery_plan_id(data_root: &Path, journal: &RepairJournal) -> String {
+    let mut hash = 14_695_981_039_346_656_037_u64;
+    if let Ok(bytes) = serde_json::to_vec(journal) {
+        repair_hash_update(&mut hash, &bytes);
+    }
+    for relative in [
+        "site/wp-content/plugins/woocommerce",
+        WOOCOMMERCE_REPAIR_STAGING,
+        WOOCOMMERCE_REPAIR_BACKUP,
+        "site/wp-content/plugins/coffeepos",
+        COFFEEPOS_REPAIR_STAGING,
+        COFFEEPOS_REPAIR_BACKUP,
+        REPAIR_ADMIN_PENDING_SECRET,
+        WORDPRESS_ADMIN_SECRET,
+        MACHINE_TOKEN_PENDING_SECRET,
+        MACHINE_TOKEN_SECRET,
+    ] {
+        hash_repair_path_evidence(&mut hash, data_root, &data_root.join(relative), relative);
+    }
+    format!("repair-recovery-{hash:016x}")
+}
+
+fn hash_repair_path_evidence(hash: &mut u64, data_root: &Path, path: &Path, label: &str) {
+    repair_hash_update(hash, label.as_bytes());
+    if let Err(error) = ensure_repair_path_safe(data_root, path, "repair recovery evidence") {
+        repair_hash_update(hash, b"unsafe:");
+        repair_hash_update(hash, error.message.as_bytes());
+        return;
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            repair_hash_update(hash, format!("missing:{:?}", error.kind()).as_bytes());
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata) {
+        repair_hash_update(hash, b"reparse");
+        return;
+    }
+    if metadata.is_file() {
+        repair_hash_update(hash, b"file:");
+        match fs::read(path) {
+            Ok(bytes) => repair_hash_update(hash, &bytes),
+            Err(error) => {
+                repair_hash_update(hash, format!("read-error:{:?}", error.kind()).as_bytes())
+            }
+        }
+        return;
+    }
+    if !metadata.is_dir() {
+        repair_hash_update(hash, b"other");
+        return;
+    }
+    repair_hash_update(hash, b"dir");
+    let mut entries = match fs::read_dir(path) {
+        Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(error) => {
+            repair_hash_update(hash, format!("dir-error:{:?}", error.kind()).as_bytes());
+            return;
+        }
+    };
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let child = entry.path();
+        let child_label = format!("{label}/{}", entry.file_name().to_string_lossy());
+        hash_repair_path_evidence(hash, data_root, &child, &child_label);
+    }
+}
+
+fn repair_hash_update(hash: &mut u64, bytes: &[u8]) {
+    const FNV_PRIME: u64 = 1_099_511_628_211;
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+}
+
+fn hash_baseline_target_evidence(
+    hash: &mut u64,
+    data_root: &Path,
+    baseline_root: &Path,
+    current_baseline: &Path,
+    destination_root: &Path,
+    skip_top: Option<&str>,
+) {
+    let mut entries = match fs::read_dir(current_baseline) {
+        Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(error) => {
+            repair_hash_update(
+                hash,
+                format!("baseline-read-error:{:?}", error.kind()).as_bytes(),
+            );
+            return;
+        }
+    };
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let source = entry.path();
+        let relative = match source.strip_prefix(baseline_root) {
+            Ok(relative) => relative,
+            Err(_) => {
+                repair_hash_update(hash, b"baseline-prefix-error");
+                continue;
+            }
+        };
+        if should_skip_baseline_path(relative, skip_top) {
+            continue;
+        }
+        repair_hash_update(hash, b"path:");
+        repair_hash_update(hash, relative.to_string_lossy().as_bytes());
+
+        let source_kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) => {
+                repair_hash_update(
+                    hash,
+                    format!("baseline-type-error:{:?}", error.kind()).as_bytes(),
+                );
+                continue;
+            }
+        };
+        if source_kind.is_dir() {
+            repair_hash_update(hash, b"baseline-dir");
+        } else if source_kind.is_file() {
+            repair_hash_update(hash, b"baseline-file:");
+            match fs::read(&source) {
+                Ok(bytes) => repair_hash_update(hash, &bytes),
+                Err(error) => repair_hash_update(
+                    hash,
+                    format!("baseline-file-error:{:?}", error.kind()).as_bytes(),
+                ),
+            }
+        } else {
+            repair_hash_update(hash, b"baseline-unsupported");
+        }
+
+        let target = destination_root.join(relative);
+        if let Err(error) = ensure_repair_path_safe(data_root, &target, "repair-plan target") {
+            repair_hash_update(hash, b"target-unsafe:");
+            repair_hash_update(hash, error.message.as_bytes());
+        } else {
+            match fs::symlink_metadata(&target) {
+                Ok(metadata)
+                    if metadata.file_type().is_symlink()
+                        || metadata_is_reparse_point(&metadata) =>
+                {
+                    repair_hash_update(hash, b"target-reparse");
+                }
+                Ok(metadata) if metadata.is_dir() => {
+                    repair_hash_update(hash, b"target-dir");
+                }
+                Ok(metadata) if metadata.is_file() => {
+                    repair_hash_update(hash, b"target-file:");
+                    match fs::read(&target) {
+                        Ok(bytes) => repair_hash_update(hash, &bytes),
+                        Err(error) => repair_hash_update(
+                            hash,
+                            format!("target-file-error:{:?}", error.kind()).as_bytes(),
+                        ),
+                    }
+                }
+                Ok(_) => repair_hash_update(hash, b"target-other"),
+                Err(error) => repair_hash_update(
+                    hash,
+                    format!("target-missing:{:?}", error.kind()).as_bytes(),
+                ),
+            }
+        }
+
+        if source_kind.is_dir() {
+            hash_baseline_target_evidence(
+                hash,
+                data_root,
+                baseline_root,
+                &source,
+                destination_root,
+                skip_top,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_managed_file(
+    data_root: &Path,
+    items: &mut Vec<RepairItem>,
+    id: &str,
+    component: &str,
+    label: &str,
+    path: &Path,
+    marker: &str,
+    expected: &[u8],
+) {
+    if let Err(error) = ensure_repair_path_safe(data_root, path, label) {
+        items.push(repair_item(
+            id,
+            component,
+            label,
+            RepairClassification::Blocked,
+            "Preserve the redirected managed-file path",
+            &error.message,
+            &error.recovery,
+            true,
+        ));
+        return;
+    }
+    if !path.exists() {
+        items.push(repair_item(
+            id,
+            component,
+            label,
+            RepairClassification::Repairable,
+            &format!("Restore the managed {label}"),
+            &format!("The CoffeePOS-managed {label} is missing."),
+            "The deterministic managed file is recreated atomically from the pinned Desktop baseline.",
+            true,
+        ));
+        return;
+    }
+    if !path.is_file() {
+        items.push(repair_item(
+            id,
+            component,
+            label,
+            RepairClassification::Blocked,
+            "Preserve the conflicting path",
+            &format!("The {label} path exists but is not a regular file."),
+            "CoffeePOS will not replace an unexpected filesystem object.",
+            true,
+        ));
+        return;
+    }
+    match fs::read(path) {
+        Ok(bytes) => {
+            let marked = String::from_utf8_lossy(&bytes).contains(marker);
+            if !marked {
+                items.push(repair_item(
+                    id,
+                    component,
+                    label,
+                    RepairClassification::Blocked,
+                    "Preserve the unmanaged file",
+                    &format!("The existing {label} is not marked as CoffeePOS-managed."),
+                    "CoffeePOS will not adopt or overwrite an unmanaged file.",
+                    true,
+                ));
+            } else if bytes != expected {
+                items.push(repair_item(
+                    id,
+                    component,
+                    label,
+                    RepairClassification::Repairable,
+                    &format!("Restore the canonical managed {label}"),
+                    &format!("The {label} is proven managed but differs from the deterministic baseline."),
+                    "The file is replaced atomically; unrelated store data is untouched.",
+                    true,
+                ));
+            }
+        }
+        Err(error) => items.push(repair_item(
+            id,
+            component,
+            label,
+            RepairClassification::Blocked,
+            "Fix filesystem access before repair",
+            &format!("Cannot read {label}: {error}."),
+            "No file is changed while its current contents cannot be inspected.",
+            true,
+        )),
+    }
+}
+
+fn should_skip_baseline_path(relative: &Path, skip_top: Option<&str>) -> bool {
+    let Some(skip_top) = skip_top else {
+        return false;
+    };
+    relative
+        .components()
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+        == Some(skip_top)
+}
+
+fn baseline_tree_differs(
+    data_root: &Path,
+    baseline_root: &Path,
+    destination_root: &Path,
+    skip_top: Option<&str>,
+) -> Result<bool, RuntimeErrorInfo> {
+    fn walk(
+        data_root: &Path,
+        baseline_root: &Path,
+        current: &Path,
+        destination_root: &Path,
+        skip_top: Option<&str>,
+    ) -> Result<bool, RuntimeErrorInfo> {
+        let entries = fs::read_dir(current).map_err(|error| {
+            provisioning_error(
+                "inspect repair baseline",
+                format!(
+                    "Cannot read pinned baseline directory {}: {error}.",
+                    current.display()
+                ),
+                "Restage the verified development artifacts and retry repair.",
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                provisioning_error(
+                    "inspect repair baseline",
+                    format!("Cannot enumerate pinned baseline: {error}."),
+                    "Restage the verified development artifacts and retry repair.",
+                )
+            })?;
+            let source = entry.path();
+            let relative = source.strip_prefix(baseline_root).map_err(|_| {
+                provisioning_error(
+                    "inspect repair baseline",
+                    "Pinned repair baseline escaped its resolved artifact root.",
+                    "Restage the verified development artifacts before retrying repair.",
+                )
+            })?;
+            if should_skip_baseline_path(relative, skip_top) {
+                continue;
+            }
+            let target = destination_root.join(relative);
+            ensure_repair_path_safe(data_root, &target, "repair target")?;
+            let kind = entry.file_type().map_err(|error| {
+                provisioning_error(
+                    "inspect repair baseline",
+                    format!("Cannot inspect pinned baseline entry: {error}."),
+                    "Restage the verified development artifacts and retry repair.",
+                )
+            })?;
+            if kind.is_dir() {
+                if target.exists() && !target.is_dir() {
+                    return Ok(true);
+                }
+                if walk(
+                    data_root,
+                    baseline_root,
+                    &source,
+                    destination_root,
+                    skip_top,
+                )? {
+                    return Ok(true);
+                }
+            } else if kind.is_file() {
+                if !target.is_file() {
+                    return Ok(true);
+                }
+                let source_bytes = fs::read(&source).map_err(|error| {
+                    provisioning_error(
+                        "inspect repair baseline",
+                        format!(
+                            "Cannot read pinned baseline file {}: {error}.",
+                            source.display()
+                        ),
+                        "Restage the verified development artifacts and retry repair.",
+                    )
+                })?;
+                let target_bytes = fs::read(&target).map_err(|error| {
+                    provisioning_error(
+                        "inspect repair target",
+                        format!(
+                            "Cannot read managed target file {}: {error}.",
+                            target.display()
+                        ),
+                        "Fix application-data permissions and retry repair.",
+                    )
+                })?;
+                if source_bytes != target_bytes {
+                    return Ok(true);
+                }
+            } else {
+                return Err(provisioning_error(
+                    "inspect repair baseline",
+                    format!(
+                        "Pinned baseline contains unsupported entry {}.",
+                        source.display()
+                    ),
+                    "Restage the verified artifact; repair only accepts regular files/directories.",
+                ));
+            }
+        }
+        Ok(false)
+    }
+    walk(
+        data_root,
+        baseline_root,
+        baseline_root,
+        destination_root,
+        skip_top,
+    )
+}
+
+fn overlay_baseline_tree(
+    data_root: &Path,
+    baseline_root: &Path,
+    destination_root: &Path,
+    skip_top: Option<&str>,
+    label: &str,
+) -> Result<(), RuntimeErrorInfo> {
+    fn walk(
+        data_root: &Path,
+        baseline_root: &Path,
+        current: &Path,
+        destination_root: &Path,
+        skip_top: Option<&str>,
+        label: &str,
+    ) -> Result<(), RuntimeErrorInfo> {
+        for entry in fs::read_dir(current).map_err(|error| {
+            provisioning_error(
+                format!("repair {label}"),
+                format!(
+                    "Cannot read pinned baseline directory {}: {error}.",
+                    current.display()
+                ),
+                "Restage the exact pinned artifact and retry repair.",
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                provisioning_error(
+                    format!("repair {label}"),
+                    format!("Cannot enumerate pinned baseline: {error}."),
+                    "Restage the exact pinned artifact and retry repair.",
+                )
+            })?;
+            let source = entry.path();
+            let relative = source.strip_prefix(baseline_root).map_err(|_| {
+                provisioning_error(
+                    format!("repair {label}"),
+                    "Pinned repair baseline escaped its artifact root.",
+                    "Restage the exact pinned artifact and retry repair.",
+                )
+            })?;
+            if should_skip_baseline_path(relative, skip_top) {
+                continue;
+            }
+            let target = destination_root.join(relative);
+            ensure_repair_path_safe(data_root, &target, label)?;
+            let kind = entry.file_type().map_err(|error| {
+                provisioning_error(
+                    format!("repair {label}"),
+                    format!("Cannot inspect pinned baseline entry: {error}."),
+                    "Restage the exact pinned artifact and retry repair.",
+                )
+            })?;
+            if kind.is_dir() {
+                if target.exists() && !target.is_dir() {
+                    return Err(provisioning_error(
+                        format!("repair {label}"),
+                        format!("Managed target {} blocks a required directory.", target.display()),
+                        "Preserve the conflicting path and resolve it explicitly before retrying repair.",
+                    ));
+                }
+                fs::create_dir_all(&target).map_err(|error| {
+                    provisioning_error(
+                        format!("repair {label}"),
+                        format!(
+                            "Cannot create managed directory {}: {error}.",
+                            target.display()
+                        ),
+                        "Check application-data permissions and retry repair.",
+                    )
+                })?;
+                walk(
+                    data_root,
+                    baseline_root,
+                    &source,
+                    destination_root,
+                    skip_top,
+                    label,
+                )?;
+            } else if kind.is_file() {
+                if target.exists() && !target.is_file() {
+                    return Err(provisioning_error(
+                        format!("repair {label}"),
+                        format!("Managed target {} blocks a required file.", target.display()),
+                        "Preserve the conflicting path and resolve it explicitly before retrying repair.",
+                    ));
+                }
+                let source_bytes = fs::read(&source).map_err(|error| {
+                    provisioning_error(
+                        format!("repair {label}"),
+                        format!(
+                            "Cannot read pinned baseline file {}: {error}.",
+                            source.display()
+                        ),
+                        "Restage the exact pinned artifact and retry repair.",
+                    )
+                })?;
+                let needs_write = fs::read(&target)
+                    .map(|bytes| bytes != source_bytes)
+                    .unwrap_or(true);
+                if needs_write {
+                    atomic_write(&target, &source_bytes, label)?;
+                }
+            } else {
+                return Err(provisioning_error(
+                    format!("repair {label}"),
+                    format!(
+                        "Pinned baseline contains unsupported entry {}.",
+                        source.display()
+                    ),
+                    "Restage the verified artifact before retrying repair.",
+                ));
+            }
+        }
+        Ok(())
+    }
+    fs::create_dir_all(destination_root).map_err(|error| {
+        provisioning_error(
+            format!("repair {label}"),
+            format!(
+                "Cannot create managed destination {}: {error}.",
+                destination_root.display()
+            ),
+            "Check application-data permissions and retry repair.",
+        )
+    })?;
+    ensure_repair_path_safe(data_root, destination_root, label)?;
+    walk(
+        data_root,
+        baseline_root,
+        baseline_root,
+        destination_root,
+        skip_top,
+        label,
+    )
+}
+
+fn reset_owned_repair_dir(data_root: &Path, path: &Path) -> Result<(), RuntimeErrorInfo> {
+    ensure_repair_path_safe(data_root, path, "repair staging/backup")?;
+    let parent = path.parent().ok_or_else(|| {
+        provisioning_error(
+            "reset repair staging",
+            "Repair staging path has no parent directory.",
+            "Restart CoffeePOS Desktop and inspect the application-data path.",
+        )
+    })?;
+    let name = path.file_name().and_then(|value| value.to_str());
+    if parent != data_root
+        || !matches!(
+            name,
+            Some(
+                WOOCOMMERCE_REPAIR_STAGING
+                    | WOOCOMMERCE_REPAIR_BACKUP
+                    | COFFEEPOS_REPAIR_STAGING
+                    | COFFEEPOS_REPAIR_BACKUP
+            )
+        )
+    {
+        return Err(provisioning_error(
+            "reset repair staging",
+            "Refusing to remove an unexpected repair path.",
+            "Restart CoffeePOS Desktop and inspect the application-data path before retrying.",
+        ));
+    }
+    if path.exists() {
+        fs::remove_dir_all(path).map_err(|error| {
+            provisioning_error(
+                "reset repair staging",
+                format!(
+                    "Cannot remove owned repair directory {}: {error}.",
+                    path.display()
+                ),
+                "Close processes using the repair directory and retry.",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plugin_tree_is_exact(
+    data_root: &Path,
+    destination: &Path,
+    slug: &str,
+    version: &str,
+    archive_sha256: &str,
+    ownership_schema: u32,
+    baseline_root: &Path,
+) -> bool {
+    if !destination.is_dir() {
+        return false;
+    }
+    let ownership = fs::read(destination.join(MANAGED_PLUGIN_OWNERSHIP_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ManagedPluginOwnership>(&bytes).ok());
+    let Some(ownership) = ownership else {
+        return false;
+    };
+    ownership.schema_version == ownership_schema
+        && ownership.plugin == slug
+        && ownership.version == version
+        && ownership
+            .archive_sha256
+            .eq_ignore_ascii_case(archive_sha256)
+        && baseline_tree_differs(
+            data_root,
+            baseline_root,
+            destination,
+            Some(MANAGED_PLUGIN_OWNERSHIP_FILE),
+        )
+        .map(|differs| !differs)
+        .unwrap_or(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn repair_managed_plugin_tree(
+    data_root: &Path,
+    slug: &str,
+    version: &str,
+    archive_sha256: &str,
+    ownership_schema: u32,
+    baseline_root: &Path,
+    staging_name: &str,
+    backup_name: &str,
+    label: &str,
+) -> Result<(), RuntimeErrorInfo> {
+    let destination = data_root.join("site/wp-content/plugins").join(slug);
+    let staging = data_root.join(staging_name);
+    let backup = data_root.join(backup_name);
+    ensure_repair_path_safe(data_root, &destination, label)?;
+    ensure_repair_path_safe(data_root, &staging, &format!("{label} repair staging"))?;
+    ensure_repair_path_safe(data_root, &backup, &format!("{label} repair backup"))?;
+    if destination.exists() {
+        ensure_repair_tree_safe(data_root, &destination, label)?;
+    }
+
+    if backup.exists() {
+        if !backup.is_dir() {
+            return Err(provisioning_error(
+                format!("recover {label} repair"),
+                "Owned repair backup path exists but is not a directory.",
+                "Preserve the unexpected path and resolve it explicitly before retrying repair.",
+            ));
+        }
+        if backup.join(REPAIR_ORIGINAL_MISSING_MARKER).is_file() {
+            return Err(provisioning_error(
+                format!("recover {label} repair"),
+                "An unfinished repair marker says the managed plugin destination was originally missing.",
+                "Preserve the repair journal, live destination, and owned repair backup marker for explicit transaction recovery before starting another repair.",
+            ));
+        }
+        if !destination.exists() {
+            fs::rename(&backup, &destination).map_err(|error| {
+                provisioning_error(
+                    format!("recover {label} repair"),
+                    format!("Cannot restore the pre-repair managed plugin backup: {error}."),
+                    "Close processes using plugin files and retry; the backup is preserved.",
+                )
+            })?;
+        } else if plugin_tree_is_exact(
+            data_root,
+            &destination,
+            slug,
+            version,
+            archive_sha256,
+            ownership_schema,
+            baseline_root,
+        ) {
+            reset_owned_repair_dir(data_root, &backup)?;
+        } else {
+            return Err(provisioning_error(
+                format!("recover {label} repair"),
+                "Both an owned repair backup and a non-verified destination exist.",
+                "Preserve both plugin trees. CoffeePOS will not guess which tree is authoritative.",
+            ));
+        }
+    }
+
+    let destination_was_missing = !destination.exists();
+    if destination_was_missing {
+        reset_owned_repair_dir(data_root, &backup)?;
+        fs::create_dir_all(&backup).map_err(|error| {
+            provisioning_error(
+                format!("prepare {label} repair rollback"),
+                format!("Cannot create owned repair backup marker directory: {error}."),
+                "Check application-data permissions and retry before activating repaired plugin files.",
+            )
+        })?;
+        atomic_write(
+            &backup.join(REPAIR_ORIGINAL_MISSING_MARKER),
+            b"original managed plugin destination was missing\n",
+            &format!("{label} original-missing repair marker"),
+        )?;
+    }
+
+    reset_owned_repair_dir(data_root, &staging)?;
+    if destination.exists() {
+        if !destination.is_dir() {
+            return Err(provisioning_error(
+                format!("repair {label}"),
+                "Managed plugin destination exists but is not a directory.",
+                "Preserve the conflicting path and resolve it explicitly before retrying repair.",
+            ));
+        }
+        let ownership =
+            fs::read(destination.join(MANAGED_PLUGIN_OWNERSHIP_FILE)).map_err(|error| {
+                provisioning_error(
+                    format!("repair {label}"),
+                    format!("Cannot read managed plugin ownership metadata: {error}."),
+                    "Preserve the plugin directory; repair requires proven CoffeePOS ownership.",
+                )
+            })?;
+        let ownership: ManagedPluginOwnership = serde_json::from_slice(&ownership).map_err(|error| {
+            provisioning_error(
+                format!("repair {label}"),
+                format!("Managed plugin ownership metadata is invalid: {error}."),
+                "Preserve the plugin directory; repair will not rewrite incompatible ownership metadata.",
+            )
+        })?;
+        if ownership.schema_version != ownership_schema
+            || ownership.plugin != slug
+            || ownership.version != version
+            || !ownership
+                .archive_sha256
+                .eq_ignore_ascii_case(archive_sha256)
+        {
+            return Err(provisioning_error(
+                format!("repair {label}"),
+                "Managed plugin ownership metadata does not match the pinned same-version baseline.",
+                "Use an explicit adoption/upgrade flow instead of overwriting this plugin.",
+            ));
+        }
+        copy_tree(
+            &destination,
+            &staging,
+            &format!("{label} repair staging"),
+            "Close processes using plugin files and retry repair.",
+        )?;
+    } else {
+        fs::create_dir_all(&staging).map_err(|error| {
+            provisioning_error(
+                format!("repair {label}"),
+                format!("Cannot create repair staging directory: {error}."),
+                "Check application-data permissions and retry repair.",
+            )
+        })?;
+    }
+
+    overlay_baseline_tree(
+        data_root,
+        baseline_root,
+        &staging,
+        Some(MANAGED_PLUGIN_OWNERSHIP_FILE),
+        label,
+    )?;
+    let ownership = ManagedPluginOwnership {
+        schema_version: ownership_schema,
+        plugin: slug.into(),
+        version: version.into(),
+        archive_sha256: archive_sha256.into(),
+    };
+    let mut ownership_bytes = serde_json::to_vec_pretty(&ownership).map_err(|error| {
+        provisioning_error(
+            format!("repair {label}"),
+            format!("Cannot serialize managed plugin ownership metadata: {error}."),
+            "Retry after checking application-data storage.",
+        )
+    })?;
+    ownership_bytes.push(b'\n');
+    atomic_write(
+        &staging.join(MANAGED_PLUGIN_OWNERSHIP_FILE),
+        &ownership_bytes,
+        &format!("{label} ownership metadata"),
+    )?;
+    if baseline_tree_differs(
+        data_root,
+        baseline_root,
+        &staging,
+        Some(MANAGED_PLUGIN_OWNERSHIP_FILE),
+    )? {
+        return Err(provisioning_error(
+            format!("repair {label}"),
+            "Repaired staging tree still differs from the pinned baseline.",
+            "Preserve the live plugin and restage the verified artifact before retrying repair.",
+        ));
+    }
+
+    if destination.exists() {
+        reset_owned_repair_dir(data_root, &backup)?;
+        fs::rename(&destination, &backup).map_err(|error| {
+            provisioning_error(
+                format!("repair {label}"),
+                format!("Cannot move the managed plugin into the repair backup: {error}."),
+                "Close processes using plugin files and retry; the live plugin has not been overwritten.",
+            )
+        })?;
+    }
+    if let Err(error) = fs::rename(&staging, &destination) {
+        let activation_error = provisioning_error(
+            format!("repair {label}"),
+            format!("Cannot atomically activate the repaired plugin tree: {error}."),
+            "Restore the proven pre-repair state before retrying after checking filesystem permissions.",
+        );
+        if let Err(rollback_error) =
+            rollback_managed_plugin_repair(data_root, slug, staging_name, backup_name, label)
+        {
+            return Err(provisioning_error(
+                format!("rollback {label} repair"),
+                format!(
+                    "{} Rollback also failed: {}",
+                    activation_error.message, rollback_error.message
+                ),
+                "Preserve config/repair.json plus the repair staging/backup evidence. Do not start another repair until the plugin destination is reconciled explicitly.",
+            ));
+        }
+        return Err(activation_error);
+    }
+    if !plugin_tree_is_exact(
+        data_root,
+        &destination,
+        slug,
+        version,
+        archive_sha256,
+        ownership_schema,
+        baseline_root,
+    ) {
+        let verification_error = provisioning_error(
+            format!("verify {label} repair"),
+            "The activated repaired plugin tree did not verify against the pinned baseline.",
+            "The pre-repair state must be restored before retrying after restaging artifacts.",
+        );
+        if let Err(rollback_error) =
+            rollback_managed_plugin_repair(data_root, slug, staging_name, backup_name, label)
+        {
+            return Err(provisioning_error(
+                format!("rollback {label} repair"),
+                format!(
+                    "{} Rollback also failed: {}",
+                    verification_error.message, rollback_error.message
+                ),
+                "Preserve the repair journal plus staging/backup evidence and reconcile the plugin trees explicitly.",
+            ));
+        }
+        return Err(verification_error);
+    }
+    Ok(())
+}
+
+fn commit_managed_plugin_repair(
+    data_root: &Path,
+    backup_name: &str,
+    label: &str,
+) -> Result<(), RuntimeErrorInfo> {
+    let backup = data_root.join(backup_name);
+    if !backup.exists() {
+        return Ok(());
+    }
+    reset_owned_repair_dir(data_root, &backup).map_err(|error| {
+        provisioning_error(
+            format!("commit {label} repair"),
+            format!(
+                "The repaired {label} plugin verified successfully, but its pre-repair backup could not be removed: {}",
+                error.message
+            ),
+            "Keep the verified repaired plugin and retry repair cleanup. The pre-repair backup is preserved.",
+        )
+    })
+}
+
+fn rollback_managed_plugin_repair(
+    data_root: &Path,
+    slug: &str,
+    staging_name: &str,
+    backup_name: &str,
+    label: &str,
+) -> Result<(), RuntimeErrorInfo> {
+    let destination = data_root.join("site/wp-content/plugins").join(slug);
+    let failed = data_root.join(staging_name);
+    let backup = data_root.join(backup_name);
+    if !backup.exists() {
+        return Err(provisioning_error(
+            format!("rollback {label} repair"),
+            "The owned pre-repair backup state is missing, so CoffeePOS cannot prove what should be restored.",
+            "Preserve the live plugin and repair journal; do not infer that the original destination was absent.",
+        ));
+    }
+    ensure_repair_path_safe(data_root, &destination, label)?;
+    ensure_repair_path_safe(data_root, &failed, &format!("{label} failed repair"))?;
+    ensure_repair_path_safe(data_root, &backup, &format!("{label} repair backup"))?;
+    reset_owned_repair_dir(data_root, &failed)?;
+    let original_was_missing = backup.join(REPAIR_ORIGINAL_MISSING_MARKER).is_file();
+    if destination.exists() {
+        fs::rename(&destination, &failed).map_err(|error| {
+            provisioning_error(
+                format!("rollback {label} repair"),
+                format!("Cannot preserve the failed repaired {label} tree: {error}."),
+                "Preserve the destination and repair backup; CoffeePOS will not overwrite either tree.",
+            )
+        })?;
+    }
+    if original_was_missing {
+        reset_owned_repair_dir(data_root, &backup)?;
+        return Ok(());
+    }
+    if let Err(error) = fs::rename(&backup, &destination) {
+        if failed.exists() && !destination.exists() {
+            let _ = fs::rename(&failed, &destination);
+        }
+        return Err(provisioning_error(
+            format!("rollback {label} repair"),
+            format!("Cannot restore the pre-repair managed {label} plugin: {error}."),
+            "Preserve the repair backup and failed repaired tree for explicit recovery.",
+        ));
+    }
+    Ok(())
+}
+
+fn rollback_pending_plugin_repair_trees(data_root: &Path) -> Result<(), RuntimeErrorInfo> {
+    if data_root.join(WOOCOMMERCE_REPAIR_BACKUP).exists() {
+        rollback_managed_plugin_repair(
+            data_root,
+            WOOCOMMERCE_PLUGIN_SLUG,
+            WOOCOMMERCE_REPAIR_STAGING,
+            WOOCOMMERCE_REPAIR_BACKUP,
+            "WooCommerce",
+        )?;
+    }
+    if data_root.join(COFFEEPOS_REPAIR_BACKUP).exists() {
+        rollback_managed_plugin_repair(
+            data_root,
+            COFFEEPOS_PLUGIN_SLUG,
+            COFFEEPOS_REPAIR_STAGING,
+            COFFEEPOS_REPAIR_BACKUP,
+            "CoffeePOS",
+        )?;
+    }
+    Ok(())
+}
+
+fn commit_pending_plugin_repair_backups(data_root: &Path) -> Result<(), RuntimeErrorInfo> {
+    if data_root.join(WOOCOMMERCE_REPAIR_BACKUP).exists() {
+        commit_managed_plugin_repair(data_root, WOOCOMMERCE_REPAIR_BACKUP, "WooCommerce")?;
+    }
+    if data_root.join(COFFEEPOS_REPAIR_BACKUP).exists() {
+        commit_managed_plugin_repair(data_root, COFFEEPOS_REPAIR_BACKUP, "CoffeePOS")?;
+    }
+    Ok(())
+}
+
+fn validate_admin_repair_password(password: &str) -> Result<(), RuntimeErrorInfo> {
+    let count = password.chars().count();
+    if !(12..=128).contains(&count) || password.chars().any(char::is_control) {
+        return Err(provisioning_error(
+            "repair administrator password",
+            "Administrator password must contain 12–128 characters without control characters.",
+            "Enter a replacement password that meets the same Phase 5.2 password contract.",
+        ));
+    }
+    Ok(())
+}
+
 fn sql_literal(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "''")
 }
@@ -4582,6 +7449,48 @@ fwrite(STDOUT, "CoffeePOS machine credential switched.\n");
 exit(0);
 "#;
 
+const WORDPRESS_ADMIN_PASSWORD_REPAIR: &str = r#"<?php
+declare(strict_types=1);
+
+$siteRoot = getenv('COFFEEPOS_SITE_ROOT');
+$username = trim((string) getenv('COFFEEPOS_ADMIN_USERNAME'));
+if (!$siteRoot || $username === '') {
+    fwrite(STDERR, "CoffeePOS administrator-password repair environment is incomplete.\n");
+    exit(2);
+}
+$password = (string) stream_get_contents(STDIN);
+$length = function_exists('mb_strlen') ? mb_strlen($password, 'UTF-8') : strlen($password);
+if ($length < 12 || $length > 128 || preg_match('/[\x00-\x1f\x7f]/', $password)) {
+    fwrite(STDERR, "Replacement administrator password does not meet the Desktop password contract.\n");
+    exit(3);
+}
+
+require_once $siteRoot . '/wp-load.php';
+$user = get_user_by('login', $username);
+if (!$user || !isset($user->ID) || (string) $user->user_login !== $username) {
+    $password = '';
+    fwrite(STDERR, "The provisioned administrator account could not be identified exactly.\n");
+    exit(4);
+}
+if (!user_can($user, 'manage_options')) {
+    $password = '';
+    fwrite(STDERR, "The provisioned administrator account no longer has administrator authority.\n");
+    exit(5);
+}
+
+wp_set_password($password, (int) $user->ID);
+clean_user_cache((int) $user->ID);
+$verified = get_user_by('id', (int) $user->ID);
+if (!$verified || (string) $verified->user_login !== $username || !wp_check_password($password, (string) $verified->user_pass, (int) $verified->ID)) {
+    $password = '';
+    fwrite(STDERR, "WordPress did not verify the replacement administrator password.\n");
+    exit(6);
+}
+$password = '';
+fwrite(STDOUT, "CoffeePOS administrator password updated and verified.\n");
+exit(0);
+"#;
+
 const WORDPRESS_ROUTER: &str = r#"<?php
 // CoffeePOS Desktop managed router.
 declare(strict_types=1);
@@ -4661,6 +7570,76 @@ mod tests {
         RuntimeManager, RuntimeState, WordPressHealthState,
     };
 
+    fn repair_test_provisioner(data_root: PathBuf) -> Provisioner {
+        let artifact_root = data_root.join("test-artifacts");
+        let wordpress_root = artifact_root.join("wordpress");
+        let woocommerce_root = artifact_root.join("woocommerce");
+        let coffeepos_root = artifact_root.join("coffeepos");
+        fs::create_dir_all(&wordpress_root).unwrap();
+        fs::create_dir_all(&woocommerce_root).unwrap();
+        fs::create_dir_all(&coffeepos_root).unwrap();
+        Provisioner {
+            runtime: ResolvedRuntime {
+                runtime_version: "test".into(),
+                php_version: "8.4.25".into(),
+                php_executable: artifact_root.join("php.exe"),
+                php_cgi_executable: artifact_root.join("php-cgi.exe"),
+                php_ini: artifact_root.join("php.ini"),
+                web_server_version: "2.11.4".into(),
+                web_server_executable: artifact_root.join("caddy.exe"),
+                mariadb_version: "11.4.13".into(),
+                mariadb_executable: artifact_root.join("mariadbd.exe"),
+                mariadb_client_executable: artifact_root.join("mariadb.exe"),
+                mariadb_install_db_executable: artifact_root.join("mariadb-install-db.exe"),
+                mariadb_base_dir: artifact_root.join("mariadb"),
+            },
+            wordpress: ResolvedWordPress {
+                version: "7.1".into(),
+                core_root: wordpress_root,
+            },
+            woocommerce: ResolvedWooCommerce {
+                version: "11.1.0".into(),
+                plugin_root: woocommerce_root,
+                archive_sha256: "woo-test-hash".into(),
+            },
+            coffeepos: ResolvedCoffeePos {
+                version: "1.0.1".into(),
+                plugin_root: coffeepos_root,
+                archive_sha256: "coffeepos-test-hash".into(),
+                required_wordpress_version: "7.1".into(),
+                required_php_version: "8.4.25".into(),
+                required_mariadb_version: "11.4.13".into(),
+                required_woocommerce_version: "11.1.0".into(),
+            },
+            data_root,
+            containment: ProcessContainment::new().unwrap(),
+            admin_username: WORDPRESS_ADMIN_USER.into(),
+            admin_email: WORDPRESS_ADMIN_EMAIL.into(),
+            failure_after: None,
+        }
+    }
+
+    fn write_repair_test_journal(
+        provisioner: &Provisioner,
+        stage: RepairJournalStage,
+        completed_item_ids: Vec<String>,
+    ) {
+        fs::create_dir_all(provisioner.data_root.join("config")).unwrap();
+        fs::create_dir_all(provisioner.data_root.join("site")).unwrap();
+        fs::create_dir_all(provisioner.data_root.join("database")).unwrap();
+        provisioner
+            .persist_repair_journal(&RepairJournal {
+                schema_version: REPAIR_SCHEMA_VERSION,
+                plan_id: "original-repair-plan".into(),
+                item_ids: vec!["woocommerce_plugin".into()],
+                completed_item_ids,
+                active_item_id: None,
+                runtime_was_running: true,
+                stage,
+            })
+            .unwrap();
+    }
+
     #[test]
     fn sql_literal_escapes_quotes_and_backslashes() {
         assert_eq!(sql_literal("a'b\\c"), "a''b\\\\c");
@@ -4687,6 +7666,443 @@ mod tests {
         assert!(reset_owned_staging_dir(data, &data.join("database")).is_err());
         assert!(reset_owned_staging_dir(data, &data.join("site.provisioning")).is_ok());
         assert!(reset_owned_staging_dir(data, &data.join("coffeepos.provisioning")).is_ok());
+    }
+
+    #[test]
+    fn repair_wordpress_core_overlay_preserves_wp_content_and_extra_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let baseline = temp.path().join("baseline");
+        let destination = temp.path().join("site");
+        fs::create_dir_all(baseline.join("wp-includes")).unwrap();
+        fs::create_dir_all(baseline.join("wp-content")).unwrap();
+        fs::create_dir_all(destination.join("wp-content")).unwrap();
+        fs::write(baseline.join("wp-settings.php"), b"pinned-core").unwrap();
+        fs::write(baseline.join("wp-includes/version.php"), b"pinned-version").unwrap();
+        fs::write(baseline.join("wp-content/index.php"), b"pinned-content").unwrap();
+        fs::write(destination.join("wp-settings.php"), b"corrupt-core").unwrap();
+        fs::write(destination.join("wp-content/index.php"), b"store-content").unwrap();
+        fs::write(
+            destination.join("wp-content/business-sentinel.txt"),
+            b"keep-me",
+        )
+        .unwrap();
+        fs::write(destination.join("unrelated-extra.txt"), b"preserve-extra").unwrap();
+
+        overlay_baseline_tree(
+            temp.path(),
+            &baseline,
+            &destination,
+            Some("wp-content"),
+            "WordPress core",
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("wp-settings.php")).unwrap(),
+            b"pinned-core"
+        );
+        assert_eq!(
+            fs::read(destination.join("wp-includes/version.php")).unwrap(),
+            b"pinned-version"
+        );
+        assert_eq!(
+            fs::read(destination.join("wp-content/index.php")).unwrap(),
+            b"store-content"
+        );
+        assert_eq!(
+            fs::read(destination.join("wp-content/business-sentinel.txt")).unwrap(),
+            b"keep-me"
+        );
+        assert_eq!(
+            fs::read(destination.join("unrelated-extra.txt")).unwrap(),
+            b"preserve-extra"
+        );
+    }
+
+    #[test]
+    fn repair_managed_plugin_preserves_extra_files_and_restores_pinned_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("store");
+        let baseline = temp.path().join("plugin-baseline");
+        let destination = data_root.join("site/wp-content/plugins/test-plugin");
+        fs::create_dir_all(baseline.join("assets")).unwrap();
+        fs::create_dir_all(destination.join("assets")).unwrap();
+        fs::write(baseline.join("plugin.php"), b"pinned-plugin").unwrap();
+        fs::write(baseline.join("assets/app.js"), b"pinned-js").unwrap();
+        fs::write(destination.join("plugin.php"), b"corrupt-plugin").unwrap();
+        fs::write(destination.join("assets/app.js"), b"corrupt-js").unwrap();
+        fs::write(destination.join("business-sentinel.txt"), b"keep-me").unwrap();
+        let ownership = ManagedPluginOwnership {
+            schema_version: 1,
+            plugin: "test-plugin".into(),
+            version: "1.0.0".into(),
+            archive_sha256: "abc123".into(),
+        };
+        let mut ownership_bytes = serde_json::to_vec_pretty(&ownership).unwrap();
+        ownership_bytes.push(b'\n');
+        fs::write(
+            destination.join(MANAGED_PLUGIN_OWNERSHIP_FILE),
+            ownership_bytes,
+        )
+        .unwrap();
+
+        repair_managed_plugin_tree(
+            &data_root,
+            "test-plugin",
+            "1.0.0",
+            "abc123",
+            1,
+            &baseline,
+            COFFEEPOS_REPAIR_STAGING,
+            COFFEEPOS_REPAIR_BACKUP,
+            "test plugin",
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("plugin.php")).unwrap(),
+            b"pinned-plugin"
+        );
+        assert_eq!(
+            fs::read(destination.join("assets/app.js")).unwrap(),
+            b"pinned-js"
+        );
+        assert_eq!(
+            fs::read(destination.join("business-sentinel.txt")).unwrap(),
+            b"keep-me"
+        );
+        assert!(!data_root.join(COFFEEPOS_REPAIR_STAGING).exists());
+        assert!(data_root.join(COFFEEPOS_REPAIR_BACKUP).exists());
+        commit_managed_plugin_repair(&data_root, COFFEEPOS_REPAIR_BACKUP, "test plugin").unwrap();
+        assert!(!data_root.join(COFFEEPOS_REPAIR_BACKUP).exists());
+    }
+
+    #[test]
+    fn failed_plugin_verifier_can_restore_pre_repair_tree_offline() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("store");
+        let baseline = temp.path().join("plugin-baseline");
+        let destination = data_root.join("site/wp-content/plugins/test-plugin");
+        fs::create_dir_all(&baseline).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(baseline.join("plugin.php"), b"pinned-plugin").unwrap();
+        fs::write(destination.join("plugin.php"), b"pre-repair-plugin").unwrap();
+        fs::write(destination.join("business-sentinel.txt"), b"keep-me").unwrap();
+        let ownership = ManagedPluginOwnership {
+            schema_version: 1,
+            plugin: "test-plugin".into(),
+            version: "1.0.0".into(),
+            archive_sha256: "abc123".into(),
+        };
+        let mut ownership_bytes = serde_json::to_vec_pretty(&ownership).unwrap();
+        ownership_bytes.push(b'\n');
+        fs::write(
+            destination.join(MANAGED_PLUGIN_OWNERSHIP_FILE),
+            ownership_bytes,
+        )
+        .unwrap();
+
+        repair_managed_plugin_tree(
+            &data_root,
+            "test-plugin",
+            "1.0.0",
+            "abc123",
+            1,
+            &baseline,
+            COFFEEPOS_REPAIR_STAGING,
+            COFFEEPOS_REPAIR_BACKUP,
+            "test plugin",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(destination.join("plugin.php")).unwrap(),
+            b"pinned-plugin"
+        );
+
+        rollback_managed_plugin_repair(
+            &data_root,
+            "test-plugin",
+            COFFEEPOS_REPAIR_STAGING,
+            COFFEEPOS_REPAIR_BACKUP,
+            "test plugin",
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("plugin.php")).unwrap(),
+            b"pre-repair-plugin"
+        );
+        assert_eq!(
+            fs::read(destination.join("business-sentinel.txt")).unwrap(),
+            b"keep-me"
+        );
+        assert_eq!(
+            fs::read(data_root.join(COFFEEPOS_REPAIR_STAGING).join("plugin.php")).unwrap(),
+            b"pinned-plugin"
+        );
+        assert!(!data_root.join(COFFEEPOS_REPAIR_BACKUP).exists());
+    }
+
+    #[test]
+    fn failed_plugin_verifier_restores_originally_missing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("store");
+        let baseline = temp.path().join("plugin-baseline");
+        let destination = data_root.join("site/wp-content/plugins/test-plugin");
+        fs::create_dir_all(&baseline).unwrap();
+        fs::create_dir_all(data_root.join("site/wp-content/plugins")).unwrap();
+        fs::write(baseline.join("plugin.php"), b"pinned-plugin").unwrap();
+
+        repair_managed_plugin_tree(
+            &data_root,
+            "test-plugin",
+            "1.0.0",
+            "abc123",
+            1,
+            &baseline,
+            COFFEEPOS_REPAIR_STAGING,
+            COFFEEPOS_REPAIR_BACKUP,
+            "test plugin",
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("plugin.php")).unwrap(),
+            b"pinned-plugin"
+        );
+        assert!(data_root
+            .join(COFFEEPOS_REPAIR_BACKUP)
+            .join(REPAIR_ORIGINAL_MISSING_MARKER)
+            .is_file());
+
+        rollback_managed_plugin_repair(
+            &data_root,
+            "test-plugin",
+            COFFEEPOS_REPAIR_STAGING,
+            COFFEEPOS_REPAIR_BACKUP,
+            "test plugin",
+        )
+        .unwrap();
+
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read(data_root.join(COFFEEPOS_REPAIR_STAGING).join("plugin.php")).unwrap(),
+            b"pinned-plugin"
+        );
+        assert!(!data_root.join(COFFEEPOS_REPAIR_BACKUP).exists());
+    }
+
+    #[test]
+    fn pending_plugin_rollback_restores_earlier_swap_before_runtime_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("store");
+        let destination = data_root.join("site/wp-content/plugins/woocommerce");
+        let backup = data_root.join(WOOCOMMERCE_REPAIR_BACKUP);
+        fs::create_dir_all(&destination).unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(destination.join("woocommerce.php"), b"repaired-unverified").unwrap();
+        fs::write(backup.join("woocommerce.php"), b"pre-repair").unwrap();
+
+        rollback_pending_plugin_repair_trees(&data_root).unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("woocommerce.php")).unwrap(),
+            b"pre-repair"
+        );
+        assert_eq!(
+            fs::read(
+                data_root
+                    .join(WOOCOMMERCE_REPAIR_STAGING)
+                    .join("woocommerce.php")
+            )
+            .unwrap(),
+            b"repaired-unverified"
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn interrupted_swapped_repair_rolls_back_owned_plugin_and_replans() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("store");
+        let provisioner = repair_test_provisioner(data_root.clone());
+        let destination = data_root.join("site/wp-content/plugins/woocommerce");
+        let backup = data_root.join(WOOCOMMERCE_REPAIR_BACKUP);
+        fs::create_dir_all(&destination).unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(destination.join("woocommerce.php"), b"repaired-unverified").unwrap();
+        fs::write(backup.join("woocommerce.php"), b"pre-repair").unwrap();
+        write_repair_test_journal(
+            &provisioner,
+            RepairJournalStage::Swapped,
+            vec!["woocommerce_plugin".into()],
+        );
+
+        let plan = provisioner.repair_plan(false, false);
+        assert!(plan.can_apply);
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].id, "repair_transaction");
+        assert_eq!(
+            plan.items[0].classification,
+            RepairClassification::Repairable
+        );
+
+        provisioner
+            .recover_interrupted_repair(&plan.plan_id)
+            .unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("woocommerce.php")).unwrap(),
+            b"pre-repair"
+        );
+        assert_eq!(
+            fs::read(
+                data_root
+                    .join(WOOCOMMERCE_REPAIR_STAGING)
+                    .join("woocommerce.php")
+            )
+            .unwrap(),
+            b"repaired-unverified"
+        );
+        assert!(!data_root.join(REPAIR_JOURNAL).exists());
+    }
+
+    #[test]
+    fn interrupted_verified_repair_keeps_live_plugin_and_commits_backup_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("store");
+        let provisioner = repair_test_provisioner(data_root.clone());
+        let destination = data_root.join("site/wp-content/plugins/woocommerce");
+        let backup = data_root.join(WOOCOMMERCE_REPAIR_BACKUP);
+        fs::create_dir_all(&destination).unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(destination.join("woocommerce.php"), b"verified-repaired").unwrap();
+        fs::write(backup.join("woocommerce.php"), b"pre-repair").unwrap();
+        write_repair_test_journal(
+            &provisioner,
+            RepairJournalStage::Verified,
+            vec!["woocommerce_plugin".into()],
+        );
+
+        let plan = provisioner.repair_plan(false, false);
+        assert!(plan.can_apply);
+        provisioner
+            .recover_interrupted_repair(&plan.plan_id)
+            .unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("woocommerce.php")).unwrap(),
+            b"verified-repaired"
+        );
+        assert!(!backup.exists());
+        assert!(!data_root.join(REPAIR_JOURNAL).exists());
+    }
+
+    #[test]
+    fn interrupted_swapped_repair_blocks_when_completed_plugin_backup_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("store");
+        let provisioner = repair_test_provisioner(data_root.clone());
+        let destination = data_root.join("site/wp-content/plugins/woocommerce");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("woocommerce.php"), b"unknown-live-state").unwrap();
+        write_repair_test_journal(
+            &provisioner,
+            RepairJournalStage::Swapped,
+            vec!["woocommerce_plugin".into()],
+        );
+
+        let plan = provisioner.repair_plan(false, false);
+        assert!(!plan.can_apply);
+        assert_eq!(plan.items[0].classification, RepairClassification::Blocked);
+        assert!(plan.items[0].reason.contains("backup/sentinel is missing"));
+        assert!(data_root.join(REPAIR_JOURNAL).is_file());
+    }
+
+    #[test]
+    fn repair_plan_id_changes_when_managed_evidence_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path();
+        fs::create_dir_all(data_root.join("config")).unwrap();
+        fs::write(
+            data_root.join("config/provisioning.json"),
+            b"first-evidence",
+        )
+        .unwrap();
+        let items = vec![repair_item(
+            "wordpress_router",
+            "wordpress",
+            "WordPress router",
+            RepairClassification::Repairable,
+            "Restore router",
+            "Managed router differs from baseline.",
+            "Only the managed router changes.",
+            true,
+        )];
+        let first = repair_plan_id(
+            data_root,
+            &ProvisioningState::NeedsRepair,
+            &items,
+            data_root,
+            data_root,
+            data_root,
+        );
+        fs::write(
+            data_root.join("config/provisioning.json"),
+            b"second-evidence",
+        )
+        .unwrap();
+        let second = repair_plan_id(
+            data_root,
+            &ProvisioningState::NeedsRepair,
+            &items,
+            data_root,
+            data_root,
+            data_root,
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn repair_plan_id_changes_when_repair_target_bytes_change_but_classification_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("store");
+        let wordpress_baseline = temp.path().join("wordpress-baseline");
+        let empty_baseline = temp.path().join("empty-baseline");
+        fs::create_dir_all(&wordpress_baseline).unwrap();
+        fs::create_dir_all(&empty_baseline).unwrap();
+        fs::create_dir_all(data_root.join("site")).unwrap();
+        fs::write(wordpress_baseline.join("wp-settings.php"), b"pinned").unwrap();
+        fs::write(data_root.join("site/wp-settings.php"), b"corrupt-a").unwrap();
+        let items = vec![repair_item(
+            "wordpress_core",
+            "wordpress",
+            "WordPress core",
+            RepairClassification::Repairable,
+            "Restore core",
+            "Managed WordPress core differs from baseline.",
+            "Only pinned core paths change.",
+            true,
+        )];
+
+        let first = repair_plan_id(
+            &data_root,
+            &ProvisioningState::NeedsRepair,
+            &items,
+            &wordpress_baseline,
+            &empty_baseline,
+            &empty_baseline,
+        );
+        fs::write(data_root.join("site/wp-settings.php"), b"corrupt-b").unwrap();
+        let second = repair_plan_id(
+            &data_root,
+            &ProvisioningState::NeedsRepair,
+            &items,
+            &wordpress_baseline,
+            &empty_baseline,
+            &empty_baseline,
+        );
+        assert_ne!(first, second);
     }
 
     #[test]

@@ -200,11 +200,16 @@
               <h2 id="diagnostics-title" tabindex="-1">Hệ thống</h2>
               <p class="page-subtitle">Theo dõi sức khỏe dịch vụ, chẩn đoán lỗi và điều khiển runtime cục bộ.</p>
             </div>
+            <nav class="system-nav" aria-label="Công cụ hệ thống">
+              <button type="button" class="system-nav-item" data-system-section="diagnostics" aria-controls="system-diagnostics-panel" aria-current="page">Chẩn đoán</button>
+              <button type="button" class="system-nav-item" data-system-section="repair" aria-controls="system-repair-panel">Sửa chữa</button>
+            </nav>
+            <div id="system-diagnostics-panel" data-system-panel="diagnostics">
             <section class="card" id="health-diagnostics" aria-labelledby="health-diagnostics-title">
               <div class="section-heading compact-heading">
                 <div>
                   <span class="section-label">CHẨN ĐOÁN</span>
-                  <h3 id="health-diagnostics-title">Tình trạng hệ thống</h3>
+                  <h3 id="health-diagnostics-title" tabindex="-1">Tình trạng hệ thống</h3>
                 </div>
                 <span id="health-summary-state" class="state-badge">—</span>
               </div>
@@ -273,6 +278,39 @@
                 </dl>
               </details>
             </section>
+            </div>
+            <div id="system-repair-panel" data-system-panel="repair" hidden>
+              <section class="card" id="repair" aria-labelledby="repair-title">
+                <div class="section-heading compact-heading">
+                  <div>
+                    <span class="section-label">SỬA CHỮA</span>
+                    <h3 id="repair-title" tabindex="-1">Sửa chữa hệ thống</h3>
+                  </div>
+                  <span id="repair-summary-state" class="state-badge">Chưa kiểm tra</span>
+                </div>
+                <p id="repair-summary" role="status" aria-live="polite">Kiểm tra các file, cấu hình, plugin và credential do CoffeePOS Desktop quản lý.</p>
+                <div id="repair-list" class="repair-list" aria-live="polite"></div>
+                <div id="repair-admin-input" class="repair-input" hidden>
+                  <p class="lead">CoffeePOS không thể khôi phục mật khẩu quản trị cũ từ WordPress. Nhập mật khẩu mới để cập nhật đúng tài khoản quản trị hiện tại.</p>
+                  <div class="field-group">
+                    <label for="repair-admin-password">Mật khẩu mới</label>
+                    <input id="repair-admin-password" type="password" autocomplete="new-password" minlength="12" maxlength="128">
+                  </div>
+                  <div class="field-group">
+                    <label for="repair-admin-password-confirm">Xác nhận mật khẩu</label>
+                    <input id="repair-admin-password-confirm" type="password" autocomplete="new-password" minlength="12" maxlength="128">
+                  </div>
+                  <p id="repair-admin-error" class="field-error" role="alert" hidden></p>
+                </div>
+                <p id="repair-error" class="error" role="alert" hidden></p>
+                <div class="actions">
+                  <button id="repair-apply" type="button" disabled>Sửa chữa</button>
+                  <button id="repair-inspect" class="secondary" type="button">Kiểm tra lại</button>
+                  <button id="repair-open-diagnostics" class="secondary" type="button" hidden>Mở Chẩn đoán</button>
+                </div>
+                <p id="repair-status" class="hint" role="status" aria-live="polite"></p>
+              </section>
+            </div>
           </section>
         </div>
       </main>

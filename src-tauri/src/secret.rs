@@ -190,7 +190,6 @@ pub fn create(path: &Path) -> Result<String, String> {
     Ok(password)
 }
 
-#[cfg(debug_assertions)]
 pub fn store_password(path: &Path, password: &str) -> Result<(), String> {
     if password.is_empty() {
         return Err("Password cannot be empty.".into());
@@ -198,7 +197,6 @@ pub fn store_password(path: &Path, password: &str) -> Result<(), String> {
     store(path, password, "WordPress administrator credential")
 }
 
-#[cfg(debug_assertions)]
 pub fn promote_staged_password(staged_path: &Path, active_path: &Path) -> Result<(), String> {
     let password = load(staged_path).map_err(|error| {
         format!("Cannot read staged WordPress administrator credential: {error}")

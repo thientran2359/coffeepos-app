@@ -13,6 +13,8 @@ fn main() {
             "retry_runtime_health",
             "refresh_runtime_maintenance",
             "get_health_diagnostics",
+            "get_repair_plan",
+            "apply_repair",
             "open_wordpress",
             "open_pos",
             "get_provisioning_info",

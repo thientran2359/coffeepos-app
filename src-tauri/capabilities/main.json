@@ -16,6 +16,8 @@
     "allow-retry-runtime-health",
     "allow-refresh-runtime-maintenance",
     "allow-get-health-diagnostics",
+    "allow-get-repair-plan",
+    "allow-apply-repair",
     "allow-open-wordpress",
     "allow-open-pos",
     "allow-get-provisioning-info",

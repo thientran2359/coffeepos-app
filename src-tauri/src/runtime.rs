@@ -1142,17 +1142,23 @@ impl RuntimeManager {
             }
         }
 
-        if self.database.is_some() {
-            if let Err(error) = self.shutdown_database_gracefully() {
-                failure.get_or_insert(error);
+        if self.cron.is_none() && self.web_server.is_none() && self.php.is_none() {
+            if self.database.is_some() {
+                if let Err(error) = self.shutdown_database_gracefully() {
+                    failure.get_or_insert(error);
+                }
             }
-        }
-        if let Some(database) = self.database.as_mut() {
-            if let Err(error) = database.terminate("database", self.timeouts.stop) {
-                failure.get_or_insert(error);
-            } else {
-                self.database = None;
+            if let Some(database) = self.database.as_mut() {
+                if let Err(error) = database.terminate("database", self.timeouts.stop) {
+                    failure.get_or_insert(error);
+                } else {
+                    self.database = None;
+                }
             }
+        } else {
+            self.log_event(
+                "database shutdown deferred because managed cron/web/PHP work is still alive",
+            );
         }
 
         self.remove_php_probe();
@@ -1503,7 +1509,7 @@ impl RuntimeManager {
             }
             Ok(None) => {}
             Err(error) => {
-                self.cron = None;
+                self.last_error = Some(error.clone());
                 self.log_event(&format!(
                     "wordpress cron/background worker monitor failed: {error}"
                 ));
@@ -1872,12 +1878,18 @@ impl RuntimeManager {
                 self.php = None;
             }
         }
-        if let Some(database) = self.database.as_mut() {
-            if let Err(error) = database.terminate("database", self.timeouts.stop) {
-                failure.get_or_insert(error);
-            } else {
-                self.database = None;
+        if self.cron.is_none() && self.web_server.is_none() && self.php.is_none() {
+            if let Some(database) = self.database.as_mut() {
+                if let Err(error) = database.terminate("database", self.timeouts.stop) {
+                    failure.get_or_insert(error);
+                } else {
+                    self.database = None;
+                }
             }
+        } else {
+            self.log_event(
+                "database cleanup deferred because managed cron/web/PHP work is still alive",
+            );
         }
         if let Some(error) = failure {
             Err(error)
@@ -4004,7 +4016,8 @@ mod tests {
             .join("runtime/development")
             .join(current_target_triple().unwrap())
             .join("manifest.json");
-        let mut manager = RuntimeManager::from_development(&project, &manifest, data).unwrap();
+        let mut manager =
+            RuntimeManager::from_development(&project, &manifest, data.clone()).unwrap();
 
         let started = manager.start().unwrap();
         assert_eq!(started.state, RuntimeState::Running);
@@ -4043,10 +4056,46 @@ mod tests {
             .join("runtime/development")
             .join(current_target_triple().unwrap())
             .join("manifest.json");
-        let mut manager = RuntimeManager::from_development(&project, &manifest, data).unwrap();
+        let mut manager =
+            RuntimeManager::from_development(&project, &manifest, data.clone()).unwrap();
         let info = manager.start().unwrap();
         assert_eq!(info.state, RuntimeState::Running);
         let port = info.http_port.unwrap();
+
+        let concurrency_probe = data.join("site/.coffeepos-concurrency-probe.php");
+        fs::write(
+            &concurrency_probe,
+            b"<?php usleep(250000); header('Content-Type: text/plain'); echo 'ok';\n",
+        )
+        .unwrap();
+        assert!(http_status_probe(
+            port,
+            "/.coffeepos-concurrency-probe.php",
+            200
+        ));
+
+        let synthetic_sequential_started = Instant::now();
+        for _ in 0..4 {
+            assert!(http_status_probe(
+                port,
+                "/.coffeepos-concurrency-probe.php",
+                200
+            ));
+        }
+        let synthetic_sequential = synthetic_sequential_started.elapsed();
+        let synthetic_parallel_started = Instant::now();
+        let synthetic_parallel_ok = thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|_| {
+                    scope
+                        .spawn(|| http_status_probe(port, "/.coffeepos-concurrency-probe.php", 200))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .all(|handle| handle.join().unwrap_or(false))
+        });
+        let synthetic_parallel = synthetic_parallel_started.elapsed();
 
         for _ in 0..2 {
             assert!(wordpress_http_probe(port));
@@ -4081,10 +4130,20 @@ mod tests {
             assert!(http_status_probe(port, static_path, 200));
             static_samples.push(started.elapsed());
         }
+        let _ = fs::remove_file(&concurrency_probe);
         manager.stop().unwrap();
 
+        eprintln!(
+            "phase6.2 raw concurrency php_probe_sequential_ms={} php_probe_parallel_ms={} wordpress_sequential_ms={} wordpress_parallel_ms={}",
+            synthetic_sequential.as_millis(),
+            synthetic_parallel.as_millis(),
+            four_sequential.as_millis(),
+            parallel_wall.as_millis()
+        );
+        assert!(synthetic_parallel_ok);
+        assert!(synthetic_parallel * 2 < synthetic_sequential);
         assert!(parallel_ok);
-        assert!(parallel_wall * 2 < four_sequential);
+        assert!(parallel_wall < four_sequential);
 
         sequential.sort();
         static_samples.sort();

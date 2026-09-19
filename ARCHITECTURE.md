@@ -13,7 +13,7 @@ Bundled shell UI (main, trusted)
 Rust: cấu hình → runtime lifecycle → provisioning → health → backup
         │ explicit executable paths + argument arrays
         ├── MariaDB (loopback only)
-        └── PHP HTTP server → WordPress → WooCommerce → CoffeePOS
+        └── Caddy HTTP → PHP FastCGI pool → WordPress → WooCommerce → CoffeePOS
                                                     │
                                        POS browser hoặc WebView / thiết bị LAN
 ```
@@ -71,7 +71,7 @@ PHP Windows có [binary và dependency riêng](https://www.php.net/manual/en/ins
 
 Hệ quả cần đo: WordPress loopback/self-request có thể bị kẹt khi cùng worker đang chờ; cron, plugin HTTP call vào chính site, nhiều màn KDS/customer display và request dài có thể chặn POS. Đây là rủi ro kiến trúc thực tế, không chỉ vấn đề đóng gói.
 
-Sau khi POS thật, auto-start và health polling cùng hoạt động, requirement thay thế đã xuất hiện: baseline 2026-09-18 cho `/wp-login.php` khoảng `0.88–0.90s` với mẫu gần `1.96s`, trong khi static JS cùng origin chỉ khoảng `2–7ms`; runtime Windows khi đó chỉ có một PHP request worker. Phase 6.2 đã chốt kiến trúc **Caddy 2.11.4 + một PHP 8.4.25 NTS FastCGI master với 4 worker + OPcache**. Caddy bind HTTP loopback động, FastCGI/admin chỉ dùng private loopback port; readiness đi end-to-end qua Caddy → FastCGI và kiểm OPcache; Caddy graceful stop là drain fence trước khi dừng PHP rồi MariaDB. Warm benchmark trên disposable store đạt dynamic p50 134 ms/p95 140 ms và 4 parallel request 144 ms so với 537 ms khi chạy tuần tự; static p50 <1 ms. `php -S` chỉ còn phù hợp cho fixture/test nhỏ và không còn là serving architecture của POS Windows development runtime. Xem [PHASE-06.2.md](docs/PHASE-06.2.md).
+Sau khi POS thật, auto-start và health polling cùng hoạt động, requirement thay thế đã xuất hiện: baseline 2026-09-18 cho `/wp-login.php` khoảng `0.88–0.90s` với mẫu gần `1.96s`, trong khi static JS cùng origin chỉ khoảng `2–7ms`; runtime Windows khi đó chỉ có một PHP request worker. Phase 6.2 đã chốt kiến trúc **Caddy 2.11.4 + một PHP 8.4.25 NTS FastCGI master với 4 worker + OPcache**. Caddy bind HTTP loopback động, FastCGI/admin chỉ dùng private loopback port; readiness đi end-to-end qua Caddy → FastCGI và kiểm OPcache; Caddy graceful stop là drain fence trước khi dừng PHP rồi MariaDB. Các final benchmark trên disposable store đạt dynamic p50 138–144 ms/p95 151–314 ms; 4 WordPress request song song 145–189 ms so với 562–738 ms khi chạy tuần tự; probe PHP cố định xác nhận khoảng 4× concurrency của worker pool; static p50 0–1 ms. `php -S` chỉ còn phù hợp cho fixture/test nhỏ và không còn là serving architecture của POS Windows development runtime. Xem [PHASE-06.2.md](docs/PHASE-06.2.md).
 
 ## 4. File và cấu hình
 

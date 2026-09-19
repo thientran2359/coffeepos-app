@@ -103,6 +103,45 @@ interface ProvisioningInfo {
 }
 
 type InstalledView = "home" | "settings" | "diagnostics";
+type SystemSection = "diagnostics" | "repair";
+type RepairClassification = "repairable" | "requires_input" | "blocked";
+
+interface RepairItem {
+  id: string;
+  component: string;
+  target: string;
+  classification: RepairClassification;
+  action: string;
+  reason: string;
+  impact: string;
+  requires_runtime_stop: boolean;
+  input_kind: "admin_password" | null;
+}
+
+interface RepairPlan {
+  plan_id: string;
+  generated_at: number;
+  store_state: ProvisioningState;
+  runtime_was_running: boolean;
+  items: RepairItem[];
+  can_apply: boolean;
+}
+
+interface RepairItemResult {
+  id: string;
+  status: "repaired" | "skipped" | "blocked";
+  message: string;
+}
+
+interface RepairApplyResult {
+  plan_id: string;
+  status: "repaired" | "partial" | "stale";
+  items: RepairItemResult[];
+  provisioning_info: ProvisioningInfo;
+  health_diagnostics: HealthDiagnosticsInfo | null;
+  last_error: RuntimeErrorInfo | null;
+}
+
 type SetupStep = "welcome" | "details" | "review" | "progress" | "complete";
 
 function element<T extends HTMLElement>(id: string): T {
@@ -181,6 +220,20 @@ const healthSummaryState = element("health-summary-state");
 const healthSummary = element("health-summary");
 const healthRecheck = element<HTMLButtonElement>("health-recheck");
 const healthCheckStatus = element("health-check-status");
+const systemSectionButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-system-section]"));
+const systemSectionPanels = Array.from(document.querySelectorAll<HTMLElement>("[data-system-panel]"));
+const repairSummaryState = element("repair-summary-state");
+const repairSummary = element("repair-summary");
+const repairList = element("repair-list");
+const repairAdminInput = element("repair-admin-input");
+const repairAdminPassword = element<HTMLInputElement>("repair-admin-password");
+const repairAdminPasswordConfirm = element<HTMLInputElement>("repair-admin-password-confirm");
+const repairAdminError = element("repair-admin-error");
+const repairError = element("repair-error");
+const repairApply = element<HTMLButtonElement>("repair-apply");
+const repairInspect = element<HTMLButtonElement>("repair-inspect");
+const repairOpenDiagnostics = element<HTMLButtonElement>("repair-open-diagnostics");
+const repairStatus = element("repair-status");
 
 let provisioningBusy = false;
 let runtimeBusy = false;
@@ -203,6 +256,10 @@ let diagnosticsBusy = false;
 let runtimeRefreshBusy = false;
 let runtimeMaintenanceBusy = false;
 let currentDiagnostics: HealthDiagnosticsInfo | null = null;
+let currentSystemSection: SystemSection = "diagnostics";
+let currentRepairPlan: RepairPlan | null = null;
+let repairOperation: "inspect" | "apply" | null = null;
+let repairRouteRequired = false;
 
 function nativeErrorText(error: unknown): string {
   if (typeof error === "string") return error;
@@ -283,6 +340,7 @@ function renderHealthComponent(component: HealthComponent, info: ComponentHealth
 
 function setHealthControls(): void {
   healthRecheck.disabled = diagnosticsBusy
+    || repairOperation !== null
     || bootstrapBusy
     || runtimeBusy
     || provisioningBusy
@@ -345,7 +403,7 @@ function renderHealthCommandError(error: unknown): void {
 }
 
 async function refreshHealthDiagnostics(): Promise<void> {
-  if (!isTauri() || diagnosticsBusy || bootstrapBusy || runtimeBusy || provisioningBusy || currentProvisioning?.state !== "ready") return;
+  if (!isTauri() || diagnosticsBusy || repairOperation || bootstrapBusy || runtimeBusy || provisioningBusy || currentProvisioning?.state !== "ready") return;
   diagnosticsBusy = true;
   setRuntimeControls(currentRuntime);
   renderHealthChecking();
@@ -362,6 +420,241 @@ async function refreshHealthDiagnostics(): Promise<void> {
     diagnosticsBusy = false;
     setHealthControls();
     setRuntimeControls(currentRuntime);
+  }
+}
+
+function repairClassificationLabel(classification: RepairClassification): string {
+  if (classification === "repairable") return "Có thể sửa";
+  if (classification === "requires_input") return "Cần xác nhận";
+  return "Không thể tự sửa";
+}
+
+function setRepairControls(): void {
+  const busy = repairOperation !== null || bootstrapBusy || provisioningBusy || runtimeBusy || diagnosticsBusy;
+  const eligible = currentProvisioning?.state === "ready" || currentProvisioning?.state === "needs_repair";
+  repairInspect.disabled = busy || !eligible;
+  repairApply.disabled = busy || !eligible || !currentRepairPlan?.can_apply;
+  repairAdminPassword.disabled = busy;
+  repairAdminPasswordConfirm.disabled = busy;
+  repairOpenDiagnostics.disabled = busy;
+}
+
+function clearRepairPasswordFields(): void {
+  repairAdminPassword.value = "";
+  repairAdminPasswordConfirm.value = "";
+  repairAdminPassword.removeAttribute("aria-invalid");
+  repairAdminPasswordConfirm.removeAttribute("aria-invalid");
+  repairAdminError.textContent = "";
+  repairAdminError.hidden = true;
+}
+
+function renderRepairItems(items: RepairItem[]): void {
+  repairList.replaceChildren();
+  for (const item of items) {
+    const article = document.createElement("article");
+    article.className = "repair-row";
+    const heading = document.createElement("div");
+    heading.className = "repair-row-heading";
+    const target = document.createElement("strong");
+    target.textContent = item.target;
+    const badge = document.createElement("span");
+    badge.className = "state-badge";
+    badge.dataset.repairClassification = item.classification;
+    badge.textContent = repairClassificationLabel(item.classification);
+    heading.append(target, badge);
+    const action = document.createElement("p");
+    action.className = "repair-action";
+    action.textContent = item.action;
+    const reason = document.createElement("p");
+    reason.className = "repair-summary-text";
+    reason.textContent = item.reason;
+    const impact = document.createElement("p");
+    impact.className = "hint";
+    impact.textContent = item.impact;
+    article.append(heading, action, reason, impact);
+    repairList.append(article);
+  }
+}
+
+function renderRepairPlan(plan: RepairPlan): void {
+  currentRepairPlan = plan;
+  repairError.hidden = true;
+  repairError.textContent = "";
+  repairOpenDiagnostics.hidden = true;
+  setTextIfChanged(repairStatus, "");
+  renderRepairItems(plan.items);
+  const repairable = plan.items.filter((item) => item.classification === "repairable").length;
+  const needsInput = plan.items.filter((item) => item.classification === "requires_input").length;
+  const blocked = plan.items.filter((item) => item.classification === "blocked").length;
+  const needsAdminPassword = plan.items.some((item) => item.input_kind === "admin_password");
+  repairAdminInput.hidden = !needsAdminPassword;
+  if (!needsAdminPassword) clearRepairPasswordFields();
+
+  if (plan.items.length === 0) {
+    setTextIfChanged(repairSummaryState, "Không cần sửa");
+    setTextIfChanged(repairSummary, "CoffeePOS không phát hiện thành phần managed nào cần sửa ở snapshot hiện tại.");
+  } else if (repairable + needsInput > 0) {
+    setTextIfChanged(repairSummaryState, "Có thể sửa");
+    const parts = [`${repairable + needsInput} mục có hành động an toàn`];
+    if (blocked > 0) parts.push(`${blocked} mục bị chặn`);
+    setTextIfChanged(repairSummary, `${parts.join(" · ")}. Xem phạm vi và ảnh hưởng của từng mục trước khi sửa.`);
+  } else {
+    setTextIfChanged(repairSummaryState, "Không thể tự sửa");
+    setTextIfChanged(repairSummary, `${blocked} mục cần được giữ nguyên vì CoffeePOS chưa có đủ ownership/authority để sửa tự động.`);
+  }
+  setRepairControls();
+}
+
+function renderRepairCommandError(error: unknown): void {
+  currentRepairPlan = null;
+  setTextIfChanged(repairSummaryState, "Không thể kiểm tra");
+  setTextIfChanged(repairSummary, "CoffeePOS chưa tạo được repair plan an toàn cho store hiện tại.");
+  repairList.replaceChildren();
+  repairAdminInput.hidden = true;
+  clearRepairPasswordFields();
+  repairError.textContent = nativeErrorText(error);
+  repairError.hidden = false;
+  setRepairControls();
+}
+
+async function refreshRepairPlan(): Promise<void> {
+  if (!isTauri() || repairOperation || bootstrapBusy || provisioningBusy || runtimeBusy || diagnosticsBusy) return;
+  if (currentProvisioning?.state !== "ready" && currentProvisioning?.state !== "needs_repair") return;
+  repairOperation = "inspect";
+  currentRepairPlan = null;
+  setTextIfChanged(repairSummaryState, "Đang kiểm tra");
+  setTextIfChanged(repairSummary, "Đang kiểm tra ownership, pinned artifacts và protected credential state…");
+  setTextIfChanged(repairStatus, "Đang lập repair plan read-only…");
+  repairError.hidden = true;
+  repairOpenDiagnostics.hidden = true;
+  setRepairControls();
+  setRuntimeControls(currentRuntime);
+  setHealthControls();
+  try {
+    renderRepairPlan(await invoke<RepairPlan>("get_repair_plan"));
+    setTextIfChanged(repairStatus, "Repair plan đã được tạo từ trạng thái native hiện tại.");
+  } catch (error) {
+    renderRepairCommandError(error);
+    setTextIfChanged(repairStatus, nativeErrorText(error));
+  } finally {
+    repairOperation = null;
+    setRepairControls();
+    setRuntimeControls(currentRuntime);
+    setHealthControls();
+  }
+}
+
+function validateRepairAdminPassword(): string | null {
+  repairAdminError.hidden = true;
+  repairAdminError.textContent = "";
+  repairAdminPassword.removeAttribute("aria-invalid");
+  repairAdminPasswordConfirm.removeAttribute("aria-invalid");
+  const password = repairAdminPassword.value;
+  const confirmation = repairAdminPasswordConfirm.value;
+  const count = Array.from(password).length;
+  if (count < 12 || count > 128 || /[\u0000-\u001f\u007f]/.test(password)) {
+    repairAdminPassword.setAttribute("aria-invalid", "true");
+    repairAdminError.textContent = "Mật khẩu phải có 12–128 ký tự và không chứa ký tự điều khiển.";
+    repairAdminError.hidden = false;
+    repairAdminPassword.focus();
+    return null;
+  }
+  if (password !== confirmation) {
+    repairAdminPasswordConfirm.setAttribute("aria-invalid", "true");
+    repairAdminError.textContent = "Hai lần nhập mật khẩu chưa khớp.";
+    repairAdminError.hidden = false;
+    repairAdminPasswordConfirm.focus();
+    return null;
+  }
+  return password;
+}
+
+function renderRepairResult(result: RepairApplyResult, previousPlan: RepairPlan): void {
+  currentRepairPlan = null;
+  repairList.replaceChildren();
+  repairAdminInput.hidden = true;
+  clearRepairPasswordFields();
+  const targets = new Map(previousPlan.items.map((item) => [item.id, item.target]));
+  for (const item of result.items) {
+    const article = document.createElement("article");
+    article.className = "repair-row";
+    const heading = document.createElement("div");
+    heading.className = "repair-row-heading";
+    const target = document.createElement("strong");
+    target.textContent = targets.get(item.id) ?? item.id;
+    const badge = document.createElement("span");
+    badge.className = "state-badge";
+    badge.textContent = item.status === "repaired" ? "Đã sửa" : item.status === "blocked" ? "Bị chặn" : "Chưa xử lý";
+    heading.append(target, badge);
+    const messageNode = document.createElement("p");
+    messageNode.className = "repair-summary-text";
+    messageNode.textContent = item.message;
+    article.append(heading, messageNode);
+    repairList.append(article);
+  }
+  repairError.hidden = !result.last_error;
+  repairError.textContent = result.last_error ? structuredErrorText(result.last_error) : "";
+  repairOpenDiagnostics.hidden = result.status === "stale";
+  if (result.status === "repaired") {
+    setTextIfChanged(repairSummaryState, "Đã sửa xong");
+    setTextIfChanged(repairSummary, "Các mục repairable đã được khôi phục, verifier đạt và runtime đã được trả về trạng thái vận hành trước khi sửa.");
+    setTextIfChanged(repairStatus, "Sửa chữa hoàn tất.");
+  } else if (result.status === "stale") {
+    setTextIfChanged(repairSummaryState, "Cần kiểm tra lại");
+    setTextIfChanged(repairSummary, "Store đã thay đổi sau lần kiểm tra trước. Không có mutation nào được áp dụng từ repair plan cũ.");
+    setTextIfChanged(repairStatus, "Kiểm tra lại để lấy repair plan mới.");
+  } else {
+    setTextIfChanged(repairSummaryState, "Cần xử lý tiếp");
+    setTextIfChanged(repairSummary, "Một phần repair đã hoàn tất hoặc còn mục bị chặn/verifier chưa đạt. Dữ liệu store hiện có được giữ nguyên.");
+    setTextIfChanged(repairStatus, "Xem lỗi và chạy Kiểm tra lại sau khi xử lý nguyên nhân còn lại.");
+  }
+  setRepairControls();
+}
+
+async function applyRepair(): Promise<void> {
+  const plan = currentRepairPlan;
+  if (!isTauri() || !plan || !plan.can_apply || repairOperation || bootstrapBusy || provisioningBusy || runtimeBusy || diagnosticsBusy) return;
+  const needsAdminPassword = plan.items.some((item) => item.input_kind === "admin_password");
+  let adminPassword: string | null = null;
+  if (needsAdminPassword) {
+    adminPassword = validateRepairAdminPassword();
+    if (adminPassword === null) return;
+  }
+  repairOperation = "apply";
+  setTextIfChanged(repairSummaryState, "Đang sửa chữa");
+  setTextIfChanged(repairSummary, "CoffeePOS đang áp dụng repair plan dưới lifecycle lock và sẽ tự kiểm tra lại trước khi kết luận.");
+  setTextIfChanged(repairStatus, "Đang sửa chữa hệ thống…");
+  repairError.hidden = true;
+  setRepairControls();
+  setRuntimeControls(currentRuntime);
+  setHealthControls();
+  const repairPromise = invoke<RepairApplyResult>("apply_repair", {
+    planId: plan.plan_id,
+    inputs: needsAdminPassword ? { adminPassword } : null,
+  });
+  clearRepairPasswordFields();
+  adminPassword = null;
+  try {
+    const result = await repairPromise;
+    await renderProvisioningWithRepairRouting(result.provisioning_info);
+    if (currentView === "diagnostics") selectSystemSection("repair", false, false);
+    renderRepairResult(result, plan);
+    if (result.health_diagnostics) renderHealthDiagnostics(result.health_diagnostics);
+    await refreshRuntime();
+    if (result.status === "stale") await refreshRepairPlan();
+  } catch (error) {
+    repairError.textContent = nativeErrorText(error);
+    repairError.hidden = false;
+    setTextIfChanged(repairSummaryState, "Sửa chữa chưa hoàn tất");
+    setTextIfChanged(repairSummary, "Native repair command chưa hoàn tất. Store được giữ theo repair transaction hiện tại; kiểm tra lại trước khi thử tiếp.");
+    setTextIfChanged(repairStatus, nativeErrorText(error));
+    await refreshProvisioning();
+    await refreshRuntime();
+  } finally {
+    repairOperation = null;
+    setRepairControls();
+    setRuntimeControls(currentRuntime);
+    setHealthControls();
   }
 }
 
@@ -493,6 +786,26 @@ function viewHeading(view: InstalledView): HTMLElement {
   return homeTitle;
 }
 
+function systemSectionHeading(section: SystemSection): HTMLElement {
+  return section === "repair"
+    ? element<HTMLElement>("repair-title")
+    : element<HTMLElement>("health-diagnostics-title");
+}
+
+function selectSystemSection(section: SystemSection, moveFocus = true, refresh = true): void {
+  currentSystemSection = section;
+  for (const button of systemSectionButtons) {
+    button.setAttribute("aria-current", button.dataset.systemSection === section ? "page" : "false");
+  }
+  for (const panel of systemSectionPanels) {
+    panel.hidden = panel.dataset.systemPanel !== section;
+  }
+  if (moveFocus) systemSectionHeading(section).focus();
+  if (!refresh || currentView !== "diagnostics") return;
+  if (section === "repair") void refreshRepairPlan();
+  else void refreshHealthDiagnostics();
+}
+
 function selectInstalledView(view: InstalledView, moveFocus = true): void {
   if (installedShell.hidden) return;
   currentView = view;
@@ -502,8 +815,14 @@ function selectInstalledView(view: InstalledView, moveFocus = true): void {
   for (const panel of viewPanels) {
     panel.hidden = panel.dataset.viewPanel !== view;
   }
+  if (view === "diagnostics") {
+    selectSystemSection(repairRouteRequired ? "repair" : "diagnostics", false, false);
+  }
   if (moveFocus) viewHeading(view).focus();
-  if (view === "diagnostics" && moveFocus) void refreshHealthDiagnostics();
+  if (view === "diagnostics" && moveFocus) {
+    if (currentSystemSection === "repair") void refreshRepairPlan();
+    else void refreshHealthDiagnostics();
+  }
 }
 
 function showBootstrapError(error: unknown): void {
@@ -517,11 +836,21 @@ function showBootstrapError(error: unknown): void {
 }
 
 function applyInstallationLayout(info: ProvisioningInfo): void {
-  const enteringInstalledShell = info.state === "ready" && installedShell.hidden === true;
-  const enteringSetup = info.state !== "ready" && setup.hidden === true;
+  const repairMode = repairRouteRequired;
+  const useInstalledShell = info.state === "ready" || repairMode;
+  const enteringInstalledShell = useInstalledShell && installedShell.hidden === true;
+  const enteringSetup = !useInstalledShell && setup.hidden === true;
   bootstrapPanel.hidden = true;
 
-  if (info.state === "ready") {
+  if (useInstalledShell) {
+    if (repairMode) {
+      completionPending = false;
+      setup.hidden = true;
+      installedShell.hidden = false;
+      selectInstalledView("diagnostics", false);
+      selectSystemSection("repair", enteringInstalledShell, enteringInstalledShell);
+      return;
+    }
     if (completionPending) {
       installedShell.hidden = true;
       setup.hidden = false;
@@ -553,6 +882,15 @@ function renderHome(): void {
     && currentRuntime.wordpress_health === "healthy"
     && currentRuntime.coffeepos_health.state === "healthy";
   if (!posReady && !posOpenBusy) setTextIfChanged(homeOpenStatus, "");
+  if (repairRouteRequired) {
+    setTextIfChanged(homeState, "Cần sửa chữa");
+    setTextIfChanged(homeStatus, "Cửa hàng cần được kiểm tra an toàn");
+    setTextIfChanged(homeDetail, "Mở Hệ thống → Sửa chữa để xem repair plan. CoffeePOS sẽ giữ nguyên dữ liệu khi ownership hoặc authority chưa đủ.");
+    setTextIfChanged(homeDiagnostics, "Mở Sửa chữa");
+    setHomeAction(null);
+    return;
+  }
+  setTextIfChanged(homeDiagnostics, "Mở Hệ thống");
 
   if (runtimeTransition === "starting") {
     setTextIfChanged(homeState, "Đang khởi động");
@@ -679,7 +1017,7 @@ function renderHome(): void {
 }
 
 function setRuntimeControls(info: RuntimeInfo | null): void {
-  if (provisioningBusy || runtimeBusy || diagnosticsBusy || !info) {
+  if (provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation !== null || repairRouteRequired || !info) {
     runtimeStart.disabled = true;
     runtimeStop.disabled = true;
     runtimeRestart.disabled = true;
@@ -828,10 +1166,35 @@ function renderProvisioning(info: ProvisioningInfo, commandError?: string): void
   renderHome();
 }
 
+async function renderProvisioningWithRepairRouting(
+  info: ProvisioningInfo,
+  commandError?: string,
+): Promise<void> {
+  let repairPlan: RepairPlan | null = null;
+  let repairPlanError: unknown = null;
+  if (info.state === "needs_repair" && isTauri()) {
+    try {
+      repairPlan = await invoke<RepairPlan>("get_repair_plan");
+      repairRouteRequired = repairPlan.items.length > 0;
+    } catch (error) {
+      repairPlanError = error;
+      repairRouteRequired = true;
+    }
+  } else {
+    repairRouteRequired = false;
+    currentRepairPlan = null;
+  }
+  renderProvisioning(info, commandError);
+  if (repairRouteRequired) {
+    if (repairPlan) renderRepairPlan(repairPlan);
+    else if (repairPlanError) renderRepairCommandError(repairPlanError);
+  }
+}
+
 async function refreshProvisioning(commandError?: string): Promise<boolean> {
   try {
     const info = await invoke<ProvisioningInfo>("get_provisioning_info");
-    renderProvisioning(info, commandError);
+    await renderProvisioningWithRepairRouting(info, commandError);
     return true;
   } catch (error) {
     showBootstrapError(commandError ?? error);
@@ -858,7 +1221,7 @@ async function refreshRuntime(): Promise<void> {
 }
 
 async function refreshRuntimeMaintenance(): Promise<void> {
-  if (runtimeMaintenanceBusy || runtimeBusy || provisioningBusy || diagnosticsBusy) return;
+  if (runtimeMaintenanceBusy || runtimeBusy || provisioningBusy || diagnosticsBusy || repairOperation) return;
   runtimeMaintenanceBusy = true;
   try {
     renderRuntime(await invoke<RuntimeInfo>("refresh_runtime_maintenance"));
@@ -899,7 +1262,7 @@ async function provision(): Promise<void> {
 
   if (result) {
     completionPending = result.state === "ready";
-    renderProvisioning(result);
+    await renderProvisioningWithRepairRouting(result);
   } else {
     await refreshProvisioning(failure ?? "Provisioning thất bại nhưng native layer không trả chi tiết lỗi.");
   }
@@ -907,7 +1270,7 @@ async function provision(): Promise<void> {
 }
 
 async function copyAdminPassword(status: HTMLElement, button: HTMLButtonElement): Promise<void> {
-  if (provisioningBusy || runtimeBusy) return;
+  if (provisioningBusy || runtimeBusy || repairOperation) return;
   button.disabled = true;
   setTextIfChanged(status, "Đang sao chép…");
   try {
@@ -921,7 +1284,7 @@ async function copyAdminPassword(status: HTMLElement, button: HTMLButtonElement)
 }
 
 async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restart_runtime" | "retry_runtime_health"): Promise<void> {
-  if (provisioningBusy || runtimeBusy || diagnosticsBusy || currentProvisioning?.state !== "ready") return;
+  if (provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation || repairRouteRequired || currentProvisioning?.state !== "ready") return;
   runtimeBusy = true;
   runtimeTransition = command === "stop_runtime" ? "stopping" : command === "retry_runtime_health" ? "checking" : "starting";
   if (currentProvisioning) renderProvisioning(currentProvisioning);
@@ -967,7 +1330,7 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
 }
 
 async function runHomeAction(): Promise<void> {
-  if (homeAction.disabled || provisioningBusy || runtimeBusy || diagnosticsBusy || posOpenBusy) return;
+  if (homeAction.disabled || provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation || posOpenBusy) return;
   if (homeActionKind === "start") {
     await runtimeAction("start_runtime");
   } else if (homeActionKind === "retry_health") {
@@ -999,7 +1362,7 @@ async function saveAppSettings(): Promise<void> {
 }
 
 async function openManagedWordPress(): Promise<void> {
-  if (provisioningBusy || runtimeBusy || openWordPress.disabled) return;
+  if (provisioningBusy || runtimeBusy || repairOperation || repairRouteRequired || openWordPress.disabled) return;
   openWordPress.disabled = true;
   openWordPressStatus.textContent = "Đang mở WordPress bằng địa chỉ runtime hiện tại…";
   try {
@@ -1014,7 +1377,7 @@ async function openManagedWordPress(): Promise<void> {
 }
 
 async function openPos(): Promise<void> {
-  if (provisioningBusy || runtimeBusy || posOpenBusy || currentProvisioning?.state !== "ready") return;
+  if (provisioningBusy || runtimeBusy || repairOperation || repairRouteRequired || posOpenBusy || currentProvisioning?.state !== "ready") return;
   posOpenBusy = true;
   renderHome();
   setTextIfChanged(homeOpenStatus, "Đang yêu cầu mở POS trong trình duyệt…");
@@ -1066,13 +1429,16 @@ async function bootstrap(): Promise<void> {
       if (currentProvisioning) renderProvisioning(currentProvisioning);
     }
     await refreshRuntime();
-    if (currentProvisioning?.state === "ready" && currentRuntime?.state === "stopped") {
+    if (currentProvisioning?.state === "ready" && !repairRouteRequired && currentRuntime?.state === "stopped") {
       await runtimeAction("start_runtime");
     }
   } finally {
     bootstrapBusy = false;
     if (!retry.hidden) retry.disabled = false;
-    if (currentView === "diagnostics") void refreshHealthDiagnostics();
+    if (currentView === "diagnostics") {
+      if (currentSystemSection === "repair") void refreshRepairPlan();
+      else void refreshHealthDiagnostics();
+    }
   }
 }
 
@@ -1103,12 +1469,22 @@ for (const button of navButtons) {
   });
 }
 
+for (const button of systemSectionButtons) {
+  button.addEventListener("click", () => {
+    const section = button.dataset.systemSection as SystemSection | undefined;
+    if (section) selectSystemSection(section, true, true);
+  });
+}
+
 homeAction.addEventListener("click", () => void runHomeAction());
 homeDiagnostics.addEventListener("click", () => selectInstalledView("diagnostics", true));
 runtimeStart.addEventListener("click", () => void runtimeAction("start_runtime"));
 runtimeStop.addEventListener("click", () => void runtimeAction("stop_runtime"));
 runtimeRestart.addEventListener("click", () => void runtimeAction("restart_runtime"));
 healthRecheck.addEventListener("click", () => void refreshHealthDiagnostics());
+repairInspect.addEventListener("click", () => void refreshRepairPlan());
+repairApply.addEventListener("click", () => void applyRepair());
+repairOpenDiagnostics.addEventListener("click", () => selectSystemSection("diagnostics", true, true));
 openWordPress.addEventListener("click", () => void openManagedWordPress());
 
 setupForm.addEventListener("submit", async (event) => {
@@ -1140,13 +1516,13 @@ setupForm.addEventListener("submit", async (event) => {
 });
 
 window.setInterval(() => {
-  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !provisioningBusy && !runtimeBusy && !diagnosticsBusy) {
+  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !provisioningBusy && !runtimeBusy && !diagnosticsBusy && !repairOperation) {
     void refreshRuntime();
   }
 }, 2000);
 
 window.setInterval(() => {
-  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy) {
+  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !repairOperation) {
     void refreshRuntimeMaintenance();
   }
 }, 5000);
