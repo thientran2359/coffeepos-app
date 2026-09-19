@@ -4,6 +4,9 @@
   "description": "Only the bundled shell can read configuration and control the managed local runtime.",
   "windows": ["main"],
   "permissions": [
+    "allow-get-log-catalog",
+    "allow-read-log-page",
+    "allow-export-support-bundle",
     "allow-get-shell-info",
     "allow-save-app-settings",
     "allow-get-setup-info",

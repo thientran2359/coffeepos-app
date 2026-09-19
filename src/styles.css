@@ -70,6 +70,18 @@ p { line-height: 1.6; overflow-wrap: anywhere; }
 .repair-summary-text { margin: 4px 0; }
 .repair-row .hint { margin: 4px 0 0; }
 .repair-input { max-width: 620px; margin-top: 18px; padding: 16px; border: 1px solid #e2e7e3; border-radius: 12px; background: #fafbf9; }
+.log-viewer-card { min-width: 0; }
+.log-source-control { max-width: 520px; margin-top: 20px; }
+.log-source-control .hint { margin: 7px 0 0; }
+.log-viewer-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-top: 22px; padding-top: 18px; border-top: 1px solid #e2e7e3; }
+.log-viewer-heading .hint { margin: 4px 0 0; }
+.log-message { margin-top: 14px; border: 1px solid #e2e7e3; border-radius: 10px; padding: 16px; background: #fafbf9; }
+.log-message p { margin: 6px 0 0; color: #607067; }
+.log-error { border-color: #d7b8b0; background: #fff7f5; color: #7a3427; }
+.log-error .technical-details { border-top-color: #e7ccc6; }
+.log-content { width: 100%; max-height: min(52vh, 560px); min-height: 220px; overflow: auto; margin: 14px 0 0; padding: 16px; border: 1px solid #d7ddd8; border-radius: 10px; background: #f7f8f6; color: #25372f; font: 12px/1.55 "Cascadia Mono", Consolas, "Courier New", monospace; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; }
+.log-page-actions { margin-top: 12px; margin-bottom: 0; }
+.log-main-actions { justify-content: space-between; border-top: 1px solid #e2e7e3; padding-top: 18px; }
 
 button:not(.nav-item) { border-radius: 8px; padding: 11px 18px; background: #244c3c; color: #fff; cursor: pointer; }
 button.secondary { background: #edf1ee; color: #244c3c; border: 1px solid #cfd9d2; }
@@ -121,6 +133,8 @@ footer { text-align: center; padding-top: 12px; }
   .settings-grid, .health-list, .technical-details dl, .info-grid { grid-template-columns: 1fr; }
   .health-row-heading { align-items: flex-start; }
   .repair-row-heading { align-items: flex-start; }
+  .log-viewer-heading { flex-direction: column; gap: 4px; }
+  .log-content { min-height: 180px; max-height: 48vh; }
 }
 
 @media (max-width: 420px) {

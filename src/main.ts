@@ -103,7 +103,7 @@ interface ProvisioningInfo {
 }
 
 type InstalledView = "home" | "settings" | "diagnostics";
-type SystemSection = "diagnostics" | "repair";
+type SystemSection = "diagnostics" | "repair" | "logs";
 type RepairClassification = "repairable" | "requires_input" | "blocked";
 
 interface RepairItem {
@@ -140,6 +140,33 @@ interface RepairApplyResult {
   provisioning_info: ProvisioningInfo;
   health_diagnostics: HealthDiagnosticsInfo | null;
   last_error: RuntimeErrorInfo | null;
+}
+
+interface LogCatalogEntry {
+  id: string;
+  label: string;
+  exists: boolean;
+  size_bytes: number;
+  modified_at: number | null;
+}
+
+interface LogCatalog {
+  generated_at: number;
+  logs: LogCatalogEntry[];
+}
+
+interface LogPage {
+  log_id: string;
+  lines: string[];
+  older_cursor: string | null;
+  has_older: boolean;
+  truncated: boolean;
+  redaction_count: number;
+}
+
+interface SupportBundleResult {
+  status: "exported" | "cancelled";
+  destination?: string | null;
 }
 
 type SetupStep = "welcome" | "details" | "review" | "progress" | "complete";
@@ -234,6 +261,24 @@ const repairApply = element<HTMLButtonElement>("repair-apply");
 const repairInspect = element<HTMLButtonElement>("repair-inspect");
 const repairOpenDiagnostics = element<HTMLButtonElement>("repair-open-diagnostics");
 const repairStatus = element("repair-status");
+const logsPanel = element("logs");
+const logsReadState = element("logs-read-state");
+const logSource = element<HTMLSelectElement>("log-source");
+const logSourceStatus = element("log-source-status");
+const logCurrentLabel = element("log-current-label");
+const logCurrentMeta = element("log-current-meta");
+const logRefreshStatus = element("log-refresh-status");
+const logEmpty = element("log-empty");
+const logReadError = element("log-read-error");
+const logReadErrorTitle = element("log-read-error-title");
+const logReadErrorMessage = element("log-read-error-message");
+const logReadErrorDetails = element<HTMLDetailsElement>("log-read-error-details");
+const logReadErrorTechnical = element("log-read-error-technical");
+const logContent = element<HTMLPreElement>("log-content");
+const logLoadOlder = element<HTMLButtonElement>("log-load-older");
+const logRefresh = element<HTMLButtonElement>("log-refresh");
+const logExport = element<HTMLButtonElement>("log-export");
+const logExportStatus = element("log-export-status");
 
 let provisioningBusy = false;
 let runtimeBusy = false;
@@ -260,6 +305,35 @@ let currentSystemSection: SystemSection = "diagnostics";
 let currentRepairPlan: RepairPlan | null = null;
 let repairOperation: "inspect" | "apply" | null = null;
 let repairRouteRequired = false;
+let currentLogCatalog: LogCatalog | null = null;
+let currentLogId: string | null = null;
+let currentLogLines: string[] = [];
+let currentLogOlderCursor: string | null = null;
+let currentLogHasOlder = false;
+let currentLogTruncated = false;
+let currentLogRedactionCount = 0;
+let logOperation: "catalog" | "read" | "older" | null = null;
+let logExportBusy = false;
+
+const LOG_PAGE_MAX_LINES = 200;
+const LOG_VIEW_MAX_LINES = 1000;
+
+function getLogCatalog(): Promise<LogCatalog> {
+  return invoke<LogCatalog>("get_log_catalog");
+}
+
+function readLogPage(logId: string, cursor: string | null, direction: "tail" | "older"): Promise<LogPage> {
+  return invoke<LogPage>("read_log_page", {
+    logId,
+    cursor,
+    direction,
+    maxLines: LOG_PAGE_MAX_LINES,
+  });
+}
+
+function exportSupportBundle(): Promise<SupportBundleResult> {
+  return invoke<SupportBundleResult>("export_support_bundle");
+}
 
 function nativeErrorText(error: unknown): string {
   if (typeof error === "string") return error;
@@ -448,6 +522,23 @@ function clearRepairPasswordFields(): void {
   repairAdminError.hidden = true;
 }
 
+function resetRepairInspectionState(): void {
+  currentRepairPlan = null;
+  repairList.replaceChildren();
+  repairAdminInput.hidden = true;
+  clearRepairPasswordFields();
+  repairError.textContent = "";
+  repairError.hidden = true;
+  repairOpenDiagnostics.hidden = true;
+  setTextIfChanged(repairSummaryState, "Chưa kiểm tra");
+  setTextIfChanged(
+    repairSummary,
+    "Nhấn Kiểm tra để CoffeePOS lập kế hoạch sửa chữa read-only cho trạng thái hiện tại.",
+  );
+  setTextIfChanged(repairInspect, "Kiểm tra");
+  setTextIfChanged(repairStatus, "");
+}
+
 function renderRepairItems(items: RepairItem[]): void {
   repairList.replaceChildren();
   for (const item of items) {
@@ -478,6 +569,7 @@ function renderRepairItems(items: RepairItem[]): void {
 
 function renderRepairPlan(plan: RepairPlan): void {
   currentRepairPlan = plan;
+  setTextIfChanged(repairInspect, "Kiểm tra lại");
   repairError.hidden = true;
   repairError.textContent = "";
   repairOpenDiagnostics.hidden = true;
@@ -507,6 +599,7 @@ function renderRepairPlan(plan: RepairPlan): void {
 
 function renderRepairCommandError(error: unknown): void {
   currentRepairPlan = null;
+  setTextIfChanged(repairInspect, "Kiểm tra lại");
   setTextIfChanged(repairSummaryState, "Không thể kiểm tra");
   setTextIfChanged(repairSummary, "CoffeePOS chưa tạo được repair plan an toàn cho store hiện tại.");
   repairList.replaceChildren();
@@ -571,6 +664,7 @@ function validateRepairAdminPassword(): string | null {
 
 function renderRepairResult(result: RepairApplyResult, previousPlan: RepairPlan): void {
   currentRepairPlan = null;
+  setTextIfChanged(repairInspect, "Kiểm tra lại");
   repairList.replaceChildren();
   repairAdminInput.hidden = true;
   clearRepairPasswordFields();
@@ -641,8 +735,9 @@ async function applyRepair(): Promise<void> {
     renderRepairResult(result, plan);
     if (result.health_diagnostics) renderHealthDiagnostics(result.health_diagnostics);
     await refreshRuntime();
-    if (result.status === "stale") await refreshRepairPlan();
   } catch (error) {
+    currentRepairPlan = null;
+    setTextIfChanged(repairInspect, "Kiểm tra lại");
     repairError.textContent = nativeErrorText(error);
     repairError.hidden = false;
     setTextIfChanged(repairSummaryState, "Sửa chữa chưa hoàn tất");
@@ -655,6 +750,276 @@ async function applyRepair(): Promise<void> {
     setRepairControls();
     setRuntimeControls(currentRuntime);
     setHealthControls();
+  }
+}
+
+function selectedLogEntry(): LogCatalogEntry | null {
+  if (!currentLogCatalog || !currentLogId) return null;
+  return currentLogCatalog.logs.find((entry) => entry.id === currentLogId) ?? null;
+}
+
+function formatLogBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MiB`;
+}
+
+function formatLogTimestamp(value: number | null): string {
+  if (!value || !Number.isFinite(value)) return "Chưa có dữ liệu";
+  const milliseconds = value < 1_000_000_000_000 ? value * 1000 : value;
+  const date = new Date(milliseconds);
+  if (Number.isNaN(date.getTime())) return "Không xác định";
+  return new Intl.DateTimeFormat("vi-VN", {
+    dateStyle: "short",
+    timeStyle: "short",
+  }).format(date);
+}
+
+function logErrorMessage(error: unknown, fallback: string): string {
+  if (error && typeof error === "object" && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+  }
+  return fallback;
+}
+
+function setLogControls(): void {
+  const busy = logOperation !== null || logExportBusy;
+  const entry = selectedLogEntry();
+  logsPanel.setAttribute("aria-busy", busy ? "true" : "false");
+  logSource.disabled = busy || !currentLogCatalog || currentLogCatalog.logs.length === 0;
+  logRefresh.disabled = busy;
+  logLoadOlder.disabled = busy || !currentLogHasOlder || !currentLogOlderCursor;
+  logExport.disabled = busy;
+  logLoadOlder.hidden = !currentLogHasOlder || !currentLogOlderCursor || !entry?.exists;
+}
+
+function renderLogMetadata(entry: LogCatalogEntry | null): void {
+  if (!entry) {
+    setTextIfChanged(logCurrentLabel, "Nhật ký");
+    setTextIfChanged(logCurrentMeta, "Chưa có metadata.");
+    return;
+  }
+  setTextIfChanged(logCurrentLabel, entry.label);
+  const metadata = entry.exists
+    ? `Cập nhật gần nhất: ${formatLogTimestamp(entry.modified_at)} · ${formatLogBytes(entry.size_bytes)}`
+    : "Chưa có file nhật ký cho nguồn này.";
+  const flags: string[] = [];
+  if (currentLogTruncated) flags.push("trang hiện tại đã được giới hạn");
+  if (currentLogRedactionCount > 0) flags.push(`đã ẩn ${currentLogRedactionCount} giá trị nhạy cảm`);
+  setTextIfChanged(logCurrentMeta, flags.length > 0 ? `${metadata} · ${flags.join(" · ")}` : metadata);
+}
+
+function clearLogReadError(): void {
+  logReadError.hidden = true;
+  logReadErrorDetails.hidden = true;
+  logReadErrorDetails.open = false;
+  logReadErrorTechnical.textContent = "";
+}
+
+function renderLogBody(): void {
+  const entry = selectedLogEntry();
+  renderLogMetadata(entry);
+  const hasLines = currentLogLines.length > 0;
+  logContent.hidden = !hasLines;
+  logContent.textContent = hasLines ? currentLogLines.join("\n") : "";
+  logEmpty.hidden = hasLines || !!entry?.exists || !entry;
+  if (!entry) {
+    setTextIfChanged(logsReadState, "Chưa tải");
+  } else if (!entry.exists) {
+    setTextIfChanged(logsReadState, "Chưa có dữ liệu");
+  } else if (hasLines) {
+    setTextIfChanged(logsReadState, currentLogTruncated ? "Đã giới hạn" : "Đã tải");
+  } else {
+    setTextIfChanged(logsReadState, "Không có dòng");
+    logEmpty.hidden = false;
+  }
+  setLogControls();
+}
+
+function showLogReadError(titleText: string, error: unknown, preserveContent: boolean): void {
+  setTextIfChanged(logsReadState, "Không thể đọc");
+  setTextIfChanged(logReadErrorTitle, titleText);
+  setTextIfChanged(logReadErrorMessage, logErrorMessage(error, "CoffeePOS không thể đọc dữ liệu nhật ký hiện tại."));
+  const technical = nativeErrorText(error);
+  logReadErrorTechnical.textContent = technical;
+  logReadErrorDetails.hidden = technical.length === 0;
+  logReadErrorDetails.open = false;
+  logReadError.hidden = false;
+  if (!preserveContent) {
+    currentLogLines = [];
+    currentLogOlderCursor = null;
+    currentLogHasOlder = false;
+    currentLogTruncated = false;
+    currentLogRedactionCount = 0;
+    logContent.textContent = "";
+    logContent.hidden = true;
+    logEmpty.hidden = true;
+  }
+  setLogControls();
+}
+
+function renderLogCatalog(catalog: LogCatalog): void {
+  const previousId = currentLogId;
+  currentLogCatalog = catalog;
+  logSource.replaceChildren();
+  for (const entry of catalog.logs) {
+    const option = document.createElement("option");
+    option.value = entry.id;
+    option.textContent = entry.exists ? entry.label : `${entry.label} · chưa có dữ liệu`;
+    logSource.append(option);
+  }
+
+  const nextId = previousId && catalog.logs.some((entry) => entry.id === previousId)
+    ? previousId
+    : catalog.logs.find((entry) => entry.id === "runtime")?.id ?? catalog.logs[0]?.id ?? null;
+  const sourceChanged = nextId !== currentLogId;
+  currentLogId = nextId;
+  logSource.value = nextId ?? "";
+  if (sourceChanged) {
+    currentLogLines = [];
+    currentLogOlderCursor = null;
+    currentLogHasOlder = false;
+    currentLogTruncated = false;
+    currentLogRedactionCount = 0;
+  }
+
+  const available = catalog.logs.filter((entry) => entry.exists).length;
+  if (catalog.logs.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Không có nguồn nhật ký";
+    logSource.append(option);
+    setTextIfChanged(logSourceStatus, "Native chưa trả về nguồn nhật ký nào trong allowlist.");
+  } else {
+    setTextIfChanged(logSourceStatus, `${available}/${catalog.logs.length} nguồn hiện có dữ liệu.`);
+  }
+  clearLogReadError();
+  renderLogBody();
+}
+
+async function loadCurrentLogTail(preserveExisting = false): Promise<void> {
+  const entry = selectedLogEntry();
+  if (!isTauri() || logOperation || logExportBusy || !entry) return;
+  if (!entry.exists) {
+    currentLogLines = [];
+    currentLogOlderCursor = null;
+    currentLogHasOlder = false;
+    currentLogTruncated = false;
+    currentLogRedactionCount = 0;
+    clearLogReadError();
+    setTextIfChanged(logRefreshStatus, "");
+    renderLogBody();
+    return;
+  }
+
+  logOperation = "read";
+  clearLogReadError();
+  setTextIfChanged(logsReadState, preserveExisting && currentLogLines.length > 0 ? "Đang làm mới" : "Đang đọc");
+  setTextIfChanged(logRefreshStatus, preserveExisting && currentLogLines.length > 0 ? "Đang làm mới…" : "Đang đọc…");
+  if (currentLogLines.length === 0) logEmpty.hidden = true;
+  setLogControls();
+  const requestedLogId = entry.id;
+  try {
+    const page = await readLogPage(requestedLogId, null, "tail");
+    if (page.log_id !== requestedLogId) throw new Error("Native trả về trang nhật ký không khớp nguồn đã chọn.");
+    const hitViewerLimit = page.lines.length > LOG_VIEW_MAX_LINES;
+    currentLogLines = hitViewerLimit ? page.lines.slice(-LOG_VIEW_MAX_LINES) : page.lines;
+    currentLogOlderCursor = page.older_cursor;
+    currentLogHasOlder = !hitViewerLimit && page.has_older;
+    currentLogTruncated = page.truncated || hitViewerLimit;
+    currentLogRedactionCount = page.redaction_count;
+    setTextIfChanged(logRefreshStatus, "Đã cập nhật.");
+    renderLogBody();
+  } catch (error) {
+    showLogReadError(`Không thể đọc nhật ký ${entry.label}`, error, preserveExisting && currentLogLines.length > 0);
+    setTextIfChanged(logRefreshStatus, "Không thể làm mới.");
+  } finally {
+    logOperation = null;
+    setLogControls();
+  }
+}
+
+async function refreshLogCatalogAndTail(preserveExisting = true): Promise<void> {
+  if (!isTauri() || logOperation || logExportBusy) return;
+  logOperation = "catalog";
+  clearLogReadError();
+  setTextIfChanged(logsReadState, currentLogLines.length > 0 ? "Đang làm mới" : "Đang tải");
+  setTextIfChanged(logRefreshStatus, currentLogLines.length > 0 ? "Đang làm mới…" : "Đang tải danh sách…");
+  setLogControls();
+  let loadTail = false;
+  try {
+    const catalog = await getLogCatalog();
+    renderLogCatalog(catalog);
+    loadTail = !!currentLogId;
+  } catch (error) {
+    showLogReadError("Không thể tải danh sách nhật ký", error, preserveExisting && currentLogLines.length > 0);
+    setTextIfChanged(logSourceStatus, "Không thể cập nhật danh sách nguồn nhật ký.");
+    setTextIfChanged(logRefreshStatus, "Không thể làm mới.");
+  } finally {
+    logOperation = null;
+    setLogControls();
+  }
+  if (loadTail) await loadCurrentLogTail(preserveExisting);
+}
+
+async function loadOlderLogLines(): Promise<void> {
+  const entry = selectedLogEntry();
+  const cursor = currentLogOlderCursor;
+  if (!isTauri() || logOperation || logExportBusy || !entry?.exists || !cursor || !currentLogHasOlder) return;
+  logOperation = "older";
+  clearLogReadError();
+  setTextIfChanged(logsReadState, "Đang tải thêm");
+  setTextIfChanged(logRefreshStatus, "Đang tải dòng cũ hơn…");
+  setLogControls();
+  const requestedLogId = entry.id;
+  try {
+    const page = await readLogPage(requestedLogId, cursor, "older");
+    if (page.log_id !== requestedLogId) throw new Error("Native trả về trang nhật ký không khớp nguồn đã chọn.");
+    const combinedLines = [...page.lines, ...currentLogLines];
+    const hitViewerLimit = combinedLines.length > LOG_VIEW_MAX_LINES;
+    currentLogLines = hitViewerLimit ? combinedLines.slice(0, LOG_VIEW_MAX_LINES) : combinedLines;
+    currentLogOlderCursor = page.older_cursor;
+    currentLogHasOlder = !hitViewerLimit && page.has_older;
+    currentLogTruncated = currentLogTruncated || page.truncated || hitViewerLimit;
+    currentLogRedactionCount += page.redaction_count;
+    setTextIfChanged(
+      logRefreshStatus,
+      hitViewerLimit
+        ? "Đã đạt giới hạn 1.000 dòng hiển thị. Chọn Làm mới để quay về phần mới nhất."
+        : page.lines.length > 0
+          ? "Đã tải thêm dòng cũ."
+          : "Không còn dòng cũ hơn.",
+    );
+    renderLogBody();
+  } catch (error) {
+    showLogReadError(`Không thể tải dòng cũ của ${entry.label}`, error, true);
+    setTextIfChanged(logRefreshStatus, "Không thể tải thêm.");
+  } finally {
+    logOperation = null;
+    setLogControls();
+  }
+}
+
+async function exportLogsSupportBundle(): Promise<void> {
+  if (!isTauri() || logExportBusy || logOperation) return;
+  logExportBusy = true;
+  setTextIfChanged(logExportStatus, "Đang tạo gói hỗ trợ… CoffeePOS đang thu thập nhật ký và loại bỏ thông tin nhạy cảm.");
+  setLogControls();
+  try {
+    const result = await exportSupportBundle();
+    if (result.status === "cancelled") {
+      setTextIfChanged(logExportStatus, "");
+      return;
+    }
+    setTextIfChanged(logExportStatus, "Đã xuất gói hỗ trợ. File đã được lưu tại vị trí bạn chọn.");
+  } catch (error) {
+    const message = logErrorMessage(error, "CoffeePOS chưa thể tạo gói hỗ trợ.");
+    setTextIfChanged(logExportStatus, `Không thể xuất gói hỗ trợ. ${message}`);
+  } finally {
+    logExportBusy = false;
+    setLogControls();
   }
 }
 
@@ -787,9 +1152,9 @@ function viewHeading(view: InstalledView): HTMLElement {
 }
 
 function systemSectionHeading(section: SystemSection): HTMLElement {
-  return section === "repair"
-    ? element<HTMLElement>("repair-title")
-    : element<HTMLElement>("health-diagnostics-title");
+  if (section === "repair") return element<HTMLElement>("repair-title");
+  if (section === "logs") return element<HTMLElement>("logs-title");
+  return element<HTMLElement>("health-diagnostics-title");
 }
 
 function selectSystemSection(section: SystemSection, moveFocus = true, refresh = true): void {
@@ -802,8 +1167,8 @@ function selectSystemSection(section: SystemSection, moveFocus = true, refresh =
   }
   if (moveFocus) systemSectionHeading(section).focus();
   if (!refresh || currentView !== "diagnostics") return;
-  if (section === "repair") void refreshRepairPlan();
-  else void refreshHealthDiagnostics();
+  if (section === "logs") void refreshLogCatalogAndTail(true);
+  else if (section === "diagnostics") void refreshHealthDiagnostics();
 }
 
 function selectInstalledView(view: InstalledView, moveFocus = true): void {
@@ -816,12 +1181,12 @@ function selectInstalledView(view: InstalledView, moveFocus = true): void {
     panel.hidden = panel.dataset.viewPanel !== view;
   }
   if (view === "diagnostics") {
-    selectSystemSection(repairRouteRequired ? "repair" : "diagnostics", false, false);
+    selectSystemSection(repairRouteRequired ? "repair" : currentSystemSection, false, false);
   }
   if (moveFocus) viewHeading(view).focus();
   if (view === "diagnostics" && moveFocus) {
-    if (currentSystemSection === "repair") void refreshRepairPlan();
-    else void refreshHealthDiagnostics();
+    if (currentSystemSection === "logs") void refreshLogCatalogAndTail(true);
+    else if (currentSystemSection === "diagnostics") void refreshHealthDiagnostics();
   }
 }
 
@@ -1170,25 +1535,16 @@ async function renderProvisioningWithRepairRouting(
   info: ProvisioningInfo,
   commandError?: string,
 ): Promise<void> {
-  let repairPlan: RepairPlan | null = null;
-  let repairPlanError: unknown = null;
-  if (info.state === "needs_repair" && isTauri()) {
-    try {
-      repairPlan = await invoke<RepairPlan>("get_repair_plan");
-      repairRouteRequired = repairPlan.items.length > 0;
-    } catch (error) {
-      repairPlanError = error;
-      repairRouteRequired = true;
-    }
-  } else {
+  const enteringRepairState = info.state === "needs_repair" && currentProvisioning?.state !== "needs_repair";
+  repairRouteRequired = info.state === "needs_repair";
+  if (enteringRepairState) {
+    resetRepairInspectionState();
+  } else if (!repairRouteRequired) {
     repairRouteRequired = false;
     currentRepairPlan = null;
   }
   renderProvisioning(info, commandError);
-  if (repairRouteRequired) {
-    if (repairPlan) renderRepairPlan(repairPlan);
-    else if (repairPlanError) renderRepairCommandError(repairPlanError);
-  }
+  setRepairControls();
 }
 
 async function refreshProvisioning(commandError?: string): Promise<boolean> {
@@ -1436,8 +1792,8 @@ async function bootstrap(): Promise<void> {
     bootstrapBusy = false;
     if (!retry.hidden) retry.disabled = false;
     if (currentView === "diagnostics") {
-      if (currentSystemSection === "repair") void refreshRepairPlan();
-      else void refreshHealthDiagnostics();
+      if (currentSystemSection === "logs") void refreshLogCatalogAndTail(true);
+      else if (currentSystemSection === "diagnostics") void refreshHealthDiagnostics();
     }
   }
 }
@@ -1485,6 +1841,22 @@ healthRecheck.addEventListener("click", () => void refreshHealthDiagnostics());
 repairInspect.addEventListener("click", () => void refreshRepairPlan());
 repairApply.addEventListener("click", () => void applyRepair());
 repairOpenDiagnostics.addEventListener("click", () => selectSystemSection("diagnostics", true, true));
+logSource.addEventListener("change", () => {
+  if (logOperation || logExportBusy) return;
+  currentLogId = logSource.value || null;
+  currentLogLines = [];
+  currentLogOlderCursor = null;
+  currentLogHasOlder = false;
+  currentLogTruncated = false;
+  currentLogRedactionCount = 0;
+  clearLogReadError();
+  setTextIfChanged(logRefreshStatus, "");
+  renderLogBody();
+  void loadCurrentLogTail(false);
+});
+logRefresh.addEventListener("click", () => void refreshLogCatalogAndTail(true));
+logLoadOlder.addEventListener("click", () => void loadOlderLogLines());
+logExport.addEventListener("click", () => void exportLogsSupportBundle());
 openWordPress.addEventListener("click", () => void openManagedWordPress());
 
 setupForm.addEventListener("submit", async (event) => {

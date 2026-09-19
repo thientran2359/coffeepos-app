@@ -1,6 +1,9 @@
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "get_log_catalog",
+            "read_log_page",
+            "export_support_bundle",
             "get_shell_info",
             "save_app_settings",
             "get_setup_info",

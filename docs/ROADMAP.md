@@ -55,7 +55,7 @@ Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ng
 | 6.1 — Health diagnostics | 🟡 Đã triển khai, chờ manual acceptance | Live authenticated Database/PHP probes; WordPress readiness + CoffeePOS machine-health mapping cho đủ 5 component; recovery action rõ ràng; lightweight checks pass |
 | 6.2 — Runtime performance and responsiveness | 🟡 Đã triển khai, chờ manual acceptance | Caddy 2.11.4 + PHP FastCGI 4 workers + OPcache; async lifecycle/status-health split; dynamic p50 134 ms, 4 parallel 144 ms vs 537 ms sequential; staged lifecycle/concurrency smoke pass |
 | 6.3 — Repair flow | 🟡 Đã triển khai, chờ manual acceptance | Hệ thống → Sửa chữa; read-only plan + stale guard; managed file/core/plugin atomic repair + crash journal; admin reset/pending machine-token recovery; DB mismatch preflight blocked trước mutation; lightweight checks pass; xem [PHASE-06.3](PHASE-06.3.md) |
-| 6.4 — Log viewer/export | ⏳ Chưa bắt đầu | Xem/export diagnostic logs đã redact secret |
+| 6.4 — Log viewer/export | 🟡 Đã triển khai, chờ manual acceptance | Hệ thống → Nhật ký; native 10-source allowlist + bounded paging; viewer/export fail-closed redaction; support bundle schema 1 + Windows Save As; 11 focused Rust tests + UI checks pass; xem [PHASE-06.4](PHASE-06.4.md) |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -189,7 +189,7 @@ Nghiệm thu trực tiếp từ app: fresh store → setup toàn stack → appli
 
 ## Phase 5 — Trải nghiệm ứng dụng và mở bán hàng
 
-Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3–5.6, Phase 6.1 health diagnostics và Phase 6.2 runtime performance đã triển khai code + focused/lightweight validation, còn manual Windows acceptance theo tài liệu từng phase. Phase 6.3+ chưa triển khai. Sau snapshot 6.1, product IA được chốt lại: installed-store top-level navigation là **Tổng quan / Cấu hình / Hệ thống**; **Chẩn đoán** chuyển thành chức năng bên trong Hệ thống. Đây là target cho mọi UI change tiếp theo; acceptance lịch sử của 5.1 vẫn ghi đúng shell đã chạy lúc đó. Trước code mỗi milestone, bổ sung spec phase với wireframe success/loading/error, contract native cần dùng và acceptance theo [UI-UX.md](UI-UX.md). Tái sử dụng runtime/provisioning hiện có; không viết lại backend chỉ để đổi giao diện.
+Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3–5.6 và Phase 6.1–6.4 đã triển khai code + focused/lightweight validation, còn manual Windows acceptance theo tài liệu từng phase. Sau snapshot 6.1, product IA được chốt lại: installed-store top-level navigation là **Tổng quan / Cấu hình / Hệ thống**; **Chẩn đoán**, **Sửa chữa** và **Nhật ký** là chức năng bên trong Hệ thống. Đây là target cho mọi UI change tiếp theo; acceptance lịch sử của 5.1 vẫn ghi đúng shell đã chạy lúc đó. Trước code mỗi milestone, bổ sung spec phase với wireframe success/loading/error, contract native cần dùng và acceptance theo [UI-UX.md](UI-UX.md). Tái sử dụng runtime/provisioning hiện có; không viết lại backend chỉ để đổi giao diện.
 
 ### Phase 5.1 — Khung giao diện và điều hướng
 
@@ -265,7 +265,9 @@ Trong **Hệ thống**, repair các file/config/plugin managed bị thiếu ho�
 
 ### Phase 6.4 — Log viewer/export
 
-Trong **Hệ thống**, cho phép xem/export diagnostic logs đã redact secret. **Done khi** một support bundle đủ để chẩn đoán runtime/provisioning failure mà không chứa credential.
+Trong **Hệ thống → Nhật ký**, cho phép xem diagnostic logs theo native allowlist + bounded paging và export support bundle schema-versioned. Viewer chỉ nhận text đã redact; export chạy redaction lần nữa, normalize path, giới hạn kích thước và chỉ lấy safe diagnostic projections + allowlisted logs. Không copy database/uploads/site/config/protected secrets và không start/stop runtime chỉ để export. **Done khi** fixture secret canary không xuất hiện trong viewer/bundle, support bundle đủ evidence cho runtime/provisioning/repair failure phổ biến và manual Windows smoke pass cho running/stopped/cancel/error. Xem [PHASE-06.4.md](PHASE-06.4.md).
+
+**Đã triển khai 2026-09-19, chờ manual acceptance:** native có catalog/read/export commands với 10 log source cố định, canonical containment, paging 200 dòng + byte/scan bounds, stale/mid-line cursor rejection và loại trailing line đang ghi dở. Viewer/export đều exact-redact protected DB/admin/machine/pending secrets và fail closed nếu secret file tồn tại nhưng không giải mã được; export normalize data-root/USERPROFILE case-insensitive trên Windows. Support bundle schema 1 chỉ lấy safe runtime/health/provisioning/repair projections + allowlisted log tails, giới hạn 2 MiB/source và 20 MiB uncompressed, staged temp + atomic finalize, native Save As và duplicate-export guard. UI **Hệ thống → Nhật ký** có source selector, empty/error states, refresh/load-older/export gating. Rust logs tests 11/11, cargo check/fmt và UI lint/build pass; Save As/export trên app Windows thật còn chờ manual smoke.
 
 ## Phase 7 — Backup / Restore
 
@@ -339,4 +341,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6** và **Phase 6.1–6.3** đã triển khai, pass focused/lightweight automated validation và còn manual acceptance. Sau khi smoke-test các mốc này, roadmap tiếp tục với **Phase 6.4 — Log viewer/export**.
+Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6** và **Phase 6.1–6.4** đã triển khai, pass focused/lightweight automated validation và còn manual acceptance theo Definition of Done tương ứng. Sau khi smoke-test các mốc này, roadmap tiếp tục với **Phase 7.1 — Backup format**.

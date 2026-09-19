@@ -1,6 +1,6 @@
 # CoffeePOS Desktop — Đặc tả UI/UX
 
-Ngày cập nhật: 2026-09-19. Đây là đặc tả trải nghiệm; bằng chứng triển khai nằm trong tài liệu từng phase. Phase 1–4.12 giữ nguyên kết quả kỹ thuật đã nghiệm thu; Phase 5.1 shell/navigation và Phase 5.2 store/account onboarding đã hoàn thành Windows-first. Phase 5.3–5.6, Phase 6.1 health diagnostics và Phase 6.2 runtime performance đã triển khai và pass focused/lightweight automated checks; manual Windows acceptance còn chờ người dùng thực hiện. Sau snapshot Phase 6.1, installed-store shell đã được refactor theo kiến trúc thông tin **Tổng quan / Cấu hình / Hệ thống**, thay thế cách trình bày ba mục ngang **Trang chính / Cài đặt / Chẩn đoán**. Scope, thứ tự và trạng thái phase do [ROADMAP.md](ROADMAP.md) quản lý.
+Ngày cập nhật: 2026-09-19. Đây là đặc tả trải nghiệm; bằng chứng triển khai nằm trong tài liệu từng phase. Phase 1–4.12 giữ nguyên kết quả kỹ thuật đã nghiệm thu; Phase 5.1 shell/navigation và Phase 5.2 store/account onboarding đã hoàn thành Windows-first. Phase 5.3–5.6 và Phase 6.1–6.4 đã triển khai và pass focused/lightweight automated checks; manual Windows acceptance còn chờ người dùng thực hiện. Sau snapshot Phase 6.1, installed-store shell đã được refactor theo kiến trúc thông tin **Tổng quan / Cấu hình / Hệ thống**, thay thế cách trình bày ba mục ngang **Trang chính / Cài đặt / Chẩn đoán**. **Chẩn đoán / Sửa chữa / Nhật ký** hiện là các chức năng cấp hai trong Hệ thống. Scope, thứ tự và trạng thái phase do [ROADMAP.md](ROADMAP.md) quản lý.
 
 ## 1. Mục tiêu
 
@@ -125,6 +125,8 @@ Baseline 5.6 Windows-first dùng system tray cho Minimize: bấm **—** ẩn sh
 
 Trong **Hệ thống → Chẩn đoán**, Phase 6.1 hiển thị Database/PHP/WordPress/WooCommerce/CoffeePOS thành các dòng health độc lập. Chỉ gán **Có lỗi** khi native probe hoặc authenticated machine-health có bằng chứng cho đúng component; dependency chưa xác minh giữ **Chưa xác minh**. **Kiểm tra lại** chạy snapshot health thật, còn restart runtime là action riêng. Phase 6.2 không tạo thêm màn hình top-level; nó làm status/lifecycle/health phản hồi mượt hơn ở phía runtime. Port, version, path và structured error chi tiết được gom dưới **Chi tiết kỹ thuật**; repair và log export không xuất hiện trước Phase 6.3–6.4.
 
+Trong **Hệ thống → Sửa chữa**, mở tab chỉ hiển thị trạng thái **Chưa kiểm tra**. Không tự chạy get_repair_plan khi vào tab, đổi tab, bootstrap hoặc route vào needs_repair; người dùng phải bấm **Kiểm tra** trước. Chỉ khi có repair plan mới nhất và can_apply=true thì nút **Sửa chữa** mới được bật. Plan stale hoặc apply lỗi yêu cầu người dùng bấm **Kiểm tra lại**; app không tự inspect/apply lại.
+
 - Một hành động chính cho mỗi bước/trạng thái; nhãn dùng từ của người vận hành: Cài đặt, Tiếp tục thiết lập, Mở bán hàng, Xem chi tiết.
 - Layout có tiêu đề, mô tả ngắn, vùng nội dung và action rõ ràng. Shell dùng cùng typography, spacing, max-width, padding và button/input/error styles; không thêm UI framework chỉ để chia màn hình.
 - Navigation cấp cao sau setup chỉ dùng **Tổng quan / Cấu hình / Hệ thống**. Chẩn đoán và công cụ kỹ thuật dùng navigation cấp hai trong Hệ thống. Wizard có thứ tự bước trước setup. Lỗi/chờ là state của màn hình, không bắt buộc tạo route riêng cho mọi state.
@@ -139,7 +141,7 @@ Trước triển khai mỗi màn hình, spec phase phải có wireframe cho tr�
 
 | Nhóm | Phần UX phải nghiệm thu cùng backend |
 | --- | --- |
-| 6.x Hệ thống / Diagnostics / Repair | Hệ thống là khu vực cấp cao; Chẩn đoán tóm tắt dễ hiểu, chi tiết kỹ thuật mở khi cần; repair giải thích phạm vi/kết quả; export log có trạng thái và redaction |
+| 6.x Hệ thống / Diagnostics / Repair / Logs | Hệ thống là khu vực cấp cao; Chẩn đoán tóm tắt dễ hiểu, chi tiết kỹ thuật mở khi cần; repair giải thích phạm vi/kết quả; Nhật ký có source selector + bounded viewer, export có trạng thái, native Save As và redaction |
 | 7.x Hệ thống / Backup / Restore | Địa điểm lưu, tiến trình, thành công/lỗi; validate bản restore và giải thích dữ liệu sẽ thay trước xác nhận; lỗi giữ đường phục hồi |
 | 8.x LAN | Mặc định tắt; bật/tắt rõ ràng, URL thực có thể copy, lỗi network/firewall, ảnh hưởng khi đổi địa chỉ hoặc dừng server |
 | 9.x Distribution/Update | Setup trên máy sạch, thông báo prerequisite; update tiến trình/lỗi và dữ liệu được giữ; không bắt người dùng chạy lệnh |

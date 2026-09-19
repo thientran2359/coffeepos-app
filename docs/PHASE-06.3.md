@@ -127,6 +127,8 @@ Hệ thống → Sửa chữa
 
 Inspect là read-only và có thể chạy nhiều lần. Apply phải dùng plan mới nhất; nếu filesystem/journal/version thay đổi từ lúc plan được tạo, native trả stale-plan error và yêu cầu inspect lại thay vì tiếp tục với assumption cũ.
 
+**UX rule:** mở **Hệ thống → Sửa chữa** không tự gọi get_repair_plan và không tự chạy bất kỳ repair operation nào. Màn hình vào trạng thái **Chưa kiểm tra**; người dùng phải bấm **Kiểm tra** để tạo repair plan read-only. Sau khi đã inspect, nút đổi thành **Kiểm tra lại**. Nếu plan stale hoặc apply lỗi, app không tự inspect lại; người dùng chủ động bấm **Kiểm tra lại** trước khi có thể chạy **Sửa chữa** lần tiếp theo.
+
 ## Planned native contract
 
 Tên type/command dưới đây là contract mục tiêu để implementation bám theo; có thể đổi tên trong code trước khi phase hoàn tất nếu semantics giữ nguyên và docs được cập nhật cùng commit.
@@ -214,15 +216,16 @@ Repair staging/backup chỉ được tạo dưới managed `data_root`, dùng t�
 
 Repair là chức năng cấp hai của **Hệ thống**, cùng hierarchy với **Chẩn đoán**; không thêm top-level tab mới.
 
-### Không có lỗi repairable
+### Chưa kiểm tra
 
 ```text
 Hệ thống > Sửa chữa
 
 Sửa chữa hệ thống
-CoffeePOS không phát hiện thành phần managed nào cần sửa.
+Chưa kiểm tra
+Nhấn Kiểm tra để CoffeePOS lập repair plan read-only.
 
-[ Kiểm tra lại ]
+[ Kiểm tra ]
 ```
 
 ### Có kế hoạch sửa chữa

@@ -203,6 +203,7 @@
             <nav class="system-nav" aria-label="Công cụ hệ thống">
               <button type="button" class="system-nav-item" data-system-section="diagnostics" aria-controls="system-diagnostics-panel" aria-current="page">Chẩn đoán</button>
               <button type="button" class="system-nav-item" data-system-section="repair" aria-controls="system-repair-panel">Sửa chữa</button>
+              <button type="button" class="system-nav-item" data-system-section="logs" aria-controls="system-logs-panel">Nhật ký</button>
             </nav>
             <div id="system-diagnostics-panel" data-system-panel="diagnostics">
             <section class="card" id="health-diagnostics" aria-labelledby="health-diagnostics-title">
@@ -288,7 +289,7 @@
                   </div>
                   <span id="repair-summary-state" class="state-badge">Chưa kiểm tra</span>
                 </div>
-                <p id="repair-summary" role="status" aria-live="polite">Kiểm tra các file, cấu hình, plugin và credential do CoffeePOS Desktop quản lý.</p>
+                <p id="repair-summary" role="status" aria-live="polite">Nhấn Kiểm tra để CoffeePOS lập kế hoạch sửa chữa read-only cho trạng thái hiện tại.</p>
                 <div id="repair-list" class="repair-list" aria-live="polite"></div>
                 <div id="repair-admin-input" class="repair-input" hidden>
                   <p class="lead">CoffeePOS không thể khôi phục mật khẩu quản trị cũ từ WordPress. Nhập mật khẩu mới để cập nhật đúng tài khoản quản trị hiện tại.</p>
@@ -305,10 +306,61 @@
                 <p id="repair-error" class="error" role="alert" hidden></p>
                 <div class="actions">
                   <button id="repair-apply" type="button" disabled>Sửa chữa</button>
-                  <button id="repair-inspect" class="secondary" type="button">Kiểm tra lại</button>
+                  <button id="repair-inspect" class="secondary" type="button">Kiểm tra</button>
                   <button id="repair-open-diagnostics" class="secondary" type="button" hidden>Mở Chẩn đoán</button>
                 </div>
                 <p id="repair-status" class="hint" role="status" aria-live="polite"></p>
+              </section>
+            </div>
+            <div id="system-logs-panel" data-system-panel="logs" hidden>
+              <section class="card log-viewer-card" id="logs" aria-labelledby="logs-title">
+                <div class="section-heading compact-heading">
+                  <div>
+                    <span class="section-label">NHẬT KÝ</span>
+                    <h3 id="logs-title" tabindex="-1">Nhật ký hệ thống</h3>
+                  </div>
+                  <span id="logs-read-state" class="state-badge">Chưa tải</span>
+                </div>
+                <p class="lead">Xem thông tin chẩn đoán gần đây hoặc xuất gói hỗ trợ khi cần xử lý sự cố.</p>
+
+                <div class="log-source-control">
+                  <label for="log-source">Nguồn nhật ký</label>
+                  <select id="log-source" aria-describedby="log-source-status">
+                    <option value="">Đang tải danh sách…</option>
+                  </select>
+                  <p id="log-source-status" class="hint" role="status" aria-live="polite">Mở Nhật ký để tải các nguồn có sẵn.</p>
+                </div>
+
+                <div class="log-viewer-heading">
+                  <div>
+                    <strong id="log-current-label">Nhật ký</strong>
+                    <p id="log-current-meta" class="hint">Chưa có metadata.</p>
+                  </div>
+                  <span id="log-refresh-status" class="hint" role="status" aria-live="polite"></span>
+                </div>
+
+                <div id="log-empty" class="log-message" hidden>
+                  <strong>Chưa có dữ liệu nhật ký cho thành phần này.</strong>
+                  <p>Nhật ký sẽ xuất hiện khi thành phần được chạy hoặc kiểm tra.</p>
+                </div>
+                <div id="log-read-error" class="log-message log-error" role="alert" hidden>
+                  <strong id="log-read-error-title">Không thể đọc nhật ký</strong>
+                  <p id="log-read-error-message">CoffeePOS không thể đọc file nhật ký hiện tại.</p>
+                  <details id="log-read-error-details" class="technical-details" hidden>
+                    <summary>Chi tiết kỹ thuật</summary>
+                    <p id="log-read-error-technical" class="hint"></p>
+                  </details>
+                </div>
+                <pre id="log-content" class="log-content" tabindex="0" aria-label="Nội dung nhật ký" hidden></pre>
+
+                <div class="actions log-page-actions">
+                  <button id="log-load-older" class="secondary" type="button" hidden>Tải dòng cũ hơn</button>
+                </div>
+                <div class="actions log-main-actions">
+                  <button id="log-refresh" class="secondary" type="button">Làm mới</button>
+                  <button id="log-export" type="button">Xuất gói hỗ trợ</button>
+                </div>
+                <p id="log-export-status" class="hint" role="status" aria-live="polite"></p>
               </section>
             </div>
           </section>

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod logs;
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod provisioning;
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
@@ -8,6 +9,7 @@ mod runtime;
 mod secret;
 
 use config::{AppConfig, StartupView, Store};
+use logs::{LogCatalog, LogErrorInfo, LogPage, SupportBundleResult};
 #[cfg(debug_assertions)]
 use provisioning::Provisioner;
 use provisioning::{
@@ -37,6 +39,7 @@ struct ShellState {
     lifecycle_requested: AtomicBool,
     exit_authorized: AtomicBool,
     shutdown_in_progress: AtomicBool,
+    support_export_in_progress: AtomicBool,
     #[cfg(debug_assertions)]
     provisioning: Mutex<()>,
 }
@@ -63,6 +66,19 @@ fn application_data_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_local_data_dir()
         .map_err(|e| format!("Cannot locate application data: {e}. Check your OS user profile."))
+}
+
+fn managed_data_root(app: &tauri::AppHandle, state: &ShellState) -> Result<PathBuf, String> {
+    match state.store.try_lock() {
+        Ok(guard) => Ok(guard
+            .as_ref()
+            .map(|store| store.root.clone())
+            .unwrap_or(application_data_root(app)?)),
+        Err(TryLockError::WouldBlock) => application_data_root(app),
+        Err(TryLockError::Poisoned(_)) => Err(
+            "Application state unavailable. Restart CoffeePOS Desktop before reading logs.".into(),
+        ),
+    }
 }
 
 #[derive(Serialize)]
@@ -508,6 +524,150 @@ fn request_full_exit(app: tauri::AppHandle) {
             }
         }
     });
+}
+
+fn logs_command_error(action: &str, code: &str, message: &str, recovery: &str) -> LogErrorInfo {
+    LogErrorInfo {
+        component: "logs".into(),
+        action: action.into(),
+        code: code.into(),
+        message: message.into(),
+        recovery: recovery.into(),
+    }
+}
+
+#[tauri::command]
+async fn get_log_catalog(app: tauri::AppHandle) -> Result<LogCatalog, LogErrorInfo> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<ShellState>();
+        let root = managed_data_root(&app, &state).map_err(|_| {
+            logs_command_error(
+                "catalog",
+                "data_root_unavailable",
+                "CoffeePOS cannot resolve the managed log directory.",
+                "Restart CoffeePOS Desktop and retry.",
+            )
+        })?;
+        logs::get_log_catalog(&root)
+    })
+    .await
+    .map_err(|_| {
+        logs_command_error(
+            "catalog",
+            "worker_failed",
+            "CoffeePOS could not complete the log catalog operation.",
+            "Retry the log view or restart CoffeePOS Desktop.",
+        )
+    })?
+}
+
+#[tauri::command]
+async fn read_log_page(
+    app: tauri::AppHandle,
+    log_id: String,
+    cursor: Option<String>,
+    direction: Option<String>,
+    max_lines: Option<usize>,
+) -> Result<LogPage, LogErrorInfo> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<ShellState>();
+        let root = managed_data_root(&app, &state).map_err(|_| {
+            logs_command_error(
+                "read",
+                "data_root_unavailable",
+                "CoffeePOS cannot resolve the managed log directory.",
+                "Restart CoffeePOS Desktop and retry.",
+            )
+        })?;
+        logs::read_log_page(
+            &root,
+            &log_id,
+            cursor.as_deref(),
+            direction.as_deref(),
+            max_lines,
+        )
+    })
+    .await
+    .map_err(|_| {
+        logs_command_error(
+            "read",
+            "worker_failed",
+            "CoffeePOS could not complete the log read operation.",
+            "Refresh the selected log or restart CoffeePOS Desktop.",
+        )
+    })?
+}
+
+#[tauri::command]
+async fn export_support_bundle(app: tauri::AppHandle) -> Result<SupportBundleResult, LogErrorInfo> {
+    {
+        let state = app.state::<ShellState>();
+        if state
+            .support_export_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(logs_command_error(
+                "export",
+                "export_in_progress",
+                "CoffeePOS is already creating a support bundle.",
+                "Wait for the current export to finish before trying again.",
+            ));
+        }
+    }
+
+    let worker_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        struct ExportFlagReset<'a>(&'a AtomicBool);
+        impl Drop for ExportFlagReset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
+        let state = worker_app.state::<ShellState>();
+        let _reset = ExportFlagReset(&state.support_export_in_progress);
+        let root = managed_data_root(&worker_app, &state).map_err(|_| {
+            logs_command_error(
+                "export",
+                "data_root_unavailable",
+                "CoffeePOS cannot resolve the managed support data directory.",
+                "Restart CoffeePOS Desktop and retry support-bundle export.",
+            )
+        })?;
+        let default_name = logs::default_support_bundle_name();
+        let Some(destination) = logs::choose_support_bundle_destination(&default_name)? else {
+            return Ok(SupportBundleResult::cancelled());
+        };
+        let runtime_snapshot = match state.runtime.try_lock() {
+            Ok(guard) => guard.as_ref().map(RuntimeManager::info),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(logs_command_error(
+                    "export",
+                    "runtime_snapshot_unavailable",
+                    "CoffeePOS cannot read the cached runtime state for the support bundle.",
+                    "Restart CoffeePOS Desktop and retry export.",
+                ));
+            }
+        };
+        logs::export_support_bundle(&root, &destination, runtime_snapshot.as_ref())
+    })
+    .await;
+
+    if result.is_err() {
+        app.state::<ShellState>()
+            .support_export_in_progress
+            .store(false, Ordering::Release);
+    }
+    result.map_err(|_| {
+        logs_command_error(
+            "export",
+            "worker_failed",
+            "CoffeePOS could not complete support-bundle export.",
+            "Retry export or restart CoffeePOS Desktop.",
+        )
+    })?
 }
 
 #[tauri::command]
@@ -1573,6 +1733,9 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            get_log_catalog,
+            read_log_page,
+            export_support_bundle,
             get_shell_info,
             save_app_settings,
             get_setup_info,
