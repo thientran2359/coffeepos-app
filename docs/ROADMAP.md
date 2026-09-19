@@ -61,6 +61,9 @@ Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ng
 | 7.3 — Uploads/config backup | ✅ Hoàn thành Windows-first | Complete encrypted backup + native Save As/progress/cancel + same-snapshot uploads/config/admin secret + crash recovery/final validation; real disposable-store smoke pass; xem [PHASE-07.3](PHASE-07.3.md) |
 | 7.4 — Restore | 🟡 Đã triển khai, chờ manual acceptance | Inspect + recovery snapshot + isolated staging + target secrets + transaction-owned cutover/rollback/recovery; focused restore checks pass; xem [PHASE-07.4](PHASE-07.4.md) |
 | 7.5 — Desktop localization | 🟡 Đã triển khai, chờ manual acceptance | Tiếng Việt/English; first-run language chooser + persisted Settings hot-switch + full Desktop-shell i18n + native tray/close locale + stable user-facing error codes; UI/Rust checks pass; xem [PHASE-07.5](PHASE-07.5.md) |
+| 8.1 — LAN bind | ⚪ Đã chốt đặc tả | Opt-in selected-interface bind, target-local HTTPS identity, canonical LAN origin, loopback-only DB/FastCGI/admin/health và rollback về local-only; xem [PHASE-08.1](PHASE-08.1.md) |
+| 8.2 — LAN address UI | ⚪ Đã chốt đặc tả | Cấu hình → Mạng nội bộ, adapter/address selection, copy canonical URL, trust-certificate export/fingerprint và address-change UX; xem [PHASE-08.2](PHASE-08.2.md) |
+| 8.3 — LAN security | ⚪ Đã chốt đặc tả | Route allow/deny, HTTPS/session/origin/CSRF, Private-network policy, firewall guidance, fail-closed network changes và multi-device security acceptance; xem [PHASE-08.3](PHASE-08.3.md) |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -302,21 +305,23 @@ Thêm hai locale Desktop `vi` / `en`. Fresh profile chọn language trước Wel
 
 ## Phase 8 — LAN Mode
 
-Entry gate: chốt canonical URL/redirect, auth/session, transport bảo vệ credential, firewall, health-token scope và rollback về loopback trước 8.1. Kiểm web server theo gate kiến trúc, bao gồm POS + KDS/customer display/request dài. `0.0.0.0` là bind address, không phải URL hiển thị. Khả năng sync của các thiết bị phải kiểm qua transport thực tế của plugin; không suy luận sync nhiều máy từ việc mở được trang.
+Entry gate đã chốt trong bộ spec Phase 8: LAN là opt-in và default vẫn local-only; canonical LAN origin dùng HTTPS trên một IPv4 của adapter được user approve; listener internal/native, MariaDB, FastCGI và Caddy admin tiếp tục loopback-only; network preference + TLS identity là target-local và không đi theo portable backup. Không dùng wildcard làm URL hiển thị/canonical origin và không silently chuyển sang adapter khác khi network thay đổi. Phase 8.1–8.2 chỉ là controlled acceptance cho tới khi 8.3 pass security gate.
+
+Kiểm web server theo gate kiến trúc, bao gồm POS + KDS/customer display/request dài. Khả năng sync của các thiết bị phải kiểm qua transport thực tế của plugin; không suy luận sync nhiều máy từ việc mở được trang.
 
 ### Phase 8.1 — LAN bind
 
-Opt-in bind HTTP trên interface LAN phù hợp; database vẫn loopback-only. **Done khi** thiết bị khác trong LAN truy cập POS được sau khi bật LAN mode.
+Opt-in bind Caddy trên selected LAN interface với HTTPS + canonical origin transaction; giữ internal Caddy listener, database, FastCGI, Caddy admin và machine-health native ở loopback. Apply/rebind được serialize với lifecycle, có health verification và rollback về local-only khi fail. **Done khi** thiết bị khác trong cùng Private LAN truy cập/login POS qua canonical HTTPS URL sau trust certificate, đồng thời DB/native/internal endpoints không đi theo listener LAN. Xem [PHASE-08.1.md](PHASE-08.1.md).
 
 ### Phase 8.2 — LAN address UI
 
-Hiển thị reachable local URL/address để người dùng không phải tự tìm IP. **Done khi** URL được cập nhật đúng khi network thay đổi trong các case hỗ trợ.
+Thêm **Cấu hình → Mạng nội bộ**: chọn adapter, hiển thị exact committed HTTPS URL, native Copy, export public trust certificate + fingerprint và state rõ khi DHCP/address/adapter thay đổi. Không quảng bá URL candidate/stale như đang reachable và không auto-switch sang network khác. **Done khi** operator không cần ipconfig/terminal, address change được detect/apply an toàn và vi/en UX pass. Xem [PHASE-08.2.md](PHASE-08.2.md).
 
 ### Phase 8.3 — LAN security
 
-Chốt auth/access control, firewall guidance, cookie/origin behavior và không expose management endpoints. **Done khi** LAN acceptance test chứng minh POS reachable nhưng DB/native control không reachable từ LAN.
+Hardening toàn surface LAN: exact route allow/deny dựa trên traffic thật của CoffeePOS, Host/canonical-origin validation, HTTPS cookie/session/CSRF/CORS behavior, Windows Private-network fail-closed policy, firewall guidance và negative tests từ remote client. wp-admin/wp-login/machine-health/runtime endpoints mặc định không được expose nếu POS transport không cần. **Done khi** LAN acceptance chứng minh POS usable trên remote device nhưng DB/FastCGI/Caddy admin/native control/internal health không reachable, Public-network transition đóng LAN và disable/rollback local-only pass. Xem [PHASE-08.3.md](PHASE-08.3.md).
 
-Nghiệm thu login/session, đổi địa chỉ mạng, quay về local-only, health endpoint không lộ thông tin khi thiếu auth và sync liên thiết bị theo phạm vi plugin hỗ trợ. Không bật LAN cho vận hành trước khi toàn bộ 8.1–8.3 pass.
+Nghiệm thu login/session thật, đổi địa chỉ mạng, certificate trust, quay về local-only, protected health endpoint không lộ qua remote route và sync liên thiết bị theo phạm vi plugin hỗ trợ. Không bật LAN cho vận hành trước khi toàn bộ 8.1–8.3 pass.
 
 ## Phase 9 — Distribution / Packaging
 

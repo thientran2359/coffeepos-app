@@ -147,7 +147,7 @@ Trước triển khai mỗi màn hình, spec phase phải có wireframe cho tr�
 | 6.x Hệ thống / Diagnostics / Repair / Logs | Hệ thống là khu vực cấp cao; Chẩn đoán tóm tắt dễ hiểu, chi tiết kỹ thuật mở khi cần; repair giải thích phạm vi/kết quả; Nhật ký có source selector + bounded viewer, export có trạng thái, native Save As và redaction |
 | 7.x Hệ thống / Backup / Restore | Địa điểm lưu, tiến trình, thành công/lỗi; validate bản restore và giải thích dữ liệu sẽ thay trước xác nhận; lỗi giữ đường phục hồi |
 | 7.5 Desktop localization | Fresh profile chọn Tiếng Việt/English trước Welcome; Cấu hình cho đổi locale và hot-switch shell; navigation, states, action/error copy, tray/close và accessibility text theo locale; target profile giữ language riêng qua backup/restore |
-| 8.x LAN | Mặc định tắt; bật/tắt rõ ràng, URL thực có thể copy, lỗi network/firewall, ảnh hưởng khi đổi địa chỉ hoặc dừng server |
+| 8.x LAN | Mặc định tắt; Cấu hình → Mạng nội bộ cho bật/tắt, chọn adapter, exact HTTPS URL có thể copy, export public trust certificate/fingerprint, lỗi network/firewall, cảnh báo session khi đổi canonical address và fail-closed khi network không còn trusted. Xem [8.1](PHASE-08.1.md), [8.2](PHASE-08.2.md), [8.3](PHASE-08.3.md) |
 | 9.x Distribution/Update | Setup trên máy sạch, thông báo prerequisite; update tiến trình/lỗi và dữ liệu được giữ; không bắt người dùng chạy lệnh |
 
 ## 10. Nghiệm thu UX

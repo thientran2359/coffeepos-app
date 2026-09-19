@@ -24,6 +24,8 @@ interface ShellInfo {
     app_language?: AppLanguage | null;
     setup_admin_username?: string;
     setup_admin_email?: string;
+    network_mode: "local_only" | "lan";
+    lan_adapter_id?: string | null;
   };
 }
 
@@ -81,8 +83,33 @@ interface RuntimeInfo {
   wordpress_health: "unavailable" | "checking" | "healthy" | "unhealthy";
   wordpress_error: RuntimeErrorInfo | null;
   coffeepos_health: CoffeePosHealthInfo;
+  network: {
+    configured_mode: "local_only" | "lan";
+    effective_mode: "local_only" | "lan";
+    adapter_id: string | null;
+    adapter_name: string | null;
+    lan_address: string | null;
+    internal_origin: string | null;
+    canonical_origin: string | null;
+    lan_listener_state: "disabled" | "starting" | "ready" | "error";
+    tls_state: "disabled" | "preparing" | "ready" | "error";
+    network_profile: "private" | "domain_authenticated" | "public" | "unknown" | null;
+    last_error: RuntimeErrorInfo | null;
+  };
   last_error: RuntimeErrorInfo | null;
 }
+
+type RuntimeStartupStage =
+  | "idle"
+  | "preparing"
+  | "database_starting"
+  | "database_ready"
+  | "php_starting"
+  | "php_ready"
+  | "web_server_starting"
+  | "web_server_ready"
+  | "application_health"
+  | "ready";
 
 type ComponentHealthState = "unavailable" | "healthy" | "unhealthy" | "unknown";
 
@@ -421,7 +448,6 @@ const installedShell = element("installed-shell");
 const navButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-view]"));
 const viewPanels = Array.from(document.querySelectorAll<HTMLElement>("[data-view-panel]"));
 
-const homeTitle = element<HTMLElement>("home-title");
 const homeStoreName = element("home-store-name");
 const homeState = element("home-state");
 const homeStatus = element("home-status");
@@ -457,6 +483,14 @@ const languageSettingsStatus = element("language-settings-status");
 const settingsStartupView = element<HTMLSelectElement>("startup-view");
 const settingsSave = element<HTMLButtonElement>("settings-save");
 const settingsSaveStatus = element("settings-save-status");
+const settingsNetwork = element("settings-network");
+const settingsNetworkState = element("settings-network-state");
+const settingsNetworkDetail = element("settings-network-detail");
+const settingsNetworkToggle = element<HTMLButtonElement>("settings-network-toggle");
+const settingsNetworkConfirmation = element("settings-network-confirmation");
+const settingsNetworkConfirm = element<HTMLButtonElement>("settings-network-confirm");
+const settingsNetworkCancel = element<HTMLButtonElement>("settings-network-cancel");
+const settingsNetworkStatus = element("settings-network-status");
 
 const runtimeDescription = element("runtime-description");
 const runtimeStart = element<HTMLButtonElement>("runtime-start");
@@ -569,7 +603,10 @@ const restoreRecoveryDetails = element("restore-recovery-details");
 const restoreRecoveryRefresh = element<HTMLButtonElement>("restore-recovery-refresh");
 
 let provisioningBusy = false;
+let provisioningProgressRefreshBusy = false;
 let runtimeBusy = false;
+let runtimeStartupProgress: RuntimeStartupStage = "idle";
+let runtimeStartupProgressRefreshBusy = false;
 let currentProvisioning: ProvisioningInfo | null = null;
 let currentRuntime: RuntimeInfo | null = null;
 let currentSetupInfo: SetupInfo | null = null;
@@ -580,6 +617,9 @@ let provisioningAction: "provision" | "refresh" = "refresh";
 let setupProfileBusy = false;
 let completionPending = false;
 let settingsBusy = false;
+let networkBusy = false;
+let networkConfirmOpen = false;
+let networkFeedback = "";
 let languageBusy = false;
 let persistedLanguage: AppLanguage | null = null;
 let currentShellInfo: ShellInfo | null = null;
@@ -2504,7 +2544,7 @@ function validateSetupForm(): boolean {
 function viewHeading(view: InstalledView): HTMLElement {
   if (view === "settings") return element<HTMLElement>("settings-title");
   if (view === "diagnostics") return element<HTMLElement>("diagnostics-title");
-  return homeTitle;
+  return element<HTMLElement>("view-home");
 }
 
 function systemSectionHeading(section: SystemSection): HTMLElement {
@@ -2661,7 +2701,12 @@ function renderHome(): void {
   if (runtimeTransition === "starting") {
     setTextIfChanged(homeState, t("overview.state.starting"));
     setTextIfChanged(homeStatus, t("overview.starting_status"));
-    setTextIfChanged(homeDetail, t("overview.starting_detail"));
+    setTextIfChanged(
+      homeDetail,
+      runtimeStartupProgress === "idle"
+        ? t("overview.starting_detail")
+        : t(`runtime.startup.${runtimeStartupProgress}`),
+    );
     setHomeAction("start", t("overview.action.starting"), true);
     return;
   }
@@ -2843,7 +2888,12 @@ function renderRuntime(info: RuntimeInfo): void {
   if (provisioningBusy) {
     setTextIfChanged(runtimeDescription, t("runtime.description.provisioning"));
   } else if (runtimeBusy) {
-    setTextIfChanged(runtimeDescription, t("runtime.description.updating"));
+    setTextIfChanged(
+      runtimeDescription,
+      runtimeTransition === "starting"
+        ? t(`runtime.startup.${runtimeStartupProgress}`)
+        : t("runtime.description.updating"),
+    );
   } else if (info.last_error) {
     setTextIfChanged(runtimeDescription, structuredErrorText(info.last_error));
   } else if (info.state === "not_installed") {
@@ -2892,14 +2942,30 @@ function renderProvisioning(info: ProvisioningInfo, commandError?: string): void
       : info.state === "ready"
         ? t("common.ready")
         : t("overview.state.needs_repair");
-  provisioningWordPress.textContent = info.wordpress_version || "—";
+  const installing = provisioningBusy || info.state === "installing";
+  const wordpressInstalled = Boolean(info.admin_username);
+  provisioningWordPress.textContent = info.wordpress_version
+    ? installing
+      ? `${info.wordpress_version} · ${t(wordpressInstalled ? "common.completed" : "common.processing")}`
+      : info.wordpress_version
+    : "—";
   provisioningWooCommerce.textContent = info.woocommerce_version
-    ? `${info.woocommerce_version} · ${t(info.woocommerce_active ? "common.active" : "common.inactive")}`
-    : "—";
+    ? `${info.woocommerce_version} · ${t(info.woocommerce_active ? "common.active" : installing ? "common.installed" : "common.inactive")}`
+    : installing
+      ? t(wordpressInstalled ? "common.processing" : "common.not_checked")
+      : "—";
   provisioningCoffeePos.textContent = info.coffeepos_version
-    ? `${info.coffeepos_version} · ${t(info.coffeepos_active ? "common.active" : "common.inactive")}`
-    : "—";
-  provisioningAdmin.textContent = info.admin_username ?? "—";
+    ? `${info.coffeepos_version} · ${t(info.coffeepos_active ? "common.active" : installing ? "common.installed" : "common.inactive")}`
+    : installing
+      ? t(info.woocommerce_active ? "common.processing" : "common.not_checked")
+      : "—";
+  provisioningAdmin.textContent = info.admin_username
+    ? installing
+      ? `${info.admin_username} · ${t("common.completed")}`
+      : info.admin_username
+    : installing
+      ? t("common.not_checked")
+      : "—";
   settingsAdminUsername.textContent = info.admin_username ?? "—";
   element("complete-admin-username").textContent = info.admin_username ?? "—";
   provisioningDetails.hidden = false;
@@ -2914,9 +2980,19 @@ function renderProvisioning(info: ProvisioningInfo, commandError?: string): void
     provisioningError.hidden = false;
   }
 
-  if (provisioningBusy || info.state === "installing") {
+  if (installing) {
     provisioningState.textContent = t("runtime.state.installing");
-    provisioningStatus.textContent = t("onboarding.installing_long");
+    provisioningStatus.textContent = !wordpressInstalled
+      ? t("onboarding.progress.wordpress")
+      : !info.woocommerce_version
+        ? t("onboarding.progress.woocommerce_install")
+        : !info.woocommerce_active
+          ? t("onboarding.progress.woocommerce_activate")
+          : !info.coffeepos_version
+            ? t("onboarding.progress.coffeepos_install")
+            : !info.coffeepos_active
+              ? t("onboarding.progress.coffeepos_activate")
+              : t("onboarding.progress.finalizing");
     setupRetry.textContent = t("onboarding.installing_button");
     setupRetry.hidden = false;
     setupRetry.disabled = true;
@@ -2977,6 +3053,20 @@ async function refreshProvisioning(commandError?: string): Promise<boolean> {
   }
 }
 
+async function refreshProvisioningProgress(): Promise<void> {
+  if (!provisioningBusy || provisioningProgressRefreshBusy || !isTauri()) return;
+  provisioningProgressRefreshBusy = true;
+  try {
+    const info = await invoke<ProvisioningInfo>("get_provisioning_info");
+    await renderProvisioningWithRepairRouting(info);
+  } catch {
+    // The foreground provisioning command remains authoritative. A transient progress read
+    // should not replace the install surface with an error while the worker is still running.
+  } finally {
+    provisioningProgressRefreshBusy = false;
+  }
+}
+
 async function refreshRuntime(): Promise<void> {
   if (runtimeRefreshBusy || backupSystemBusy()) return;
   runtimeRefreshBusy = true;
@@ -2991,6 +3081,26 @@ async function refreshRuntime(): Promise<void> {
     renderHome();
   } finally {
     runtimeRefreshBusy = false;
+  }
+}
+
+async function refreshRuntimeStartupProgress(): Promise<void> {
+  if (
+    !isTauri()
+    || !runtimeBusy
+    || runtimeTransition !== "starting"
+    || runtimeStartupProgressRefreshBusy
+  ) return;
+  runtimeStartupProgressRefreshBusy = true;
+  try {
+    runtimeStartupProgress = await invoke<RuntimeStartupStage>("get_runtime_startup_progress");
+    setTextIfChanged(runtimeDescription, t(`runtime.startup.${runtimeStartupProgress}`));
+    renderHome();
+  } catch {
+    // The foreground lifecycle command remains authoritative; keep the last known stage if this
+    // lightweight progress read is temporarily unavailable.
+  } finally {
+    runtimeStartupProgressRefreshBusy = false;
   }
 }
 
@@ -3010,9 +3120,9 @@ async function provision(): Promise<void> {
   if (provisioningBusy || runtimeBusy || backupSystemBusy()) return;
   provisioningBusy = true;
   selectSetupStep("progress", true);
-  const installingInfo: ProvisioningInfo = currentProvisioning ?? {
+  const installingInfo: ProvisioningInfo = {
     state: "installing",
-    wordpress_version: "",
+    wordpress_version: currentProvisioning?.wordpress_version ?? "",
     woocommerce_version: "",
     woocommerce_active: false,
     coffeepos_version: "",
@@ -3061,6 +3171,7 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
   if (provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation || backupSystemBusy() || repairRouteRequired || currentProvisioning?.state !== "ready") return;
   runtimeBusy = true;
   runtimeTransition = command === "stop_runtime" ? "stopping" : command === "retry_runtime_health" ? "checking" : "starting";
+  if (runtimeTransition === "starting") runtimeStartupProgress = "preparing";
   if (currentProvisioning) renderProvisioning(currentProvisioning);
   setRuntimeControls(null);
   if (command !== "retry_runtime_health") element("runtime-state").textContent = t(`runtime.state.${runtimeTransition}`);
@@ -3086,7 +3197,7 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
     ? t("runtime.transition.stop")
     : command === "retry_runtime_health"
       ? t("runtime.transition.health")
-      : t("runtime.transition.start");
+      : t(`runtime.startup.${runtimeStartupProgress}`);
   renderHome();
 
   try {
@@ -3378,6 +3489,14 @@ window.setInterval(() => {
     void refreshRuntime();
   }
 }, 2000);
+
+window.setInterval(() => {
+  if (isTauri() && provisioningBusy) void refreshProvisioningProgress();
+}, 750);
+
+window.setInterval(() => {
+  if (isTauri() && runtimeBusy && runtimeTransition === "starting") void refreshRuntimeStartupProgress();
+}, 500);
 
 window.setInterval(() => {
   if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !repairOperation && !backupSystemBusy()) {

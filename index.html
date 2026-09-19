@@ -147,11 +147,7 @@
             <button type="button" class="nav-item" data-view="diagnostics" aria-controls="view-diagnostics" data-i18n="navigation.system">Hệ thống</button>
           </nav>
 
-          <section id="view-home" class="view-panel" data-view-panel="home" aria-labelledby="home-title">
-            <div class="page-heading">
-              <h2 id="home-title" tabindex="-1" data-i18n="overview.title">Tổng quan</h2>
-              <p class="page-subtitle" data-i18n="overview.subtitle">Theo dõi và vận hành CoffeePOS tại cửa hàng này.</p>
-            </div>
+          <section id="view-home" class="view-panel" data-view-panel="home" tabindex="-1" aria-label="Tổng quan" data-i18n-aria-label="navigation.home">
             <div class="card home-status-card">
               <div class="home-card-heading">
                 <div>
@@ -216,6 +212,29 @@
                 <dl class="compact-list"><dt data-i18n="settings.username">Tên đăng nhập</dt><dd id="settings-admin-username">—</dd></dl>
                 <button id="settings-copy-password" class="secondary" type="button" data-i18n="settings.copy_password">Sao chép mật khẩu ban đầu</button>
                 <p id="settings-copy-status" class="hint" role="status" aria-live="polite"></p>
+              </section>
+              <section class="card settings-network-card" id="settings-network" aria-labelledby="settings-network-title">
+                <div class="section-heading compact-heading">
+                  <div>
+                    <span class="section-label" data-i18n="settings.network_label">MẠNG NỘI BỘ</span>
+                    <h3 id="settings-network-title" data-i18n="settings.network_title">Truy cập trong mạng LAN</h3>
+                  </div>
+                  <span id="settings-network-state" class="state-badge" data-i18n="settings.network_state.local_only">Chỉ máy này</span>
+                </div>
+                <p class="lead" data-i18n="settings.network_lead">Cho phép thiết bị trong cùng mạng riêng truy cập CoffeePOS qua HTTPS.</p>
+                <p id="settings-network-detail" class="hint" data-i18n="settings.network_detail.local_only">CoffeePOS chỉ nhận kết nối trên máy này.</p>
+                <div class="actions">
+                  <button id="settings-network-toggle" type="button" data-i18n="settings.network_enable">Bật truy cập LAN</button>
+                </div>
+                <div id="settings-network-confirmation" class="network-confirmation" hidden>
+                  <strong data-i18n="settings.network_confirm_title">Bật truy cập LAN?</strong>
+                  <p data-i18n="settings.network_confirm_message">CoffeePOS sẽ khởi động lại dịch vụ web, tạo danh tính HTTPS cục bộ và chỉ bật LAN khi kiểm tra cuối thành công. Chỉ dùng trên mạng Windows Private mà bạn tin cậy.</p>
+                  <div class="actions">
+                    <button id="settings-network-confirm" type="button" data-i18n="settings.network_confirm_enable">Bật và khởi động lại</button>
+                    <button id="settings-network-cancel" class="secondary" type="button" data-i18n="common.cancel">Hủy</button>
+                  </div>
+                </div>
+                <p id="settings-network-status" class="hint" role="status" aria-live="polite"></p>
               </section>
             </div>
           </section>

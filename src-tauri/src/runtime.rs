@@ -1,3 +1,5 @@
+use crate::config::NetworkMode;
+use crate::network::{self, LanCandidate, NetworkProfile};
 use crate::secret;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -53,6 +55,22 @@ pub enum RuntimeState {
     Stopping,
 }
 
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStartupStage {
+    #[default]
+    Idle,
+    Preparing,
+    DatabaseStarting,
+    DatabaseReady,
+    PhpStarting,
+    PhpReady,
+    WebServerStarting,
+    WebServerReady,
+    ApplicationHealth,
+    Ready,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WordPressHealthState {
@@ -78,6 +96,41 @@ pub enum CoffeePosHealthFailureKind {
     TransportBootstrap,
     Authentication,
     Contract,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LanListenerState {
+    #[default]
+    Disabled,
+    Starting,
+    Ready,
+    Error,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsState {
+    #[default]
+    Disabled,
+    Preparing,
+    Ready,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct NetworkInfo {
+    pub configured_mode: NetworkMode,
+    pub effective_mode: NetworkMode,
+    pub adapter_id: Option<String>,
+    pub adapter_name: Option<String>,
+    pub lan_address: Option<String>,
+    pub internal_origin: Option<String>,
+    pub canonical_origin: Option<String>,
+    pub lan_listener_state: LanListenerState,
+    pub tls_state: TlsState,
+    pub network_profile: Option<NetworkProfile>,
+    pub last_error: Option<RuntimeErrorInfo>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,6 +217,7 @@ pub struct RuntimeInfo {
     pub wordpress_health: WordPressHealthState,
     pub wordpress_error: Option<RuntimeErrorInfo>,
     pub coffeepos_health: CoffeePosHealthInfo,
+    pub network: NetworkInfo,
     pub last_error: Option<RuntimeErrorInfo>,
 }
 
@@ -325,6 +379,8 @@ struct RuntimeSettings {
     schema_version: u32,
     database_port: u16,
     http_port: u16,
+    #[serde(default)]
+    lan_port: Option<u16>,
 }
 
 #[derive(Clone, Debug)]
@@ -410,6 +466,7 @@ pub struct RuntimeManager {
     state: RuntimeState,
     database_port: Option<u16>,
     http_port: Option<u16>,
+    lan_port: Option<u16>,
     web_server_admin_port: Option<u16>,
     database: Option<ManagedChild>,
     web_server: Option<ManagedChild>,
@@ -425,6 +482,13 @@ pub struct RuntimeManager {
     instance_generation: u64,
     log_lock: Arc<Mutex<()>>,
     last_error: Option<RuntimeErrorInfo>,
+    configured_network_mode: NetworkMode,
+    configured_lan_adapter_id: Option<String>,
+    effective_network_mode: NetworkMode,
+    lan_candidate: Option<LanCandidate>,
+    lan_listener_state: LanListenerState,
+    tls_state: TlsState,
+    network_last_error: Option<RuntimeErrorInfo>,
     timeouts: RuntimeTimeouts,
     backup_maintenance_active: bool,
     backup_recovery_lease: Option<DatabaseMaintenanceLease>,
@@ -464,6 +528,7 @@ impl RuntimeManager {
             state,
             database_port: None,
             http_port: None,
+            lan_port: None,
             web_server_admin_port: None,
             database: None,
             web_server: None,
@@ -479,6 +544,13 @@ impl RuntimeManager {
             instance_generation: 0,
             log_lock: Arc::new(Mutex::new(())),
             last_error: None,
+            configured_network_mode: NetworkMode::LocalOnly,
+            configured_lan_adapter_id: None,
+            effective_network_mode: NetworkMode::LocalOnly,
+            lan_candidate: None,
+            lan_listener_state: LanListenerState::Disabled,
+            tls_state: TlsState::Disabled,
+            network_last_error: None,
             timeouts: RuntimeTimeouts::default(),
             backup_maintenance_active: false,
             backup_recovery_lease: None,
@@ -520,8 +592,147 @@ impl RuntimeManager {
             wordpress_health: self.wordpress_health.clone(),
             wordpress_error: self.wordpress_error.clone(),
             coffeepos_health: self.coffeepos_health.clone(),
+            network: self.network_info(),
             last_error: self.last_error.clone(),
         }
+    }
+
+    pub fn configure_network(
+        &mut self,
+        mode: NetworkMode,
+        adapter_id: Option<&str>,
+    ) -> Result<Option<String>, RuntimeErrorInfo> {
+        if matches!(
+            self.state,
+            RuntimeState::Installing
+                | RuntimeState::Starting
+                | RuntimeState::Running
+                | RuntimeState::Stopping
+        ) {
+            return Err(network_error(
+                "network_busy",
+                "configure",
+                "Network mode can only be configured while the managed runtime is stopped.",
+                "Stop the managed store before changing its network mode.",
+            ));
+        }
+        match mode {
+            NetworkMode::LocalOnly => {
+                self.configured_network_mode = NetworkMode::LocalOnly;
+                self.configured_lan_adapter_id = None;
+                self.effective_network_mode = NetworkMode::LocalOnly;
+                self.lan_candidate = None;
+                self.lan_port = None;
+                self.lan_listener_state = LanListenerState::Disabled;
+                self.tls_state = TlsState::Disabled;
+                self.network_last_error = None;
+                Ok(None)
+            }
+            NetworkMode::Lan => {
+                let candidate = match network::select_lan_candidate(adapter_id) {
+                    Ok(candidate) => candidate,
+                    Err(message) => {
+                        let error = network_error(
+                        "network_adapter_unavailable",
+                        "preflight",
+                        message,
+                        "Connect an active Private Windows network, then retry LAN mode. CoffeePOS remains local-only.",
+                        );
+                        self.network_last_error = Some(error.clone());
+                        return Err(error);
+                    }
+                };
+                let selected_id = candidate.adapter_id.clone();
+                self.configured_network_mode = NetworkMode::Lan;
+                self.configured_lan_adapter_id = Some(selected_id.clone());
+                self.effective_network_mode = NetworkMode::LocalOnly;
+                self.lan_candidate = Some(candidate);
+                self.lan_listener_state = LanListenerState::Disabled;
+                self.tls_state = TlsState::Disabled;
+                self.network_last_error = None;
+                Ok(Some(selected_id))
+            }
+        }
+    }
+
+    pub fn record_network_error(&mut self, error: RuntimeErrorInfo) {
+        self.network_last_error = Some(error);
+    }
+
+    pub fn sync_network_preference_hint(
+        &mut self,
+        mode: NetworkMode,
+        adapter_id: Option<String>,
+    ) {
+        if matches!(self.state, RuntimeState::NotInstalled | RuntimeState::Stopped)
+            && !self.has_managed_children()
+        {
+            self.configured_network_mode = mode;
+            self.configured_lan_adapter_id = if mode == NetworkMode::Lan {
+                adapter_id
+            } else {
+                None
+            };
+        }
+    }
+
+    pub fn network_info(&self) -> NetworkInfo {
+        let internal_origin = self
+            .http_port
+            .map(|port| format!("http://{LOOPBACK}:{port}"));
+        let lan_origin = self.lan_candidate.as_ref().and_then(|candidate| {
+            self.lan_port
+                .map(|port| format!("https://{}:{port}", candidate.address))
+        });
+        let canonical_origin = if self.effective_network_mode == NetworkMode::Lan {
+            lan_origin.clone()
+        } else {
+            internal_origin.clone()
+        };
+        NetworkInfo {
+            configured_mode: self.configured_network_mode,
+            effective_mode: self.effective_network_mode,
+            adapter_id: self
+                .lan_candidate
+                .as_ref()
+                .map(|candidate| candidate.adapter_id.clone())
+                .or_else(|| self.configured_lan_adapter_id.clone()),
+            adapter_name: self
+                .lan_candidate
+                .as_ref()
+                .map(|candidate| candidate.adapter_name.clone()),
+            lan_address: self
+                .lan_candidate
+                .as_ref()
+                .map(|candidate| candidate.address.to_string()),
+            internal_origin,
+            canonical_origin,
+            lan_listener_state: self.lan_listener_state.clone(),
+            tls_state: self.tls_state.clone(),
+            network_profile: self
+                .lan_candidate
+                .as_ref()
+                .map(|candidate| candidate.network_profile.clone()),
+            last_error: self.network_last_error.clone(),
+        }
+    }
+
+    fn canonical_origin(&self) -> Result<String, RuntimeErrorInfo> {
+        self.network_info().canonical_origin.ok_or_else(|| {
+            network_error(
+                "network_origin_unavailable",
+                "resolve origin",
+                "The managed runtime does not have a canonical origin yet.",
+                "Restart the runtime so CoffeePOS Desktop can establish its listener and canonical origin.",
+            )
+        })
+    }
+
+    fn clear_effective_network(&mut self) {
+        self.effective_network_mode = NetworkMode::LocalOnly;
+        self.lan_port = None;
+        self.lan_listener_state = LanListenerState::Disabled;
+        self.tls_state = TlsState::Disabled;
     }
 
     pub(crate) fn provisioning_context(&self) -> (ResolvedRuntime, PathBuf) {
@@ -897,6 +1108,7 @@ impl RuntimeManager {
                     self.http_port = None;
                     self.php_fastcgi_port = None;
                     self.web_server_admin_port = None;
+                    self.clear_effective_network();
                 }
                 self.last_error = Some(cleanup_error.unwrap_or(error));
                 self.wordpress_health = WordPressHealthState::Unavailable;
@@ -918,17 +1130,33 @@ impl RuntimeManager {
     }
 
     pub fn start(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
-        self.start_with_wordpress_health(true)
+        let mut progress = |_| {};
+        self.start_with_wordpress_health(true, &mut progress)
+    }
+
+    pub(crate) fn start_with_progress<F>(
+        &mut self,
+        mut progress: F,
+    ) -> Result<RuntimeInfo, RuntimeErrorInfo>
+    where
+        F: FnMut(RuntimeStartupStage),
+    {
+        self.start_with_wordpress_health(true, &mut progress)
     }
 
     pub(crate) fn start_for_provisioning(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
-        self.start_with_wordpress_health(false)
+        let mut progress = |_| {};
+        self.start_with_wordpress_health(false, &mut progress)
     }
 
-    fn start_with_wordpress_health(
+    fn start_with_wordpress_health<F>(
         &mut self,
         check_wordpress_health: bool,
-    ) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        progress: &mut F,
+    ) -> Result<RuntimeInfo, RuntimeErrorInfo>
+    where
+        F: FnMut(RuntimeStartupStage),
+    {
         if self.backup_maintenance_active {
             return Err(error_info(
                 "runtime",
@@ -969,7 +1197,26 @@ impl RuntimeManager {
                 return Err(error);
             }
         };
+        if self.configured_network_mode == NetworkMode::Lan {
+            let candidate = network::select_lan_candidate(self.configured_lan_adapter_id.as_deref())
+                .map_err(|message| {
+                    let error = network_error(
+                        "network_adapter_unavailable",
+                        "preflight",
+                        message,
+                        "Reconnect the selected Private Windows network or disable LAN mode. CoffeePOS has not exposed a LAN listener.",
+                    );
+                    self.network_last_error = Some(error.clone());
+                    error
+                })?;
+            self.configured_lan_adapter_id = Some(candidate.adapter_id.clone());
+            self.lan_candidate = Some(candidate);
+        } else {
+            self.lan_candidate = None;
+            self.clear_effective_network();
+        }
         self.state = RuntimeState::Starting;
+        progress(RuntimeStartupStage::Preparing);
         self.wordpress_health = WordPressHealthState::Checking;
         self.wordpress_error = None;
         self.clear_coffeepos_health();
@@ -1001,12 +1248,41 @@ impl RuntimeManager {
                 }
             };
             excluded_ports.push(http_port);
+            let lan_port = if self.configured_network_mode == NetworkMode::Lan {
+                let candidate = self.lan_candidate.as_ref().ok_or_else(|| {
+                    network_error(
+                        "network_adapter_unavailable",
+                        "preflight",
+                        "The selected LAN adapter disappeared before listener preparation.",
+                        "Reconnect the selected Private Windows network or disable LAN mode.",
+                    )
+                })?;
+                match choose_lan_port(
+                    candidate.address,
+                    settings.as_ref().and_then(|settings| settings.lan_port),
+                    &excluded_ports,
+                ) {
+                    Ok(port) => {
+                        excluded_ports.push(port);
+                        Some(port)
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
             self.database_port = Some(database_port);
             self.http_port = Some(http_port);
+            self.lan_port = lan_port;
 
-            match self.start_attempt(database_port, http_port) {
+            match self.start_attempt(database_port, http_port, lan_port, progress) {
                 Ok(()) => {
-                    if let Err(error) = self.persist_runtime_settings(database_port, http_port) {
+                    if let Err(error) =
+                        self.persist_runtime_settings(database_port, http_port, lan_port)
+                    {
                         let cleanup_error = self.cleanup_started().err();
                         if self.database.is_none() {
                             self.database_port = None;
@@ -1015,20 +1291,31 @@ impl RuntimeManager {
                             self.http_port = None;
                             self.php_fastcgi_port = None;
                             self.web_server_admin_port = None;
+                            self.clear_effective_network();
                         }
                         last_error = Some(cleanup_error.unwrap_or(error));
                         break;
                     }
                     self.state = RuntimeState::Running;
+                    if self.configured_network_mode == NetworkMode::Lan {
+                        self.effective_network_mode = NetworkMode::Lan;
+                        self.lan_listener_state = LanListenerState::Ready;
+                        self.tls_state = TlsState::Ready;
+                        self.network_last_error = None;
+                    } else {
+                        self.clear_effective_network();
+                    }
                     self.instance_generation = self.instance_generation.wrapping_add(1);
                     self.last_error = None;
                     if check_wordpress_health {
+                        progress(RuntimeStartupStage::ApplicationHealth);
                         self.refresh_wordpress_health();
                     } else {
                         self.wordpress_health = WordPressHealthState::Unavailable;
                         self.wordpress_error = None;
                         self.clear_coffeepos_health();
                     }
+                    progress(RuntimeStartupStage::Ready);
                     self.log_event("runtime ready");
                     return Ok(self.info());
                 }
@@ -1043,6 +1330,7 @@ impl RuntimeManager {
                         self.http_port = None;
                         self.php_fastcgi_port = None;
                         self.web_server_admin_port = None;
+                        self.clear_effective_network();
                     }
                     last_error = Some(cleanup_error.unwrap_or(error));
                     if self.has_managed_children() {
@@ -1073,6 +1361,7 @@ impl RuntimeManager {
         self.wordpress_health = WordPressHealthState::Unavailable;
         self.wordpress_error = None;
         self.clear_coffeepos_health();
+        self.clear_effective_network();
         self.log_event("runtime start failed");
         Err(error)
     }
@@ -1384,7 +1673,7 @@ impl RuntimeManager {
                 "Wait for WordPress health to become healthy or restart the runtime if the health check failed.",
             ));
         }
-        let port = self.http_port.ok_or_else(|| {
+        self.http_port.ok_or_else(|| {
             error_info(
                 "wordpress",
                 "open",
@@ -1392,7 +1681,7 @@ impl RuntimeManager {
                 "Restart the runtime so CoffeePOS Desktop can select and verify a loopback HTTP port.",
             )
         })?;
-        Ok(format!("http://{LOOPBACK}:{port}/"))
+        Ok(format!("{}/", self.canonical_origin()?.trim_end_matches('/')))
     }
 
     pub fn pos_url(&self) -> Result<String, RuntimeErrorInfo> {
@@ -1436,7 +1725,7 @@ impl RuntimeManager {
                 "Restore a compatible CoffeePOS router/settings configuration and retry the health check.",
             ));
         }
-        let port = self.http_port.ok_or_else(|| {
+        self.http_port.ok_or_else(|| {
             error_info(
                 "coffeepos",
                 "open POS",
@@ -1444,7 +1733,7 @@ impl RuntimeManager {
                 "Restart the runtime so CoffeePOS Desktop can select and verify a loopback HTTP port.",
             )
         })?;
-        Ok(format!("http://{LOOPBACK}:{port}{}", payload.pos_path))
+        Ok(format!("{}{}", self.canonical_origin()?.trim_end_matches('/'), payload.pos_path))
     }
 
     pub fn stop(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
@@ -1546,6 +1835,7 @@ impl RuntimeManager {
             self.http_port = None;
             self.php_fastcgi_port = None;
             self.web_server_admin_port = None;
+            self.clear_effective_network();
         }
         self.state = if self.has_managed_children() {
             RuntimeState::Stopping
@@ -1611,7 +1901,29 @@ impl RuntimeManager {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn restart(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        let mut progress = |_| {};
+        self.restart_with_progress_inner(&mut progress)
+    }
+
+    pub(crate) fn restart_with_progress<F>(
+        &mut self,
+        mut progress: F,
+    ) -> Result<RuntimeInfo, RuntimeErrorInfo>
+    where
+        F: FnMut(RuntimeStartupStage),
+    {
+        self.restart_with_progress_inner(&mut progress)
+    }
+
+    fn restart_with_progress_inner<F>(
+        &mut self,
+        progress: &mut F,
+    ) -> Result<RuntimeInfo, RuntimeErrorInfo>
+    where
+        F: FnMut(RuntimeStartupStage),
+    {
         if self.backup_maintenance_active {
             return Err(error_info(
                 "runtime",
@@ -1632,19 +1944,28 @@ impl RuntimeManager {
             }
             RuntimeState::Running => {
                 self.stop()?;
-                self.start()
+                self.start_with_wordpress_health(true, progress)
             }
-            RuntimeState::NotInstalled | RuntimeState::Stopped => self.start(),
+            RuntimeState::NotInstalled | RuntimeState::Stopped => {
+                self.start_with_wordpress_health(true, progress)
+            }
         }
     }
 
-    fn start_attempt(
+    fn start_attempt<F>(
         &mut self,
         database_port: u16,
         http_port: u16,
-    ) -> Result<(), RuntimeErrorInfo> {
+        lan_port: Option<u16>,
+        progress: &mut F,
+    ) -> Result<(), RuntimeErrorInfo>
+    where
+        F: FnMut(RuntimeStartupStage),
+    {
+        progress(RuntimeStartupStage::DatabaseStarting);
         self.database = Some(self.spawn_database(database_port)?);
         self.wait_database_ready(database_port)?;
+        progress(RuntimeStartupStage::DatabaseReady);
         self.log_event("database ready");
 
         let prepend_gate = self.prepare_runtime_prepend_gate()?;
@@ -1662,23 +1983,56 @@ impl RuntimeManager {
                     "Run provisioning repair with the same Windows user profile, then retry.",
                 )
             })?;
+        let canonical_origin = match (&self.lan_candidate, lan_port) {
+            (Some(candidate), Some(port)) if self.configured_network_mode == NetworkMode::Lan => {
+                format!("https://{}:{port}", candidate.address)
+            }
+            _ => format!("http://{LOOPBACK}:{http_port}"),
+        };
+        progress(RuntimeStartupStage::PhpStarting);
         self.php = Some(self.spawn_php_worker(
             fastcgi_port,
-            http_port,
+            &canonical_origin,
             &prepend_gate,
             &database_password,
         )?);
         self.wait_fastcgi_workers_ready()?;
+        progress(RuntimeStartupStage::PhpReady);
         self.log_event("php fastcgi workers ready");
 
-        let web_server_config =
-            self.prepare_web_server_config(http_port, web_server_admin_port, fastcgi_port)?;
+        progress(RuntimeStartupStage::WebServerStarting);
+        if self.configured_network_mode == NetworkMode::Lan {
+            self.lan_listener_state = LanListenerState::Starting;
+            self.tls_state = TlsState::Preparing;
+        }
+        let web_server_config = self.prepare_web_server_config(
+            http_port,
+            web_server_admin_port,
+            fastcgi_port,
+            lan_port,
+            &canonical_origin,
+        )?;
         self.web_server = Some(self.spawn_web_server(&web_server_config)?);
         let nonce = probe_nonce();
         let probe_name = self.write_php_probe(&nonce)?;
         let readiness = self.wait_http_ready(http_port, &probe_name, &nonce);
         self.remove_php_probe();
         readiness?;
+        if let (Some(candidate), Some(port)) = (&self.lan_candidate, lan_port) {
+            if !lan_port_listening(candidate.address, port) {
+                self.lan_listener_state = LanListenerState::Error;
+                self.tls_state = TlsState::Error;
+                let error = network_error(
+                    "network_listener_unavailable",
+                    "readiness",
+                    "Caddy started, but the selected LAN HTTPS listener did not become reachable.",
+                    "CoffeePOS will keep LAN disabled. Verify the selected adapter and local port availability, then retry.",
+                );
+                self.network_last_error = Some(error.clone());
+                return Err(error);
+            }
+        }
+        progress(RuntimeStartupStage::WebServerReady);
         self.log_event("concurrent http runtime ready");
         Ok(())
     }
@@ -1739,7 +2093,7 @@ impl RuntimeManager {
     fn spawn_php_worker(
         &self,
         worker_port: u16,
-        http_port: u16,
+        canonical_origin: &str,
         prepend_gate: &Path,
         database_password: &str,
     ) -> Result<ManagedChild, RuntimeErrorInfo> {
@@ -1773,7 +2127,7 @@ impl RuntimeManager {
             .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
             .env(
                 "COFFEEPOS_SITE_URL",
-                format!("http://{LOOPBACK}:{http_port}"),
+                canonical_origin,
             )
             .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
             .env(
@@ -1840,14 +2194,7 @@ impl RuntimeManager {
                 "Restart the runtime so MariaDB is ready before cron/background jobs are processed.",
             )
         })?;
-        let http_port = self.http_port.ok_or_else(|| {
-            error_info(
-                "wordpress cron",
-                "spawn",
-                "HTTP port is unavailable while preparing the managed WordPress cron runner.",
-                "Restart the runtime so the current managed site URL can be supplied to WordPress cron.",
-            )
-        })?;
+        let canonical_origin = self.canonical_origin()?;
         let database_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
             .map_err(|error| {
                 error_info(
@@ -1866,10 +2213,7 @@ impl RuntimeManager {
             .env("PHP_INI_SCAN_DIR", "")
             .env("COFFEEPOS_DB_PASSWORD", database_password)
             .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
-            .env(
-                "COFFEEPOS_SITE_URL",
-                format!("http://{LOOPBACK}:{http_port}"),
-            )
+            .env("COFFEEPOS_SITE_URL", canonical_origin)
             .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
             .env("COFFEEPOS_DESKTOP_CRON", "1")
             .current_dir(&site);
@@ -2142,6 +2486,8 @@ impl RuntimeManager {
         http_port: u16,
         admin_port: u16,
         fastcgi_port: u16,
+        lan_port: Option<u16>,
+        canonical_origin: &str,
     ) -> Result<PathBuf, RuntimeErrorInfo> {
         let config_dir = self.data_root.join("config");
         fs::create_dir_all(&config_dir).map_err(|error| {
@@ -2155,8 +2501,28 @@ impl RuntimeManager {
         let site = caddy_path(&self.data_root.join("site"));
         let uploads = caddy_path(&self.data_root.join("uploads"));
         let grace_millis = self.timeouts.request_drain.as_millis().max(1);
+        let internal_fastcgi_env = if let (Some(candidate), Some(port)) =
+            (&self.lan_candidate, lan_port)
+        {
+            format!(
+                "            env HTTP_HOST \"{}:{port}\"\n            env HTTPS on\n            env SERVER_PORT \"{port}\"\n",
+                candidate.address
+            )
+        } else {
+            String::new()
+        };
+        let internal_site = format!(
+            "http://{LOOPBACK}:{http_port} {{\n    route {{\n        @blocked path_regexp blocked (?i)^/(wp-config\\.php|\\.env|composer\\.(?:json|lock)|\\.htaccess)$\n        respond @blocked 404\n\n        handle_path /wp-content/uploads/* {{\n            root * \"{uploads}\"\n            file_server\n        }}\n\n        root * \"{site}\"\n        php_fastcgi {LOOPBACK}:{fastcgi_port} {{\n            root \"{site}\"\n            capture_stderr\n{internal_fastcgi_env}        }}\n        file_server\n    }}\n}}\n"
+        );
+        let lan_site = match (&self.lan_candidate, lan_port) {
+            (Some(candidate), Some(port)) => format!(
+                "\nhttps://{}:{port} {{\n    tls internal\n    route {{\n        @internal path /wp-json/coffeepos/v1/system/status /.coffeepos-runtime-health-*\n        respond @internal 404\n\n        @blocked path_regexp blocked (?i)^/(wp-config\\.php|\\.env|composer\\.(?:json|lock)|\\.htaccess)$\n        respond @blocked 404\n\n        handle_path /wp-content/uploads/* {{\n            root * \"{uploads}\"\n            file_server\n        }}\n\n        root * \"{site}\"\n        php_fastcgi {LOOPBACK}:{fastcgi_port} {{\n            root \"{site}\"\n            capture_stderr\n        }}\n        file_server\n    }}\n}}\n",
+                candidate.address
+            ),
+            _ => String::new(),
+        };
         let contents = format!(
-            "{{\n    admin {LOOPBACK}:{admin_port}\n    persist_config off\n    auto_https off\n    grace_period {grace_millis}ms\n}}\n\nhttp://{LOOPBACK}:{http_port} {{\n    route {{\n        @blocked path_regexp blocked (?i)^/(wp-config\\.php|\\.env|composer\\.(?:json|lock)|\\.htaccess)$\n        respond @blocked 404\n\n        handle_path /wp-content/uploads/* {{\n            root * \"{uploads}\"\n            file_server\n        }}\n\n        root * \"{site}\"\n        php_fastcgi {LOOPBACK}:{fastcgi_port} {{\n            root \"{site}\"\n            capture_stderr\n        }}\n        file_server\n    }}\n}}\n"
+            "{{\n    admin {LOOPBACK}:{admin_port}\n    persist_config off\n    auto_https disable_redirects\n    grace_period {grace_millis}ms\n}}\n\n# Canonical origin: {canonical_origin}\n{internal_site}{lan_site}"
         );
         let path = config_dir.join("runtime-Caddyfile");
         fs::write(&path, contents.as_bytes()).map_err(|error| {
@@ -2329,7 +2695,11 @@ impl RuntimeManager {
                 "Correct or restore config/runtime.json, then retry. Do not delete store data.",
             )
         })?;
-        if settings.schema_version != 1 || settings.database_port == 0 || settings.http_port == 0 {
+        if !matches!(settings.schema_version, 1 | 2)
+            || settings.database_port == 0
+            || settings.http_port == 0
+            || settings.lan_port == Some(0)
+        {
             return Err(error_info(
                 "runtime",
                 "read settings",
@@ -2344,6 +2714,7 @@ impl RuntimeManager {
         &self,
         database_port: u16,
         http_port: u16,
+        lan_port: Option<u16>,
     ) -> Result<(), RuntimeErrorInfo> {
         let config_dir = self.data_root.join("config");
         fs::create_dir_all(&config_dir).map_err(|error| {
@@ -2355,9 +2726,10 @@ impl RuntimeManager {
             )
         })?;
         let settings = RuntimeSettings {
-            schema_version: 1,
+            schema_version: 2,
             database_port,
             http_port,
+            lan_port,
         };
         let mut temporary = NamedTempFile::new_in(&config_dir).map_err(|error| {
             error_info(
@@ -2673,8 +3045,57 @@ fn choose_runtime_port(preferred: Option<u16>, excluded: &[u16]) -> Result<u16, 
     choose_loopback_port(excluded)
 }
 
+fn choose_lan_port(
+    address: Ipv4Addr,
+    preferred: Option<u16>,
+    excluded: &[u16],
+) -> Result<u16, RuntimeErrorInfo> {
+    if let Some(port) = preferred {
+        if port != 0 && !excluded.contains(&port) && lan_port_available(address, port) {
+            return Ok(port);
+        }
+    }
+    for _ in 0..PORT_ATTEMPTS {
+        let listener = TcpListener::bind(SocketAddrV4::new(address, 0)).map_err(|error| {
+            network_error(
+                "network_bind_failed",
+                "select LAN port",
+                format!("Cannot reserve a LAN port on {address}: {error}."),
+                "Verify that the selected Private network adapter is still active, then retry.",
+            )
+        })?;
+        let port = listener.local_addr().map_err(|error| {
+            network_error(
+                "network_bind_failed",
+                "select LAN port",
+                format!("Cannot read the reserved LAN port on {address}: {error}."),
+                "Retry LAN mode after checking the selected network adapter.",
+            )
+        })?.port();
+        drop(listener);
+        if !excluded.contains(&port) && lan_port_available(address, port) {
+            return Ok(port);
+        }
+    }
+    Err(network_error(
+        "network_port_unavailable",
+        "select LAN port",
+        "CoffeePOS could not select an available port on the selected LAN address.",
+        "Close stale local listeners or reconnect the selected Private network, then retry.",
+    ))
+}
+
 fn loopback_port_available(port: u16) -> bool {
     TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_ok()
+}
+
+fn lan_port_available(address: Ipv4Addr, port: u16) -> bool {
+    TcpListener::bind(SocketAddrV4::new(address, port)).is_ok()
+}
+
+fn lan_port_listening(address: Ipv4Addr, port: u16) -> bool {
+    let address = SocketAddr::V4(SocketAddrV4::new(address, port));
+    TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
 }
 
 fn loopback_port_listening(port: u16) -> bool {
@@ -3661,6 +4082,15 @@ fn error_info(
     error_info_with_code("runtime_error", component, operation, message, recovery)
 }
 
+fn network_error(
+    code: impl Into<String>,
+    operation: impl Into<String>,
+    message: impl Into<String>,
+    recovery: impl Into<String>,
+) -> RuntimeErrorInfo {
+    error_info_with_code(code, "network", operation, message, recovery)
+}
+
 fn error_info_with_code(
     code: impl Into<String>,
     component: impl Into<String>,
@@ -4174,6 +4604,10 @@ mod tests {
         assert_eq!(value["http_port"], 8081);
         assert_eq!(value["wordpress_health"], "checking");
         assert_eq!(value["coffeepos_health"]["state"], "unavailable");
+        assert_eq!(
+            serde_json::to_value(RuntimeStartupStage::WebServerStarting).unwrap(),
+            "web_server_starting"
+        );
     }
 
     #[test]

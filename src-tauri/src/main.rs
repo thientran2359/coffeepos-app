@@ -10,6 +10,7 @@ mod backup_database;
 mod backup_format;
 mod config;
 mod logs;
+mod network;
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod provisioning;
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
@@ -22,7 +23,7 @@ use backup::{BackupOperationState, BackupResult, BackupStatus};
 use backup_format::{
     BackupCompatibilityTarget, BackupErrorInfo, BackupInspection, BackupValidation,
 };
-use config::{AppConfig, AppLanguage, StartupView, Store};
+use config::{AppConfig, AppLanguage, NetworkMode, StartupView, Store};
 use logs::{LogCatalog, LogErrorInfo, LogPage, SupportBundleResult};
 #[cfg(debug_assertions)]
 use provisioning::Provisioner;
@@ -32,7 +33,10 @@ use provisioning::{
     ProvisioningState, RepairItemStatus, RepairResultStatus, WORDPRESS_ADMIN_EMAIL,
     WORDPRESS_ADMIN_SECRET, WORDPRESS_ADMIN_USER,
 };
-use runtime::{HealthDiagnosticsInfo, RuntimeInfo, RuntimeManager, RuntimeState};
+use runtime::{
+    CoffeePosHealthState, HealthDiagnosticsInfo, LanListenerState, RuntimeInfo, RuntimeManager,
+    RuntimeStartupStage, RuntimeState, TlsState, WordPressHealthState,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,6 +117,7 @@ struct ShellState {
     effective_language: Mutex<AppLanguage>,
     language_mutation: Mutex<()>,
     runtime: Mutex<Option<RuntimeManager>>,
+    runtime_startup_progress: Mutex<RuntimeStartupStage>,
     lifecycle: Mutex<()>,
     lifecycle_requested: AtomicBool,
     exit_authorized: AtomicBool,
@@ -303,6 +308,13 @@ fn set_effective_app_language(state: &ShellState, language: AppLanguage) {
     }
 }
 
+fn set_runtime_startup_progress(state: &ShellState, stage: RuntimeStartupStage) {
+    match state.runtime_startup_progress.lock() {
+        Ok(mut current) => *current = stage,
+        Err(poisoned) => *poisoned.into_inner() = stage,
+    }
+}
+
 fn native_tray_menu<R: tauri::Runtime, M: Manager<R>>(
     manager: &M,
     language: AppLanguage,
@@ -420,6 +432,45 @@ fn runtime_ipc_error(
         message,
         "Retry the runtime action. If the problem continues, open System diagnostics before making further changes.",
     )
+}
+
+fn network_ipc_error(
+    code: &'static str,
+    operation: &'static str,
+    message: impl Into<String>,
+) -> runtime::RuntimeErrorInfo {
+    ipc_error_info(
+        code,
+        "network",
+        operation,
+        message,
+        "CoffeePOS remains on the last verified network mode. Retry after checking the selected Private Windows network and System diagnostics.",
+    )
+}
+
+fn read_network_preference(
+    app: &tauri::AppHandle,
+    state: &ShellState,
+) -> Result<(NetworkMode, Option<String>), runtime::RuntimeErrorInfo> {
+    let shell = with_store(app, state, |_| Ok(()))
+        .map_err(|message| network_ipc_error("network_config_error", "read preference", message))?;
+    Ok((
+        shell.config.network_mode,
+        shell.config.lan_adapter_id.clone(),
+    ))
+}
+
+fn persist_network_preference(
+    app: &tauri::AppHandle,
+    state: &ShellState,
+    mode: NetworkMode,
+    adapter_id: Option<String>,
+) -> Result<(), runtime::RuntimeErrorInfo> {
+    with_store(app, state, |store| {
+        store.save_network_preference(mode, adapter_id)
+    })
+    .map(|_| ())
+    .map_err(|message| network_ipc_error("network_config_error", "save preference", message))
 }
 
 fn provisioning_ipc_error(
@@ -1041,6 +1092,9 @@ fn verify_restore_runtime_health(
     data_root: &Path,
     runtime: &mut RuntimeManager,
 ) -> Result<RuntimeInfo, restore::RestoreErrorInfo> {
+    runtime
+        .configure_network(NetworkMode::LocalOnly, None)
+        .map_err(|error| restore_error_from_runtime("isolate restored runtime", error))?;
     let runtime_info = runtime
         .start_for_provisioning()
         .map_err(|error| restore_error_from_runtime("verify restored runtime", error))?;
@@ -1841,6 +1895,8 @@ fn run_restore_apply_worker(
         })?;
         let startup_view = store.config.startup_view.clone();
         let app_language = store.config.app_language;
+        let network_mode = store.config.network_mode;
+        let lan_adapter_id = store.config.lan_adapter_id.clone();
         let staging_root = restore::staging_store_root(&data_root, &journal)?;
         let mut staging_store = Store::open(staging_root).map_err(|error| {
             restore_command_error(
@@ -1852,6 +1908,16 @@ fn run_restore_apply_worker(
         })?;
         staging_store
             .save_desktop_preferences(startup_view, app_language)
+            .map_err(|error| {
+                restore_command_error(
+                    "prepare target config",
+                    "restore_target_config_failed",
+                    error,
+                    "The active store is unchanged. Retry restore after checking staging storage.",
+                )
+            })?;
+        staging_store
+            .save_network_preference(network_mode, lan_adapter_id)
             .map_err(|error| {
                 restore_command_error(
                     "prepare target config",
@@ -1917,6 +1983,9 @@ fn run_restore_apply_worker(
     }
 
     let active_verification = (|| {
+        runtime
+            .configure_network(NetworkMode::LocalOnly, None)
+            .map_err(|error| restore_error_from_runtime("isolate active verification", error))?;
         let runtime_info = runtime
             .start_for_provisioning()
             .map_err(|error| restore_error_from_runtime("start active verification", error))?;
@@ -1992,6 +2061,35 @@ fn run_restore_apply_worker(
     drop(language_mutation_guard);
 
     if runtime_was_running {
+        let resume_preference = read_network_preference(app, &state).map_err(|error| {
+            restore_command_error(
+                "resume runtime",
+                "network_preference_unavailable",
+                error.message,
+                "The restore is committed. Keep the store stopped and reopen CoffeePOS before resuming service.",
+            )
+        })?;
+        if let Err(network_error) =
+            runtime.configure_network(resume_preference.0, resume_preference.1.as_deref())
+        {
+            let _ = runtime.configure_network(NetworkMode::LocalOnly, None);
+            if let Err(error) =
+                persist_network_preference(app, &state, NetworkMode::LocalOnly, None)
+            {
+                if let Ok(mut operation) = state.restore_operation.lock() {
+                    operation.status.warnings.push(format!(
+                        "network_fallback_persist_failed: {}",
+                        error.message
+                    ));
+                }
+            }
+            if let Ok(mut operation) = state.restore_operation.lock() {
+                operation.status.warnings.push(format!(
+                    "network_resume_fallback_local: {}",
+                    network_error.message
+                ));
+            }
+        }
         if let Err(error) = runtime.start() {
             if let Ok(mut operation) = state.restore_operation.lock() {
                 operation
@@ -2117,6 +2215,9 @@ fn verify_recovered_active_target(
             "Keep restore fenced and preserve rollback evidence; do not reset the administrator password.",
         )
     })?;
+    runtime
+        .configure_network(NetworkMode::LocalOnly, None)
+        .map_err(|error| restore_error_from_runtime("isolate recovered target", error))?;
     let runtime_info = runtime.start_for_provisioning().map_err(|error| {
         restore_error_from_runtime("start recovered target verification", error)
     })?;
@@ -3583,14 +3684,267 @@ fn copy_admin_password(app: tauri::AppHandle, state: State<'_, ShellState>) -> R
     }
 }
 
+fn verify_network_apply(
+    info: &RuntimeInfo,
+    expected_mode: NetworkMode,
+) -> Result<(), runtime::RuntimeErrorInfo> {
+    if info.state != RuntimeState::Running
+        || info.wordpress_health != WordPressHealthState::Healthy
+        || info.coffeepos_health.state != CoffeePosHealthState::Healthy
+    {
+        return Err(network_ipc_error(
+            "network_health_failed",
+            "verify",
+            "The managed runtime did not reach healthy WordPress and CoffeePOS state after the network change.",
+        ));
+    }
+    match expected_mode {
+        NetworkMode::LocalOnly => {
+            if info.network.effective_mode != NetworkMode::LocalOnly
+                || info.network.lan_listener_state != LanListenerState::Disabled
+                || info.network.tls_state != TlsState::Disabled
+            {
+                return Err(network_ipc_error(
+                    "network_verification_failed",
+                    "verify",
+                    "LAN resources remained active after CoffeePOS switched to local-only mode.",
+                ));
+            }
+        }
+        NetworkMode::Lan => {
+            let canonical = info.network.canonical_origin.as_deref().unwrap_or_default();
+            if info.network.effective_mode != NetworkMode::Lan
+                || info.network.lan_listener_state != LanListenerState::Ready
+                || info.network.tls_state != TlsState::Ready
+                || info.network.lan_address.is_none()
+                || !canonical.starts_with("https://")
+            {
+                return Err(network_ipc_error(
+                    "network_verification_failed",
+                    "verify",
+                    "The LAN HTTPS listener did not reach the verified ready state.",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn get_runtime_info(app: tauri::AppHandle) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo> {
-    read_runtime_blocking(app, RuntimeManager::refresh).await
+    let preference = {
+        let state = app.state::<ShellState>();
+        read_network_preference(&app, &state)?
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<ShellState>();
+        with_runtime_structured(&app, &state, |runtime| {
+            let info = runtime.refresh();
+            if matches!(info.state, RuntimeState::NotInstalled | RuntimeState::Stopped) {
+                runtime.sync_network_preference_hint(preference.0, preference.1);
+            }
+            Ok(runtime.info())
+        })
+    })
+    .await
+    .map_err(|error| {
+        runtime_ipc_error(
+            "read runtime status",
+            format!("Runtime status worker failed: {error}."),
+        )
+    })?
+}
+
+#[tauri::command]
+async fn set_network_mode(
+    app: tauri::AppHandle,
+    network_mode: NetworkMode,
+) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo> {
+    let previous = {
+        let state = app.state::<ShellState>();
+        read_network_preference(&app, &state)?
+    };
+    {
+        let state = app.state::<ShellState>();
+        set_runtime_startup_progress(&state, RuntimeStartupStage::Preparing);
+    }
+    let operation_app = app.clone();
+    run_runtime_blocking(app, "change network mode", move |runtime| {
+        let before = runtime.refresh();
+        let runtime_was_running = before.state == RuntimeState::Running;
+        if matches!(
+            before.state,
+            RuntimeState::Installing | RuntimeState::Starting | RuntimeState::Stopping
+        ) {
+            return Err(network_ipc_error(
+                "network_busy",
+                "apply",
+                "CoffeePOS is already changing runtime state.",
+            ));
+        }
+        if runtime_was_running {
+            runtime.stop()?;
+        }
+
+        let requested_adapter = if network_mode == NetworkMode::Lan
+            && previous.0 == NetworkMode::Lan
+        {
+            previous.1.as_deref()
+        } else {
+            None
+        };
+        let selected_adapter = match runtime.configure_network(network_mode, requested_adapter) {
+            Ok(selected) => selected,
+            Err(error) => {
+                if runtime_was_running {
+                    let _ = runtime.configure_network(previous.0, previous.1.as_deref());
+                    let _ = runtime.start();
+                }
+                runtime.record_network_error(error.clone());
+                return Err(error);
+            }
+        };
+
+        let apply_result = (|| {
+            let info = runtime.start_with_progress(|stage| {
+                let state = operation_app.state::<ShellState>();
+                set_runtime_startup_progress(&state, stage);
+            })?;
+            verify_network_apply(&info, network_mode)?;
+            if !runtime_was_running {
+                runtime.stop()?;
+            }
+            let state = operation_app.state::<ShellState>();
+            persist_network_preference(
+                &operation_app,
+                &state,
+                network_mode,
+                selected_adapter.clone(),
+            )?;
+            Ok::<RuntimeInfo, runtime::RuntimeErrorInfo>(runtime.info())
+        })();
+
+        match apply_result {
+            Ok(info) => Ok(info),
+            Err(failure) => {
+                let current = runtime.refresh();
+                if current.state == RuntimeState::Running {
+                    let _ = runtime.stop();
+                }
+                let rollback_configured =
+                    runtime.configure_network(previous.0, previous.1.as_deref());
+                let mut rollback_mode = previous.0;
+                let mut rollback_adapter = previous.1.clone();
+                if rollback_configured.is_err() {
+                    runtime.configure_network(NetworkMode::LocalOnly, None)?;
+                    rollback_mode = NetworkMode::LocalOnly;
+                    rollback_adapter = None;
+                    let state = operation_app.state::<ShellState>();
+                    persist_network_preference(
+                        &operation_app,
+                        &state,
+                        NetworkMode::LocalOnly,
+                        None,
+                    )?;
+                }
+                if runtime_was_running {
+                    let rollback_info = runtime.start()?;
+                    verify_network_apply(&rollback_info, rollback_mode)?;
+                }
+                if rollback_mode != previous.0 || rollback_adapter != previous.1 {
+                    let state = operation_app.state::<ShellState>();
+                    persist_network_preference(
+                        &operation_app,
+                        &state,
+                        rollback_mode,
+                        rollback_adapter,
+                    )?;
+                }
+                runtime.record_network_error(failure.clone());
+                Err(failure)
+            }
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+fn get_runtime_startup_progress(
+    state: State<'_, ShellState>,
+) -> Result<RuntimeStartupStage, runtime::RuntimeErrorInfo> {
+    state
+        .runtime_startup_progress
+        .lock()
+        .map(|progress| progress.clone())
+        .map_err(|_| {
+            runtime_ipc_error(
+                "read runtime startup progress",
+                "Runtime startup progress state is unavailable.",
+            )
+        })
 }
 
 #[tauri::command]
 async fn start_runtime(app: tauri::AppHandle) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo> {
-    run_runtime_blocking(app, "start the runtime", RuntimeManager::start).await
+    let preference = {
+        let state = app.state::<ShellState>();
+        read_network_preference(&app, &state)?
+    };
+    {
+        let state = app.state::<ShellState>();
+        set_runtime_startup_progress(&state, RuntimeStartupStage::Preparing);
+    }
+    let progress_app = app.clone();
+    let preference_app = app.clone();
+    run_runtime_blocking(app, "start the runtime", move |runtime| {
+        let requested_mode = preference.0;
+        let requested_adapter = preference.1.clone();
+        let selected_adapter = match runtime.configure_network(
+            requested_mode,
+            requested_adapter.as_deref(),
+        ) {
+            Ok(selected) => selected,
+            Err(error) if requested_mode == NetworkMode::Lan => {
+                runtime.configure_network(NetworkMode::LocalOnly, None)?;
+                let state = preference_app.state::<ShellState>();
+                persist_network_preference(
+                    &preference_app,
+                    &state,
+                    NetworkMode::LocalOnly,
+                    None,
+                )?;
+                runtime.record_network_error(error);
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let first = runtime.start_with_progress(|stage| {
+            let state = progress_app.state::<ShellState>();
+            set_runtime_startup_progress(&state, stage);
+        });
+        match first {
+            Ok(info) => Ok(info),
+            Err(error) if requested_mode == NetworkMode::Lan && selected_adapter.is_some() => {
+                runtime.configure_network(NetworkMode::LocalOnly, None)?;
+                let state = preference_app.state::<ShellState>();
+                persist_network_preference(
+                    &preference_app,
+                    &state,
+                    NetworkMode::LocalOnly,
+                    None,
+                )?;
+                let failure = error.clone();
+                runtime.start_with_progress(|stage| {
+                    let state = progress_app.state::<ShellState>();
+                    set_runtime_startup_progress(&state, stage);
+                })?;
+                runtime.record_network_error(failure);
+                Ok(runtime.info())
+            }
+            Err(error) => Err(error),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3600,7 +3954,69 @@ async fn stop_runtime(app: tauri::AppHandle) -> Result<RuntimeInfo, runtime::Run
 
 #[tauri::command]
 async fn restart_runtime(app: tauri::AppHandle) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo> {
-    run_runtime_blocking(app, "restart the runtime", RuntimeManager::restart).await
+    let preference = {
+        let state = app.state::<ShellState>();
+        read_network_preference(&app, &state)?
+    };
+    {
+        let state = app.state::<ShellState>();
+        set_runtime_startup_progress(&state, RuntimeStartupStage::Preparing);
+    }
+    let progress_app = app.clone();
+    let preference_app = app.clone();
+    run_runtime_blocking(app, "restart the runtime", move |runtime| {
+        let current = runtime.refresh();
+        if current.state == RuntimeState::Running {
+            runtime.stop()?;
+        }
+        let requested_mode = preference.0;
+        let requested_adapter = preference.1.clone();
+        let selected_adapter = match runtime.configure_network(
+            requested_mode,
+            requested_adapter.as_deref(),
+        ) {
+            Ok(selected) => selected,
+            Err(error) if requested_mode == NetworkMode::Lan => {
+                runtime.configure_network(NetworkMode::LocalOnly, None)?;
+                let state = preference_app.state::<ShellState>();
+                persist_network_preference(
+                    &preference_app,
+                    &state,
+                    NetworkMode::LocalOnly,
+                    None,
+                )?;
+                runtime.record_network_error(error);
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let first = runtime.start_with_progress(|stage| {
+            let state = progress_app.state::<ShellState>();
+            set_runtime_startup_progress(&state, stage);
+        });
+        match first {
+            Ok(info) => Ok(info),
+            Err(error) if requested_mode == NetworkMode::Lan && selected_adapter.is_some() => {
+                runtime.configure_network(NetworkMode::LocalOnly, None)?;
+                let state = preference_app.state::<ShellState>();
+                persist_network_preference(
+                    &preference_app,
+                    &state,
+                    NetworkMode::LocalOnly,
+                    None,
+                )?;
+                let failure = error.clone();
+                runtime.start_with_progress(|stage| {
+                    let state = progress_app.state::<ShellState>();
+                    set_runtime_startup_progress(&state, stage);
+                })?;
+                runtime.record_network_error(failure);
+                Ok(runtime.info())
+            }
+            Err(error) => Err(error),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -4355,115 +4771,140 @@ fn open_pos(
 }
 
 #[tauri::command]
-fn provision_wordpress(
+async fn provision_wordpress(
     app: tauri::AppHandle,
-    state: State<'_, ShellState>,
 ) -> Result<ProvisioningInfo, runtime::RuntimeErrorInfo> {
     #[cfg(debug_assertions)]
     {
-        let result = (|| -> Result<ProvisioningInfo, String> {
-            ensure_restore_allows_managed_operation(&state, "provision WordPress")?;
-            let _lifecycle_guard = try_lifecycle(&state, "provision WordPress")?;
-            let root = data_root(&app, &state)?;
-            let (store_name, admin_username, admin_email, setup_profile_configured) = {
-                let guard = state.store.lock().map_err(|_| {
-                    "Application state unavailable. Restart CoffeePOS Desktop.".to_string()
+        {
+            let state = app.state::<ShellState>();
+            ensure_restore_allows_managed_operation(&state, "provision WordPress")
+                .map_err(|message| provisioning_ipc_error("provision WordPress", message))?;
+            if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
+                return Err(provisioning_ipc_error(
+                    "provision WordPress",
+                    "Runtime lifecycle is busy with another operation.",
+                ));
+            }
+        }
+
+        let worker_app = app.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let state = worker_app.state::<ShellState>();
+            let result = (|| -> Result<ProvisioningInfo, String> {
+                ensure_restore_allows_managed_operation(&state, "provision WordPress")?;
+                let _lifecycle_guard = try_lifecycle(&state, "provision WordPress")?;
+                let root = data_root(&worker_app, &state)?;
+                let (store_name, admin_username, admin_email, setup_profile_configured) = {
+                    let guard = state.store.lock().map_err(|_| {
+                        "Application state unavailable. Restart CoffeePOS Desktop.".to_string()
+                    })?;
+                    let store = guard
+                        .as_ref()
+                        .ok_or_else(|| "Configuration unavailable. Retry startup.".to_string())?;
+                    (
+                        store.config.store_name.clone(),
+                        store
+                            .config
+                            .setup_admin_username
+                            .clone()
+                            .unwrap_or_else(|| WORDPRESS_ADMIN_USER.into()),
+                        store
+                            .config
+                            .setup_admin_email
+                            .clone()
+                            .unwrap_or_else(|| WORDPRESS_ADMIN_EMAIL.into()),
+                        store.config.setup_admin_username.is_some()
+                            && store.config.setup_admin_email.is_some(),
+                    )
+                };
+                let provisioning_before = inspect_provisioning(&worker_app, &state)?;
+                if provisioning_before.state == ProvisioningState::NotInstalled {
+                    if root.join(WORDPRESS_ADMIN_PENDING_SECRET).exists() {
+                        return Err("Administrator credential update is incomplete. Return to setup and save the administrator password again before installing CoffeePOS.".into());
+                    }
+                    let password_ready = secret::load(&root.join(WORDPRESS_ADMIN_SECRET))
+                        .map(|value| !value.is_empty())
+                        .unwrap_or(false);
+                    if !setup_profile_configured || !password_ready {
+                        return Err("Complete the store and administrator account step before installing CoffeePOS.".into());
+                    }
+                }
+                let _provisioning_guard = match state.provisioning.try_lock() {
+                    Ok(guard) => guard,
+                    Err(TryLockError::WouldBlock) => {
+                        return Err(
+                        "WordPress provisioning is already running. Wait for it to finish before retrying."
+                            .into(),
+                    );
+                    }
+                    Err(TryLockError::Poisoned(_)) => {
+                        return Err(
+                        "Provisioning state unavailable. Restart CoffeePOS Desktop before retrying."
+                            .into(),
+                    );
+                    }
+                };
+                let (project_root, manifest) = development_runtime_paths()?;
+                let mut runtime_guard = state.runtime.lock().map_err(|_| {
+                    "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string()
                 })?;
-                let store = guard
-                    .as_ref()
-                    .ok_or_else(|| "Configuration unavailable. Retry startup.".to_string())?;
-                (
-                    store.config.store_name.clone(),
-                    store
-                        .config
-                        .setup_admin_username
-                        .clone()
-                        .unwrap_or_else(|| WORDPRESS_ADMIN_USER.into()),
-                    store
-                        .config
-                        .setup_admin_email
-                        .clone()
-                        .unwrap_or_else(|| WORDPRESS_ADMIN_EMAIL.into()),
-                    store.config.setup_admin_username.is_some()
-                        && store.config.setup_admin_email.is_some(),
-                )
-            };
-            let provisioning_before = inspect_provisioning(&app, &state)?;
-            if provisioning_before.state == ProvisioningState::NotInstalled {
-                if root.join(WORDPRESS_ADMIN_PENDING_SECRET).exists() {
-                    return Err("Administrator credential update is incomplete. Return to setup and save the administrator password again before installing CoffeePOS.".into());
+                if runtime_guard.is_none() {
+                    *runtime_guard = Some(
+                        RuntimeManager::from_development(&project_root, &manifest, root.clone())
+                            .map_err(|error| error.to_string())?,
+                    );
                 }
-                let password_ready = secret::load(&root.join(WORDPRESS_ADMIN_SECRET))
-                    .map(|value| !value.is_empty())
-                    .unwrap_or(false);
-                if !setup_profile_configured || !password_ready {
-                    return Err("Complete the store and administrator account step before installing CoffeePOS.".into());
-                }
-            }
-            let _provisioning_guard = match state.provisioning.try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::WouldBlock) => {
+                let runtime = runtime_guard
+                    .as_mut()
+                    .ok_or_else(|| "Runtime manager unavailable. Retry startup.".to_string())?;
+                if runtime.backup_maintenance_active() {
                     return Err(
-                    "WordPress provisioning is already running. Wait for it to finish before retrying."
-                        .into(),
-                );
+                        "Database backup maintenance is active. Finish or cancel the current backup cleanup before provisioning CoffeePOS."
+                            .into(),
+                    );
                 }
-                Err(TryLockError::Poisoned(_)) => {
-                    return Err(
-                    "Provisioning state unavailable. Restart CoffeePOS Desktop before retrying."
-                        .into(),
-                );
-                }
-            };
-            let (project_root, manifest) = development_runtime_paths()?;
-            let mut runtime_guard = state
-                .runtime
-                .lock()
-                .map_err(|_| "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string())?;
-            if runtime_guard.is_none() {
-                *runtime_guard = Some(
-                    RuntimeManager::from_development(&project_root, &manifest, root.clone())
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-            let runtime = runtime_guard
-                .as_mut()
-                .ok_or_else(|| "Runtime manager unavailable. Retry startup.".to_string())?;
-            if runtime.backup_maintenance_active() {
-                return Err(
-                "Database backup maintenance is active. Finish or cancel the current backup cleanup before provisioning CoffeePOS."
-                    .into(),
-            );
-            }
-            runtime.stop().map_err(|error| error.to_string())?;
-            let (resolved, runtime_root) = runtime.provisioning_context();
-            let mut provisioner =
-                Provisioner::from_development(&project_root, &manifest, resolved, runtime_root)
+                runtime.stop().map_err(|error| error.to_string())?;
+                let (resolved, runtime_root) = runtime.provisioning_context();
+                let mut provisioner =
+                    Provisioner::from_development(&project_root, &manifest, resolved, runtime_root)
+                        .map_err(|error| error.to_string())?;
+                provisioner
+                    .configure_initial_admin(&admin_username, &admin_email)
                     .map_err(|error| error.to_string())?;
-            provisioner
-                .configure_initial_admin(&admin_username, &admin_email)
-                .map_err(|error| error.to_string())?;
-            provisioner.prepare().map_err(|error| error.to_string())?;
-            let runtime_info = runtime
-                .start_for_provisioning()
-                .map_err(|error| error.to_string())?;
-            match provisioner.install_wordpress(&store_name, &runtime_info) {
-                Ok(info) => {
-                    runtime.refresh_wordpress_health();
-                    Ok(info)
+                provisioner.prepare().map_err(|error| error.to_string())?;
+                let runtime_info = runtime
+                    .start_for_provisioning()
+                    .map_err(|error| error.to_string())?;
+                match provisioner.install_wordpress(&store_name, &runtime_info) {
+                    Ok(info) => {
+                        runtime.refresh_wordpress_health();
+                        Ok(info)
+                    }
+                    Err(error) => {
+                        let _ = runtime.stop();
+                        Err(error.to_string())
+                    }
                 }
-                Err(error) => {
-                    let _ = runtime.stop();
-                    Err(error.to_string())
-                }
-            }
-        })();
-        result.map_err(|message| provisioning_ipc_error("provision WordPress", message))
+            })();
+            result.map_err(|message| provisioning_ipc_error("provision WordPress", message))
+        })
+        .await;
+
+        app.state::<ShellState>()
+            .lifecycle_requested
+            .store(false, Ordering::Release);
+
+        result.map_err(|error| {
+            provisioning_ipc_error(
+                "provision WordPress",
+                format!("Provisioning worker failed: {error}."),
+            )
+        })?
     }
     #[cfg(not(debug_assertions))]
     {
         let _ = app;
-        let _ = state;
         Err(provisioning_ipc_error(
             "provision WordPress",
             "Bundled WordPress resources are not packaged yet. Use a qualified development build.",
@@ -4562,6 +5003,8 @@ fn main() {
             save_setup_profile,
             copy_admin_password,
             get_runtime_info,
+            set_network_mode,
+            get_runtime_startup_progress,
             start_runtime,
             stop_runtime,
             restart_runtime,

@@ -18,3 +18,5 @@ Database + uploads/config phải thuộc cùng một maintenance snapshot: Caddy
 Restore luôn validate encryption, archive schema, path safety, checksums và compatibility trước mutation. Existing store phải có validated pre-restore recovery snapshot; restored store được dựng trong isolated staging, dùng target-local credentials, pass health rồi mới cutover. Interrupted cutover dùng restore journal để resume/rollback; daily startup bị gate cho tới khi transaction được reconcile.
 
 Phase 7 dùng dump/import tools từ development artifact đã pin/verify; Phase 9.1 mới bundle production. Windows cross-profile restore là acceptance của 7.4. Windows ↔ macOS chỉ được công bố sau khi có acceptance trên cả hai target.
+
+Từ Phase 8, LAN/network preference vẫn là target-local: portable backup không mang selected adapter/IP, firewall state, LAN certificate private key/CA identity hoặc effective canonical network origin sang máy đích. Fresh-profile restore mặc định local-only. Restore vào existing profile giữ preference/TLS identity của chính target khi còn hợp lệ; mọi restore staging vẫn loopback-only và LAN chỉ được resume sau committed restore + final active health.

@@ -2116,14 +2116,44 @@ impl Provisioner {
     }
 
     pub fn installing_info(&self) -> ProvisioningInfo {
+        let journal = self.load_journal().ok().flatten();
+        let stage = journal.as_ref().map(|value| value.stage.clone());
+        let wordpress_installed = stage
+            .as_ref()
+            .is_some_and(|value| value >= &ProvisioningStage::WordPressInstalled);
+        let woocommerce_provisioned = stage
+            .as_ref()
+            .is_some_and(|value| value >= &ProvisioningStage::WooCommerceProvisioned);
+        let woocommerce_activated = stage
+            .as_ref()
+            .is_some_and(|value| value >= &ProvisioningStage::WooCommerceActivated);
+        let coffeepos_provisioned = stage
+            .as_ref()
+            .is_some_and(|value| value >= &ProvisioningStage::CoffeePosProvisioned);
+        let coffeepos_activated = stage
+            .as_ref()
+            .is_some_and(|value| value >= &ProvisioningStage::CoffeePosActivated);
         ProvisioningInfo {
             state: ProvisioningState::Installing,
             wordpress_version: self.wordpress.version.clone(),
-            woocommerce_version: self.woocommerce.version.clone(),
-            woocommerce_active: false,
-            coffeepos_version: self.coffeepos.version.clone(),
-            coffeepos_active: false,
-            admin_username: Some(self.admin_username.clone()),
+            woocommerce_version: if woocommerce_provisioned {
+                self.woocommerce.version.clone()
+            } else {
+                String::new()
+            },
+            woocommerce_active: woocommerce_activated,
+            coffeepos_version: if coffeepos_provisioned {
+                self.coffeepos.version.clone()
+            } else {
+                String::new()
+            },
+            coffeepos_active: coffeepos_activated,
+            admin_username: wordpress_installed.then(|| {
+                journal
+                    .as_ref()
+                    .map(|value| value.admin_username.clone())
+                    .unwrap_or_else(|| self.admin_username.clone())
+            }),
             can_retry: false,
             last_error: None,
         }

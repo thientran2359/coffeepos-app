@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
-pub const APP_CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const APP_CONFIG_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +24,14 @@ pub enum AppLanguage {
     En,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    #[default]
+    LocalOnly,
+    Lan,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -38,6 +46,10 @@ pub struct AppConfig {
     pub setup_admin_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_admin_email: Option<String>,
+    #[serde(default)]
+    pub network_mode: NetworkMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_adapter_id: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -50,6 +62,8 @@ impl Default for AppConfig {
             app_language: None,
             setup_admin_username: None,
             setup_admin_email: None,
+            network_mode: NetworkMode::LocalOnly,
+            lan_adapter_id: None,
         }
     }
 }
@@ -124,9 +138,24 @@ impl AppConfig {
         }
         if self.bind_host != "127.0.0.1" {
             return Err(
-                "Phase 1 supports local-only mode. Set bind_host to 127.0.0.1 in config/app.json."
+                "bind_host is an internal compatibility field and must remain 127.0.0.1. Use network_mode for LAN access."
                     .into(),
             );
+        }
+        match self.network_mode {
+            NetworkMode::LocalOnly if self.lan_adapter_id.is_some() => {
+                return Err("lan_adapter_id must be empty while network_mode is local_only.".into());
+            }
+            NetworkMode::Lan => {
+                if self
+                    .lan_adapter_id
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty() || value.len() > 128)
+                {
+                    return Err("lan_adapter_id must be a stable non-empty adapter identity.".into());
+                }
+            }
+            NetworkMode::LocalOnly => {}
         }
         if self.store_name.trim().is_empty()
             || self.store_name.chars().count() > 80
@@ -171,8 +200,13 @@ fn invalid_config_error() -> String {
         .to_string()
 }
 
-fn decode_config(bytes: &[u8]) -> Result<AppConfig, String> {
-    let value: serde_json::Value =
+struct DecodedConfig {
+    config: AppConfig,
+    migrated: bool,
+}
+
+fn decode_config(bytes: &[u8]) -> Result<DecodedConfig, String> {
+    let mut value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| invalid_config_error())?;
     if let Some(language) = value.get("app_language") {
         if !language.is_null() && !matches!(language.as_str(), Some("vi" | "en")) {
@@ -182,7 +216,33 @@ fn decode_config(bytes: &[u8]) -> Result<AppConfig, String> {
             );
         }
     }
-    serde_json::from_value(value).map_err(|_| invalid_config_error())
+    let schema_version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(invalid_config_error)?;
+    let migrated = match schema_version {
+        1 => {
+            if value.get("bind_host").and_then(serde_json::Value::as_str) != Some("127.0.0.1") {
+                return Err(invalid_config_error());
+            }
+            let object = value.as_object_mut().ok_or_else(invalid_config_error)?;
+            object.insert(
+                "schema_version".into(),
+                serde_json::Value::from(APP_CONFIG_SCHEMA_VERSION),
+            );
+            object.insert(
+                "network_mode".into(),
+                serde_json::Value::String("local_only".into()),
+            );
+            object.remove("lan_adapter_id");
+            true
+        }
+        version if version == APP_CONFIG_SCHEMA_VERSION as u64 => false,
+        _ => return Err(invalid_config_error()),
+    };
+    let config: AppConfig = serde_json::from_value(value).map_err(|_| invalid_config_error())?;
+    config.validate()?;
+    Ok(DecodedConfig { config, migrated })
 }
 
 fn persist(path: &Path, config: &AppConfig) -> Result<(), String> {
@@ -212,9 +272,8 @@ pub fn read_app_language(root: &Path) -> Result<Option<AppLanguage>, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(disk_error("read configuration", error)),
     };
-    let config = decode_config(&bytes)?;
-    config.validate()?;
-    Ok(config.app_language)
+    let decoded = decode_config(&bytes)?;
+    Ok(decoded.config.app_language)
 }
 
 impl Store {
@@ -233,16 +292,22 @@ impl Store {
                 .map_err(|e| disk_error("create store directories", e))?;
         }
         let path = root.join("config/app.json");
-        let config: AppConfig = match fs::read(&path) {
-            Ok(bytes) => decode_config(&bytes)?,
+        let (config, migrated) = match fs::read(&path) {
+            Ok(bytes) => {
+                let decoded = decode_config(&bytes)?;
+                (decoded.config, decoded.migrated)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let config = AppConfig::default();
                 persist(&path, &config)?;
-                config
+                (config, false)
             }
             Err(e) => return Err(disk_error("read configuration", e)),
         };
         config.validate()?;
+        if migrated {
+            persist(&path, &config)?;
+        }
         let store = Self {
             root,
             config,
@@ -307,6 +372,23 @@ impl Store {
         self.save_desktop_preferences(self.config.startup_view.clone(), Some(app_language))
     }
 
+    pub fn save_network_preference(
+        &mut self,
+        network_mode: NetworkMode,
+        lan_adapter_id: Option<String>,
+    ) -> Result<(), String> {
+        let next = AppConfig {
+            network_mode,
+            lan_adapter_id,
+            bind_host: "127.0.0.1".into(),
+            ..self.config.clone()
+        };
+        persist(&self.root.join("config/app.json"), &next)?;
+        self.config = next;
+        self.log("desktop network preference saved");
+        Ok(())
+    }
+
     fn log(&self, event: &str) {
         // Diagnostic logging never includes configuration values or credentials.
         let timestamp = std::time::SystemTime::now()
@@ -350,7 +432,8 @@ mod tests {
         let path = temp.path().join("config/app.json");
         for bytes in [
             "{broken",
-            r#"{"schema_version":2,"store_name":"Shop","bind_host":"127.0.0.1"}"#,
+            r#"{"schema_version":3,"store_name":"Shop","bind_host":"127.0.0.1"}"#,
+            r#"{"schema_version":1,"store_name":"Shop","bind_host":"192.168.1.20"}"#,
         ] {
             fs::write(&path, bytes).unwrap();
             assert!(Store::open(temp.path().to_owned()).is_err());
@@ -374,6 +457,11 @@ mod tests {
         assert!(reopened.config.app_language.is_none());
         assert!(reopened.config.setup_admin_username.is_none());
         assert!(reopened.config.setup_admin_email.is_none());
+        assert_eq!(reopened.config.network_mode, NetworkMode::LocalOnly);
+        assert!(reopened.config.lan_adapter_id.is_none());
+        let migrated = fs::read_to_string(path).unwrap();
+        assert!(migrated.contains("\"schema_version\": 2"));
+        assert!(migrated.contains("\"network_mode\": \"local_only\""));
     }
 
     #[test]
@@ -400,8 +488,27 @@ mod tests {
         assert_eq!(reopened.config.app_language, Some(AppLanguage::En));
         assert_eq!(read_app_language(&root).unwrap(), Some(AppLanguage::En));
         let json = fs::read_to_string(root.join("config/app.json")).unwrap();
-        assert!(json.contains("\"schema_version\": 1"));
+        assert!(json.contains("\"schema_version\": 2"));
         assert!(json.contains("\"app_language\": \"en\""));
+    }
+
+    #[test]
+    fn network_preference_is_atomic_and_keeps_bind_host_internal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_owned();
+        let mut store = Store::open(root.clone()).unwrap();
+        store
+            .save_network_preference(NetworkMode::Lan, Some("adapter-001".into()))
+            .unwrap();
+        assert_eq!(store.config.network_mode, NetworkMode::Lan);
+        assert_eq!(store.config.lan_adapter_id.as_deref(), Some("adapter-001"));
+        assert_eq!(store.config.bind_host, "127.0.0.1");
+        drop(store);
+
+        let reopened = Store::open(root).unwrap();
+        assert_eq!(reopened.config.network_mode, NetworkMode::Lan);
+        assert_eq!(reopened.config.lan_adapter_id.as_deref(), Some("adapter-001"));
+        assert_eq!(reopened.config.bind_host, "127.0.0.1");
     }
 
     #[test]

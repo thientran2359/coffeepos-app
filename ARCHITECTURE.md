@@ -120,6 +120,12 @@ Phase 1 không chọn HTTP/database port vì chưa có service. Phase 2 thử po
 
 URL WordPress phải cập nhật có kiểm soát theo actual host/port trước health. Không search-replace tùy tiện serialized database. Lưu DB port riêng, luôn loopback. LAN canonical host, cookie scope và URL changes là hợp đồng Phase 8.x. Browser CORS không phải cơ chế xác thực.
 
+### Phase 8 LAN boundary
+
+Phase 8 chốt security architecture trước implementation: local-only vẫn là default; LAN là opt-in trên một adapter IPv4 được user approve và canonical LAN origin dùng HTTPS. Caddy giữ internal loopback listener cho readiness/native machine-health và thêm LAN listener cho CoffeePOS web surface; MariaDB, PHP FastCGI và Caddy admin không đổi khỏi loopback. LAN route không mirror toàn bộ internal surface: machine-health/runtime probes/native control phải remain local-only, còn exact POS/KDS/customer-display/API allowlist được audit ở 8.3.
+
+Network setting persist user intent (local-only/LAN + stable adapter identity), không tin arbitrary raw host từ frontend/config. Effective address được derive lại từ OS; không silently switch sang adapter khác khi network thay đổi. LAN TLS identity/private key thuộc target profile và bị loại khỏi portable backup; public trust certificate/fingerprint được 8.2 dùng để onboard thiết bị. Network apply/rebind dùng lifecycle transaction, health verification và rollback về loopback nếu bind/TLS/canonical-origin change fail. Windows Public network không được dùng cho initial LAN support. Xem [PHASE-08.1](docs/PHASE-08.1.md), [PHASE-08.2](docs/PHASE-08.2.md), [PHASE-08.3](docs/PHASE-08.3.md).
+
 ## 6. Provisioning và phiên bản
 
 Xem [PROVISIONING.md](docs/PROVISIONING.md). Bundle manifest phải có exact Desktop/runtime/PHP/MariaDB/WordPress/WooCommerce/CoffeePOS/schema versions, target triple, artifact hash, nguồn và license notices. Không dùng tên archive để suy luận compatibility; không tải “latest” khi mở app.
