@@ -1,6 +1,6 @@
 # CoffeePOS Desktop — Đặc tả UI/UX
 
-Ngày cập nhật: 2026-09-18. Đây là đặc tả trải nghiệm; bằng chứng triển khai nằm trong tài liệu từng phase. Phase 1–4.12 giữ nguyên kết quả kỹ thuật đã nghiệm thu; Phase 5.1 shell/navigation và Phase 5.2 store/account onboarding đã hoàn thành Windows-first. Phase 5.3–5.6 và Phase 6.1 health diagnostics đã triển khai và pass lightweight automated checks; manual Windows acceptance còn chờ người dùng thực hiện. Sau snapshot Phase 6.1, installed-store shell đã được refactor theo kiến trúc thông tin **Tổng quan / Cấu hình / Hệ thống**, thay thế cách trình bày ba mục ngang **Trang chính / Cài đặt / Chẩn đoán**. Scope, thứ tự và trạng thái phase do [ROADMAP.md](ROADMAP.md) quản lý.
+Ngày cập nhật: 2026-09-19. Đây là đặc tả trải nghiệm; bằng chứng triển khai nằm trong tài liệu từng phase. Phase 1–4.12 giữ nguyên kết quả kỹ thuật đã nghiệm thu; Phase 5.1 shell/navigation và Phase 5.2 store/account onboarding đã hoàn thành Windows-first. Phase 5.3–5.6, Phase 6.1 health diagnostics và Phase 6.2 runtime performance đã triển khai và pass focused/lightweight automated checks; manual Windows acceptance còn chờ người dùng thực hiện. Sau snapshot Phase 6.1, installed-store shell đã được refactor theo kiến trúc thông tin **Tổng quan / Cấu hình / Hệ thống**, thay thế cách trình bày ba mục ngang **Trang chính / Cài đặt / Chẩn đoán**. Scope, thứ tự và trạng thái phase do [ROADMAP.md](ROADMAP.md) quản lý.
 
 ## 1. Mục tiêu
 

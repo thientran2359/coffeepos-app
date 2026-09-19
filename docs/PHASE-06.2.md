@@ -109,3 +109,31 @@ Sau các thay đổi trên, benchmark lại POS/WordPress. Chỉ thêm MariaDB c
 ## Definition of Done
 
 Phase 6.2 chỉ được đánh dấu hoàn thành khi có cả bốn bằng chứng: Desktop responsive trong lifecycle, status/health scheduling không tranh request vô ích, OPcache thực sự active, và POS runtime xử lý request concurrent bằng serving stack đã pin/managed. Chỉ đổi timeout hoặc giảm polling mà vẫn giữ `php -S` single-process không đủ để hoàn thành phase.
+
+## Trạng thái triển khai 2026-09-19
+
+Phase 6.2 đã được triển khai Windows-first và pass focused automated/runtime acceptance; manual native UX acceptance còn chờ người dùng smoke-test cảm giác resize/navigation/repaint trong lúc auto-start/restart trên app thật.
+
+Serving architecture hiện tại:
+
+- development manifest schema 2 pin **Caddy 2.11.4** cùng PHP 8.4.25 NTS và MariaDB 11.4.13; staging xác minh SHA256 trước extract và giữ binary/config tách khỏi PATH/global install;
+- Caddy bind HTTP ở dynamic loopback port hiện có, serve static + external uploads trực tiếp và chuyển PHP sang một private FastCGI loopback port;
+- một `php-cgi` master chạy với `PHP_FCGI_CHILDREN=4`, `PHP_FCGI_MAX_REQUESTS=500` và `FCGI_WEB_SERVER_ADDRS=127.0.0.1`; Windows PHP quản lý/respawn worker con, còn Desktop chỉ cần track master trong Job Object;
+- `php.ini` bật Zend OPcache; nonce readiness chạy qua **Caddy → FastCGI → PHP** và trả failure nếu OPcache không active trên web-serving SAPI;
+- Caddy admin dùng dynamic loopback port, `persist_config off`, `auto_https off` và bounded `grace_period`. Shutdown gọi `/stop`, đợi Caddy drain/exit, rồi dừng PHP master trước MariaDB. Drain marker PHP chỉ còn fallback khi graceful Caddy stop không hoàn tất và vẫn được clear ở clean startup.
+
+Scheduling/UI responsiveness đã đổi như sau:
+
+- `get_runtime_info` chỉ refresh managed-process state/cached health; poll 2 giây không tự gọi WordPress/CoffeePOS hoặc spawn cron;
+- frontend status poll có single-flight guard. Maintenance chạy riêng, được serialize bằng lifecycle lock; CoffeePOS machine-health tối đa mỗi 15 giây và cron giữ cadence 60 giây;
+- start/stop/restart/health/diagnostics chạy qua Tauri async command + `spawn_blocking`. Close/Alt+F4 chỉ làm kiểm tra/confirm nhanh trên window event thread; runtime stop thật chạy blocking worker trước khi authorize exit.
+
+Acceptance dùng bản copy disposable của store development đang dừng, không sửa store gốc. Kết quả runtime mới:
+
+- `start → stop → restart-from-stopped → restart-while-running → stop`: **PASS 1/1**; WordPress và CoffeePOS machine-health đều healthy, graceful Caddy drain hoàn tất và sau test không còn `caddy`, `php-cgi` hoặc `mariadbd` process;
+- warm `/wp-login.php`: **p50 134 ms, p95 140 ms**. Baseline trước Phase 6.2 khoảng `0.88–0.90s`, có mẫu gần `1.96s`, nên p50 trên cùng máy cải thiện hơn 6×;
+- 4 dynamic request tuần tự: **537 ms**; 4 request song song: **144 ms**, chứng minh worker pool không còn serialize gần tuyến tính;
+- static CoffeePOS JS sau warm-up: **p50 <1 ms, p95 1 ms**;
+- runtime staging xác minh PHP/FastCGI/Caddy/OPcache; WordPress 7.1, WooCommerce 11.1.0 và CoffeePOS 1.0.1 artifacts đã được restage lại và checksum pass sau khi thay runtime target.
+
+Focused validation pass: Rust `cargo check`, `cargo fmt --check`, Phase 6.2 manifest/drain tests, ignored staged lifecycle/concurrency smoke, TypeScript lint/build, `npm run doctor` và `git diff --check`. Clippy pass cho code hiện tại khi bỏ qua `clippy::derivable_impls`, là lint có sẵn ở `config.rs` ngoài scope Phase 6.2. Chưa dùng kết quả automated này để tự thay manual UX smoke-test của người dùng.

@@ -118,7 +118,7 @@ CoffeePOS
 
 Avoid adding Nginx or Apache unless there is a demonstrated requirement.
 
-The Phase 6.2 performance investigation demonstrated that requirement for the POS serving path on Windows: the single-process built-in server serializes dynamic requests, while measured WordPress dynamic requests were orders of magnitude slower than static assets. Keep `php -S` only where a lightweight development/fixture server is appropriate; the managed POS runtime must move to the concurrent serving model specified by the roadmap before LAN/release.
+The Phase 6.2 performance investigation demonstrated that requirement for the POS serving path on Windows: the single-process built-in server serializes dynamic requests, while measured WordPress dynamic requests were orders of magnitude slower than static assets. The Windows development POS runtime now uses pinned Caddy + a managed PHP FastCGI worker pool with OPcache; keep `php -S` only where a lightweight development/fixture server is appropriate. Preserve that concurrent serving contract before LAN/release.
 
 For the first implementation, prefer PHP's built-in web server:
 
@@ -923,8 +923,8 @@ Current Windows-first status:
 - Phase 5.5 — Daily startup: implemented; lightweight validation passed, manual Windows acceptance pending.
 - Phase 5.6 — Minimize, exit and shutdown: implemented; lightweight validation passed, manual Windows acceptance pending.
 - Phase 6.1 — Health diagnostics: implemented; lightweight validation passed, manual Windows acceptance pending.
-- Phase 6.2 — Runtime performance and responsiveness: planned; see `docs/PHASE-06.2.md`.
-- Next implementation milestone: Phase 6.2 — Runtime performance and responsiveness.
+- Phase 6.2 — Runtime performance and responsiveness: implemented; focused lifecycle/concurrency validation passed, manual Windows UX acceptance pending.
+- Next implementation milestone after Phase 6.2 acceptance: Phase 6.3 — Repair flow.
 
 From Phase 4 onward, work is intentionally split into small independently verifiable milestones:
 

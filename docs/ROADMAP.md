@@ -53,7 +53,7 @@ Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ng
 | 5.5 — Daily startup | 🟡 Đã triển khai, chờ manual acceptance | Installed ready store auto-start khi runtime stopped; reload running không start lại; setup/recovery không auto-start; không tự mở POS; lightweight checks pass |
 | 5.6 — Minimize, exit and shutdown | 🟡 Đã triển khai, chờ manual acceptance | Minimize giữ runtime; Close/Alt+F4 native confirm; bounded PHP request drain + MariaDB shutdown; Windows Job Object crash containment; lightweight checks pass |
 | 6.1 — Health diagnostics | 🟡 Đã triển khai, chờ manual acceptance | Live authenticated Database/PHP probes; WordPress readiness + CoffeePOS machine-health mapping cho đủ 5 component; recovery action rõ ràng; lightweight checks pass |
-| 6.2 — Runtime performance and responsiveness | ⏳ Chưa bắt đầu | Mốc implementation tiếp theo: async lifecycle/health scheduling, OPcache và serving stack concurrent; spec đã chốt |
+| 6.2 — Runtime performance and responsiveness | 🟡 Đã triển khai, chờ manual acceptance | Caddy 2.11.4 + PHP FastCGI 4 workers + OPcache; async lifecycle/status-health split; dynamic p50 134 ms, 4 parallel 144 ms vs 537 ms sequential; staged lifecycle/concurrency smoke pass |
 | 6.3+ | ⏳ Chưa bắt đầu | Repair flow rồi Log viewer/export |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
@@ -188,7 +188,7 @@ Nghiệm thu trực tiếp từ app: fresh store → setup toàn stack → appli
 
 ## Phase 5 — Trải nghiệm ứng dụng và mở bán hàng
 
-Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3–5.6 đã triển khai code và lightweight validation, còn manual Windows acceptance theo [PHASE-05.3.md](PHASE-05.3.md), [PHASE-05.4.md](PHASE-05.4.md), [PHASE-05.5.md](PHASE-05.5.md) và [PHASE-05.6.md](PHASE-05.6.md). Phase 6.1 health diagnostics cũng đã triển khai và chờ manual acceptance theo [PHASE-06.1.md](PHASE-06.1.md); Phase 6.2+ chưa triển khai. Sau snapshot 6.1, product IA được chốt lại: installed-store top-level navigation là **Tổng quan / Cấu hình / Hệ thống**; **Chẩn đoán** chuyển thành chức năng bên trong Hệ thống. Đây là target cho mọi UI change tiếp theo; acceptance lịch sử của 5.1 vẫn ghi đúng shell đã chạy lúc đó. Trước code mỗi milestone, bổ sung spec phase với wireframe success/loading/error, contract native cần dùng và acceptance theo [UI-UX.md](UI-UX.md). Tái sử dụng runtime/provisioning hiện có; không viết lại backend chỉ để đổi giao diện.
+Phase 5.1–5.2 đã hoàn thành Windows-first. Phase 5.3–5.6, Phase 6.1 health diagnostics và Phase 6.2 runtime performance đã triển khai code + focused/lightweight validation, còn manual Windows acceptance theo tài liệu từng phase. Phase 6.3+ chưa triển khai. Sau snapshot 6.1, product IA được chốt lại: installed-store top-level navigation là **Tổng quan / Cấu hình / Hệ thống**; **Chẩn đoán** chuyển thành chức năng bên trong Hệ thống. Đây là target cho mọi UI change tiếp theo; acceptance lịch sử của 5.1 vẫn ghi đúng shell đã chạy lúc đó. Trước code mỗi milestone, bổ sung spec phase với wireframe success/loading/error, contract native cần dùng và acceptance theo [UI-UX.md](UI-UX.md). Tái sử dụng runtime/provisioning hiện có; không viết lại backend chỉ để đổi giao diện.
 
 ### Phase 5.1 — Khung giao diện và điều hướng
 
@@ -255,6 +255,8 @@ Hiển thị component health cho Database / PHP / WordPress / WooCommerce / Cof
 ### Phase 6.2 — Hiệu năng runtime và độ mượt
 
 Đưa lifecycle/readiness/health I/O khỏi Tauri UI thread; tách fast runtime status khỏi application-health probe; bật OPcache; thay serving path POS single-process `php -S` bằng local web-serving/FastCGI worker model có concurrency và được Desktop pin/quản lý. Giữ loopback/dynamic port, machine-health, provisioning, Phase 5.6 admission/drain và Windows Job Object semantics. **Done khi** app vẫn phản hồi trong start/restart, status poll không tự tạo WordPress request, OPcache active, benchmark cùng máy cải thiện rõ ràng và 4 request động concurrent không còn serialize gần tuyến tính. Xem [PHASE-06.2.md](PHASE-06.2.md).
+
+**Đã triển khai 2026-09-19, chờ manual acceptance:** runtime Windows development pin Caddy 2.11.4 và dùng một PHP 8.4.25 NTS `php-cgi` master với 4 FastCGI workers; Caddy serve static/uploads, proxy PHP trên private loopback và graceful-drain qua admin loopback động. OPcache được bật và readiness HTTP kiểm trực tiếp web SAPI. `get_runtime_info` trở thành fast process/cached-health snapshot; cron + application health chuyển sang maintenance riêng; lifecycle/diagnostics/close shutdown blocking work chạy ngoài Tauri UI thread. Disposable-store lifecycle smoke pass, không orphan. Warm dynamic benchmark đạt p50 134 ms/p95 140 ms; 4 sequential 537 ms vs 4 parallel 144 ms; static p50 <1 ms/p95 1 ms. Automated checks pass; resize/navigation/repaint trong lúc auto-start/restart để người dùng manual smoke-test. Xem [PHASE-06.2.md](PHASE-06.2.md).
 
 ### Phase 6.3 — Repair flow
 
@@ -336,4 +338,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6** và **Phase 6.1** đã triển khai, pass lightweight automated validation và còn manual acceptance. Mốc implementation tiếp theo là **Phase 6.2 — Hiệu năng runtime và độ mượt**.
+Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6**, **Phase 6.1** và **Phase 6.2** đã triển khai, pass focused/lightweight automated validation và còn manual acceptance. Mốc implementation tiếp theo sau acceptance này là **Phase 6.3 — Repair flow**.

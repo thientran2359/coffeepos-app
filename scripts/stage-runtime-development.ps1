@@ -57,6 +57,7 @@ function Get-PinnedArchive {
 }
 
 $phpArchive = Get-PinnedArchive -Component $manifest.php
+$caddyArchive = Get-PinnedArchive -Component $manifest.web_server
 $mariaArchive = Get-PinnedArchive -Component $manifest.mariadb
 
 if (Test-Path -LiteralPath $extractRoot) {
@@ -65,13 +66,27 @@ if (Test-Path -LiteralPath $extractRoot) {
 New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
 
 $phpExtract = Join-Path $extractRoot 'php'
+$caddyExtract = Join-Path $extractRoot 'caddy'
 $mariaExtract = Join-Path $extractRoot 'mariadb'
 Expand-Archive -LiteralPath $phpArchive -DestinationPath $phpExtract
+Expand-Archive -LiteralPath $caddyArchive -DestinationPath $caddyExtract
 Expand-Archive -LiteralPath $mariaArchive -DestinationPath $mariaExtract
 
 $mariaSourceRoot = Join-Path $mariaExtract "mariadb-$($manifest.mariadb.version)-winx64"
 if (-not (Test-Path -LiteralPath (Join-Path $phpExtract 'php.exe'))) {
     throw 'PHP archive did not contain php.exe at the expected root.'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $phpExtract 'php-cgi.exe'))) {
+    throw 'PHP archive did not contain php-cgi.exe at the expected root.'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $phpExtract 'ext/php_opcache.dll'))) {
+    throw 'PHP archive did not contain ext/php_opcache.dll.'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $caddyExtract 'caddy.exe'))) {
+    throw 'Caddy archive did not contain caddy.exe at the expected root.'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $caddyExtract 'LICENSE'))) {
+    throw 'Caddy archive did not contain LICENSE at the expected root.'
 }
 if (-not (Test-Path -LiteralPath (Join-Path $mariaSourceRoot 'bin/mariadbd.exe'))) {
     throw 'MariaDB archive did not contain the expected winx64 directory layout.'
@@ -82,11 +97,18 @@ if (Test-Path -LiteralPath $stageRoot) {
 }
 New-Item -ItemType Directory -Force -Path $stageRoot | Out-Null
 Move-Item -LiteralPath $phpExtract -Destination (Join-Path $stageRoot 'php')
+Move-Item -LiteralPath $caddyExtract -Destination (Join-Path $stageRoot 'caddy')
 Move-Item -LiteralPath $mariaSourceRoot -Destination (Join-Path $stageRoot 'mariadb')
 $phpExtDir = (Join-Path $stageRoot 'php/ext').Replace('\', '/')
 $phpIni = (Get-Content -LiteralPath (Join-Path $templateRoot 'php.ini') -Raw).Replace('__COFFEEPOS_PHP_EXT_DIR__', $phpExtDir)
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [IO.File]::WriteAllText((Join-Path $stageRoot 'php/php.ini'), $phpIni, $utf8NoBom)
+$phpExecutable = Join-Path $stageRoot 'php/php.exe'
+$phpIniPath = Join-Path $stageRoot 'php/php.ini'
+$phpModules = & $phpExecutable -c $phpIniPath -m
+if ($LASTEXITCODE -ne 0 -or -not ($phpModules -match 'Zend OPcache')) {
+    throw 'Staged PHP did not load Zend OPcache from the managed php.ini.'
+}
 Copy-Item -LiteralPath (Join-Path $templateRoot 'fixture') -Destination (Join-Path $stageRoot 'fixture') -Recurse
 Copy-Item -LiteralPath $manifestTemplate -Destination (Join-Path $stageRoot 'manifest.json')
 
@@ -94,4 +116,6 @@ Remove-Item -LiteralPath $extractRoot -Recurse -Force
 
 Write-Host "Staged development runtime: $stageRoot"
 Write-Host "PHP:     $(Join-Path $stageRoot $manifest.php.executable)"
+Write-Host "PHP CGI: $(Join-Path $stageRoot $manifest.php.cgi)"
+Write-Host "Caddy:   $(Join-Path $stageRoot $manifest.web_server.executable)"
 Write-Host "MariaDB: $(Join-Path $stageRoot $manifest.mariadb.server)"

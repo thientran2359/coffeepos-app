@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "target": "x86_64-pc-windows-msvc",
-  "runtime_version": "2026-09-17.windows-dev.1",
+  "runtime_version": "2026-09-19.windows-dev.2",
   "php": {
     "version": "8.4.25",
     "archive": "php-8.4.25-nts-Win32-vs17-x64.zip",
@@ -11,7 +11,18 @@
     "license": "PHP-3.01",
     "license_file": "php/license.txt",
     "executable": "php/php.exe",
+    "cgi": "php/php-cgi.exe",
     "ini": "php/php.ini"
+  },
+  "web_server": {
+    "version": "2.11.4",
+    "archive": "caddy_2.11.4_windows_amd64.zip",
+    "source": "https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_windows_amd64.zip",
+    "checksum_source": "https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_checksums.txt",
+    "archive_sha256": "1708333f79e274c7697285afe6d592ab39314e0b131e9ec6bea08ad27df62ebf",
+    "license": "Apache-2.0",
+    "license_file": "caddy/LICENSE",
+    "executable": "caddy/caddy.exe"
   },
   "mariadb": {
     "version": "11.4.13",

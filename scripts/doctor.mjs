@@ -25,5 +25,20 @@ if (process.platform === "win32") {
   console.log("This project targets Windows and macOS; other platforms are not qualified.");
   missing = true;
 }
-console.log("PHP/MariaDB are not required for Phase 1 and are never resolved from PATH by the app.");
+const stagedRuntime = join(process.cwd(), "runtime", "development", "x86_64-pc-windows-msvc");
+const stagedPhp = join(stagedRuntime, "php", "php.exe");
+const stagedPhpCgi = join(stagedRuntime, "php", "php-cgi.exe");
+const stagedCaddy = join(stagedRuntime, "caddy", "caddy.exe");
+const stagedIni = join(stagedRuntime, "php", "php.ini");
+if (existsSync(stagedPhp) && existsSync(stagedIni)) {
+  const modules = spawnSync(stagedPhp, ["-c", stagedIni, "-m"], { encoding: "utf8", shell: false });
+  const opcache = modules.status === 0 && modules.stdout.includes("Zend OPcache");
+  const fastCgi = existsSync(stagedPhpCgi);
+  const caddy = existsSync(stagedCaddy);
+  console.log(`Managed runtime: FastCGI=${fastCgi ? "OK" : "MISSING"}, OPcache=${opcache ? "OK" : "MISSING"}, Caddy=${caddy ? "OK" : "MISSING"}`);
+  missing ||= !fastCgi || !opcache || !caddy;
+} else {
+  console.log("Managed runtime: not staged (run scripts/stage-runtime-development.ps1 when runtime work is needed).");
+}
+console.log("PHP/MariaDB/Caddy are never resolved from PATH by the app.");
 process.exitCode = missing ? 1 : 0;

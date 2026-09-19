@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 const LOOPBACK: &str = "127.0.0.1";
-const MANIFEST_SCHEMA_VERSION: u32 = 1;
+const MANIFEST_SCHEMA_VERSION: u32 = 2;
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_LOG_CHUNK_BYTES: usize = 8192;
 const PORT_ATTEMPTS: usize = 3;
@@ -24,28 +24,22 @@ pub(crate) const DATABASE_WORDPRESS_SECRET: &str = "config/database-wordpress.se
 pub(crate) const MACHINE_TOKEN_SECRET: &str = "config/machine-token.secret";
 pub(crate) const MACHINE_TOKEN_PENDING_SECRET: &str = "config/machine-token.pending.secret";
 const COFFEEPOS_HEALTH_SCHEMA_VERSION: u32 = 1;
-const COFFEEPOS_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
+const COFFEEPOS_HEALTH_INTERVAL: Duration = Duration::from_secs(15);
+const PHP_FASTCGI_WORKERS: usize = 4;
 const REQUEST_DRAIN_MARKER: &str = "config/runtime-draining.flag";
-const RUNTIME_ROUTER_WRAPPER: &str = r#"<?php
+const RUNTIME_PREPEND_GATE: &str = r#"<?php
 $marker = getenv('COFFEEPOS_DRAIN_MARKER');
 $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 $requestPath = rawurldecode($requestPath);
-$local = getcwd() . DIRECTORY_SEPARATOR . ltrim(str_replace('/', DIRECTORY_SEPARATOR, $requestPath), DIRECTORY_SEPARATOR);
 $isDrainProbe = str_starts_with($requestPath, '/.coffeepos-runtime-health-')
-    && str_ends_with($requestPath, '.php')
-    && is_file($local);
+    && str_ends_with($requestPath, '.php');
 if ($marker && is_file($marker) && !$isDrainProbe) {
     http_response_code(503);
     header('Retry-After: 1');
     header('Connection: close');
     echo 'CoffeePOS is shutting down';
-    return true;
+    exit;
 }
-$managedRouter = getenv('COFFEEPOS_MANAGED_ROUTER');
-if ($managedRouter && is_file($managedRouter)) {
-    return require $managedRouter;
-}
-return false;
 "#;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -159,15 +153,24 @@ pub struct RuntimeInfo {
     pub state: RuntimeState,
     pub runtime_version: Option<String>,
     pub php_version: Option<String>,
+    pub web_server_version: Option<String>,
     pub mariadb_version: Option<String>,
     pub database_port: Option<u16>,
     pub http_port: Option<u16>,
     pub database_pid: Option<u32>,
     pub php_pid: Option<u32>,
+    pub web_server_pid: Option<u32>,
     pub wordpress_health: WordPressHealthState,
     pub wordpress_error: Option<RuntimeErrorInfo>,
     pub coffeepos_health: CoffeePosHealthInfo,
     pub last_error: Option<RuntimeErrorInfo>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BackgroundHealthProbe {
+    data_root: PathBuf,
+    http_port: u16,
+    generation: u64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -232,6 +235,7 @@ struct DevelopmentManifest {
     target: String,
     runtime_version: String,
     php: PhpManifest,
+    web_server: WebServerManifest,
     mariadb: MariaDbManifest,
     http_fixture: HttpFixtureManifest,
 }
@@ -242,7 +246,21 @@ struct PhpManifest {
     version: String,
     archive: String,
     executable: PathBuf,
+    cgi: PathBuf,
     ini: PathBuf,
+    source: String,
+    checksum_source: String,
+    archive_sha256: String,
+    license: String,
+    license_file: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebServerManifest {
+    version: String,
+    archive: String,
+    executable: PathBuf,
     source: String,
     checksum_source: String,
     archive_sha256: String,
@@ -278,7 +296,10 @@ pub struct ResolvedRuntime {
     pub(crate) runtime_version: String,
     pub(crate) php_version: String,
     pub(crate) php_executable: PathBuf,
+    pub(crate) php_cgi_executable: PathBuf,
     pub(crate) php_ini: PathBuf,
+    pub(crate) web_server_version: String,
+    pub(crate) web_server_executable: PathBuf,
     pub(crate) mariadb_version: String,
     pub(crate) mariadb_executable: PathBuf,
     pub(crate) mariadb_client_executable: PathBuf,
@@ -377,8 +398,11 @@ pub struct RuntimeManager {
     state: RuntimeState,
     database_port: Option<u16>,
     http_port: Option<u16>,
+    web_server_admin_port: Option<u16>,
     database: Option<ManagedChild>,
+    web_server: Option<ManagedChild>,
     php: Option<ManagedChild>,
+    php_fastcgi_port: Option<u16>,
     cron: Option<ManagedChild>,
     last_cron_spawn: Option<Instant>,
     php_probe: Option<PathBuf>,
@@ -386,6 +410,7 @@ pub struct RuntimeManager {
     wordpress_error: Option<RuntimeErrorInfo>,
     coffeepos_health: CoffeePosHealthInfo,
     last_coffeepos_probe: Option<Instant>,
+    instance_generation: u64,
     log_lock: Arc<Mutex<()>>,
     last_error: Option<RuntimeErrorInfo>,
     timeouts: RuntimeTimeouts,
@@ -423,8 +448,11 @@ impl RuntimeManager {
             state,
             database_port: None,
             http_port: None,
+            web_server_admin_port: None,
             database: None,
+            web_server: None,
             php: None,
+            php_fastcgi_port: None,
             cron: None,
             last_cron_spawn: None,
             php_probe: None,
@@ -432,6 +460,7 @@ impl RuntimeManager {
             wordpress_error: None,
             coffeepos_health: CoffeePosHealthInfo::unavailable(),
             last_coffeepos_probe: None,
+            instance_generation: 0,
             log_lock: Arc::new(Mutex::new(())),
             last_error: None,
             timeouts: RuntimeTimeouts::default(),
@@ -461,11 +490,13 @@ impl RuntimeManager {
             state: self.state.clone(),
             runtime_version: Some(self.runtime.runtime_version.clone()),
             php_version: Some(self.runtime.php_version.clone()),
+            web_server_version: Some(self.runtime.web_server_version.clone()),
             mariadb_version: Some(self.runtime.mariadb_version.clone()),
             database_port: self.database_port,
             http_port: self.http_port,
             database_pid: self.database.as_ref().map(ManagedChild::id),
             php_pid: self.php.as_ref().map(ManagedChild::id),
+            web_server_pid: self.web_server.as_ref().map(ManagedChild::id),
             wordpress_health: self.wordpress_health.clone(),
             wordpress_error: self.wordpress_error.clone(),
             coffeepos_health: self.coffeepos_health.clone(),
@@ -477,21 +508,34 @@ impl RuntimeManager {
         (self.runtime.clone(), self.data_root.clone())
     }
 
+    fn has_php_workers(&self) -> bool {
+        self.php.is_some()
+    }
+
+    fn has_managed_children(&self) -> bool {
+        self.database.is_some()
+            || self.web_server.is_some()
+            || self.has_php_workers()
+            || self.cron.is_some()
+    }
+
     pub fn refresh(&mut self) -> RuntimeInfo {
         self.refresh_cron_child();
         if self.state == RuntimeState::Stopping {
             let database_error = reap_finished_child(&mut self.database, "database");
+            let web_server_error = reap_finished_child(&mut self.web_server, "web server");
             let php_error = reap_finished_child(&mut self.php, "php");
-            if let Some(error) = database_error.or(php_error) {
+            if let Some(error) = database_error.or(web_server_error).or(php_error) {
                 self.last_error = Some(error);
             }
         }
         if self.state == RuntimeState::Running {
             let database_exit = child_exit(&mut self.database, "database");
+            let web_server_exit = child_exit(&mut self.web_server, "web server");
             let php_exit = child_exit(&mut self.php, "php");
-            if let Some(error) = database_exit.or(php_exit) {
+            if let Some(error) = database_exit.or(web_server_exit).or(php_exit) {
                 let cleanup_error = self.cleanup_started().err();
-                self.state = if self.database.is_some() || self.php.is_some() {
+                self.state = if self.has_managed_children() {
                     RuntimeState::Stopping
                 } else {
                     RuntimeState::Stopped
@@ -499,8 +543,10 @@ impl RuntimeManager {
                 if self.database.is_none() {
                     self.database_port = None;
                 }
-                if self.php.is_none() {
+                if !self.has_php_workers() && self.web_server.is_none() {
                     self.http_port = None;
+                    self.php_fastcgi_port = None;
+                    self.web_server_admin_port = None;
                 }
                 self.last_error = Some(cleanup_error.unwrap_or(error));
                 self.wordpress_health = WordPressHealthState::Unavailable;
@@ -508,20 +554,7 @@ impl RuntimeManager {
                 self.clear_coffeepos_health();
                 self.log_event("runtime child exited unexpectedly");
             }
-            if self.state == RuntimeState::Running {
-                if let Err(error) = self.maybe_spawn_wordpress_cron(false) {
-                    self.log_event(&format!("wordpress cron spawn failed: {error}"));
-                }
-                if self.wordpress_health == WordPressHealthState::Healthy
-                    && self
-                        .last_coffeepos_probe
-                        .map(|instant| instant.elapsed() >= COFFEEPOS_HEALTH_INTERVAL)
-                        .unwrap_or(true)
-                {
-                    self.refresh_coffeepos_health();
-                }
-            }
-        } else if self.database.is_none() && self.php.is_none() && self.cron.is_none() {
+        } else if !self.has_managed_children() {
             self.state = if installation_ready(&self.data_root) {
                 RuntimeState::Stopped
             } else {
@@ -620,13 +653,16 @@ impl RuntimeManager {
                         if self.database.is_none() {
                             self.database_port = None;
                         }
-                        if self.php.is_none() {
+                        if !self.has_php_workers() && self.web_server.is_none() {
                             self.http_port = None;
+                            self.php_fastcgi_port = None;
+                            self.web_server_admin_port = None;
                         }
                         last_error = Some(cleanup_error.unwrap_or(error));
                         break;
                     }
                     self.state = RuntimeState::Running;
+                    self.instance_generation = self.instance_generation.wrapping_add(1);
                     self.last_error = None;
                     if check_wordpress_health {
                         self.refresh_wordpress_health();
@@ -645,11 +681,13 @@ impl RuntimeManager {
                     if self.database.is_none() {
                         self.database_port = None;
                     }
-                    if self.php.is_none() {
+                    if !self.has_php_workers() && self.web_server.is_none() {
                         self.http_port = None;
+                        self.php_fastcgi_port = None;
+                        self.web_server_admin_port = None;
                     }
                     last_error = Some(cleanup_error.unwrap_or(error));
-                    if self.database.is_some() || self.php.is_some() {
+                    if self.has_managed_children() {
                         break;
                     }
                     if !retryable {
@@ -660,7 +698,7 @@ impl RuntimeManager {
             }
         }
 
-        self.state = if self.database.is_some() || self.php.is_some() {
+        self.state = if self.has_managed_children() {
             RuntimeState::Stopping
         } else {
             RuntimeState::Stopped
@@ -682,7 +720,11 @@ impl RuntimeManager {
     }
 
     pub(crate) fn refresh_wordpress_health(&mut self) -> RuntimeInfo {
-        if self.state != RuntimeState::Running || self.php.is_none() || self.database.is_none() {
+        if self.state != RuntimeState::Running
+            || !self.has_php_workers()
+            || self.web_server.is_none()
+            || self.database.is_none()
+        {
             self.wordpress_health = WordPressHealthState::Unavailable;
             self.wordpress_error = None;
             self.clear_coffeepos_health();
@@ -718,7 +760,8 @@ impl RuntimeManager {
     pub(crate) fn refresh_coffeepos_health(&mut self) -> RuntimeInfo {
         if self.state != RuntimeState::Running
             || self.wordpress_health != WordPressHealthState::Healthy
-            || self.php.is_none()
+            || !self.has_php_workers()
+            || self.web_server.is_none()
             || self.database.is_none()
         {
             self.clear_coffeepos_health();
@@ -736,6 +779,67 @@ impl RuntimeManager {
         };
         self.last_coffeepos_probe = Some(Instant::now());
         self.coffeepos_health = probe_coffeepos_health(&self.data_root, http_port);
+        match self.coffeepos_health.state {
+            CoffeePosHealthState::Healthy => self.log_event("coffeepos application healthy"),
+            CoffeePosHealthState::Degraded => self.log_event("coffeepos application degraded"),
+            CoffeePosHealthState::Failed => self.log_event("coffeepos application health failed"),
+            CoffeePosHealthState::Unavailable | CoffeePosHealthState::Checking => {}
+        }
+        self.info()
+    }
+
+    pub(crate) fn prepare_background_maintenance(
+        &mut self,
+    ) -> (RuntimeInfo, Option<BackgroundHealthProbe>) {
+        let runtime = self.refresh();
+        if runtime.state != RuntimeState::Running {
+            return (runtime, None);
+        }
+        if let Err(error) = self.maybe_spawn_wordpress_cron(false) {
+            self.log_event(&format!("wordpress cron spawn failed: {error}"));
+        }
+        if self.wordpress_health != WordPressHealthState::Healthy {
+            return (self.info(), None);
+        }
+        let due = self
+            .last_coffeepos_probe
+            .map(|instant| instant.elapsed() >= COFFEEPOS_HEALTH_INTERVAL)
+            .unwrap_or(true);
+        if !due {
+            return (self.info(), None);
+        }
+        let Some(http_port) = self.http_port else {
+            return (self.info(), None);
+        };
+        self.last_coffeepos_probe = Some(Instant::now());
+        let probe = BackgroundHealthProbe {
+            data_root: self.data_root.clone(),
+            http_port,
+            generation: self.instance_generation,
+        };
+        (self.info(), Some(probe))
+    }
+
+    pub(crate) fn run_background_health_probe(
+        probe: &BackgroundHealthProbe,
+    ) -> CoffeePosHealthInfo {
+        probe_coffeepos_health(&probe.data_root, probe.http_port)
+    }
+
+    pub(crate) fn commit_background_health(
+        &mut self,
+        probe: &BackgroundHealthProbe,
+        health: CoffeePosHealthInfo,
+    ) -> RuntimeInfo {
+        let runtime = self.refresh();
+        if runtime.state != RuntimeState::Running
+            || self.wordpress_health != WordPressHealthState::Healthy
+            || self.instance_generation != probe.generation
+            || self.http_port != Some(probe.http_port)
+        {
+            return runtime;
+        }
+        self.coffeepos_health = health;
         match self.coffeepos_health.state {
             CoffeePosHealthState::Healthy => self.log_event("coffeepos application healthy"),
             CoffeePosHealthState::Degraded => self.log_event("coffeepos application degraded"),
@@ -985,9 +1089,7 @@ impl RuntimeManager {
     pub fn stop(&mut self) -> Result<RuntimeInfo, RuntimeErrorInfo> {
         self.refresh();
         if (self.state == RuntimeState::NotInstalled || self.state == RuntimeState::Stopped)
-            && self.database.is_none()
-            && self.php.is_none()
-            && self.cron.is_none()
+            && !self.has_managed_children()
         {
             return Ok(self.info());
         }
@@ -1000,12 +1102,7 @@ impl RuntimeManager {
             ));
         }
 
-        let drain_gate_active = if self.php.is_some() {
-            self.begin_request_drain()?;
-            true
-        } else {
-            false
-        };
+        let mut drain_gate_active = false;
         self.state = RuntimeState::Stopping;
         self.wordpress_health = WordPressHealthState::Unavailable;
         self.wordpress_error = None;
@@ -1022,9 +1119,24 @@ impl RuntimeManager {
         }
 
         self.drain_php_requests();
+        if self.web_server.is_some() && !drain_gate_active {
+            match self.begin_request_drain() {
+                Ok(()) => drain_gate_active = true,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(web_server) = self.web_server.as_mut() {
+            if let Err(error) = web_server.terminate("web server", self.timeouts.stop) {
+                failure.get_or_insert(error);
+            } else {
+                self.web_server = None;
+            }
+        }
         if let Some(php) = self.php.as_mut() {
             if let Err(error) = php.terminate("php", self.timeouts.stop) {
-                failure = Some(error);
+                failure.get_or_insert(error);
             } else {
                 self.php = None;
             }
@@ -1047,17 +1159,19 @@ impl RuntimeManager {
         if self.database.is_none() {
             self.database_port = None;
         }
-        if self.php.is_none() {
+        if !self.has_php_workers() && self.web_server.is_none() {
             self.http_port = None;
+            self.php_fastcgi_port = None;
+            self.web_server_admin_port = None;
         }
-        self.state = if self.database.is_some() || self.php.is_some() || self.cron.is_some() {
+        self.state = if self.has_managed_children() {
             RuntimeState::Stopping
         } else if installation_ready(&self.data_root) {
             RuntimeState::Stopped
         } else {
             RuntimeState::NotInstalled
         };
-        if drain_gate_active && self.php.is_none() {
+        if drain_gate_active && !self.has_php_workers() && self.web_server.is_none() {
             if let Err(error) = self.clear_request_drain_marker() {
                 failure.get_or_insert(error);
             }
@@ -1076,9 +1190,7 @@ impl RuntimeManager {
     }
 
     pub fn requires_exit_confirmation(&self) -> bool {
-        self.database.is_some()
-            || self.php.is_some()
-            || self.cron.is_some()
+        self.has_managed_children()
             || matches!(
                 self.state,
                 RuntimeState::Installing
@@ -1091,12 +1203,12 @@ impl RuntimeManager {
     fn wait_wordpress_ready(&mut self, port: u16) -> Result<(), RuntimeErrorInfo> {
         let deadline = Instant::now() + self.timeouts.wordpress_readiness;
         loop {
-            if child_finished(&mut self.php, "php", "WordPress health")? {
+            if self.web_stack_finished("WordPress health")? {
                 return Err(error_info(
                     "wordpress",
                     "health",
-                    "PHP exited before WordPress health could be verified.",
-                    "Inspect logs/php.log, restart the runtime, and retry the WordPress health check.",
+                    "The web/PHP serving stack exited before WordPress health could be verified.",
+                    "Inspect logs/web-server.log and logs/php.log, restart the runtime, and retry the WordPress health check.",
                 ));
             }
             if wordpress_http_probe(port) {
@@ -1142,13 +1254,39 @@ impl RuntimeManager {
         self.wait_database_ready(database_port)?;
         self.log_event("database ready");
 
+        let prepend_gate = self.prepare_runtime_prepend_gate()?;
+        let fastcgi_port = choose_runtime_port(None, &[database_port, http_port])?;
+        let web_server_admin_port =
+            choose_runtime_port(None, &[database_port, http_port, fastcgi_port])?;
+        self.php_fastcgi_port = Some(fastcgi_port);
+        self.web_server_admin_port = Some(web_server_admin_port);
+        let database_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+            .map_err(|error| {
+                error_info(
+                    "php",
+                    "load database credential",
+                    error,
+                    "Run provisioning repair with the same Windows user profile, then retry.",
+                )
+            })?;
+        self.php = Some(self.spawn_php_worker(
+            fastcgi_port,
+            http_port,
+            &prepend_gate,
+            &database_password,
+        )?);
+        self.wait_fastcgi_workers_ready()?;
+        self.log_event("php fastcgi workers ready");
+
+        let web_server_config =
+            self.prepare_web_server_config(http_port, web_server_admin_port, fastcgi_port)?;
+        self.web_server = Some(self.spawn_web_server(&web_server_config)?);
         let nonce = probe_nonce();
         let probe_name = self.write_php_probe(&nonce)?;
-        self.php = Some(self.spawn_php(http_port)?);
         let readiness = self.wait_http_ready(http_port, &probe_name, &nonce);
         self.remove_php_probe();
         readiness?;
-        self.log_event("php http ready");
+        self.log_event("concurrent http runtime ready");
         Ok(())
     }
 
@@ -1205,10 +1343,14 @@ impl RuntimeManager {
         self.spawn_logged(command, "database", "database.log")
     }
 
-    fn spawn_php(&self, port: u16) -> Result<ManagedChild, RuntimeErrorInfo> {
+    fn spawn_php_worker(
+        &self,
+        worker_port: u16,
+        http_port: u16,
+        prepend_gate: &Path,
+        database_password: &str,
+    ) -> Result<ManagedChild, RuntimeErrorInfo> {
         let site = self.data_root.join("site");
-        let runtime_router = self.prepare_runtime_router_wrapper()?;
-        let managed_router = self.data_root.join("config/wordpress-router.php");
         let database_port = self.database_port.ok_or_else(|| {
             error_info(
                 "php",
@@ -1217,42 +1359,68 @@ impl RuntimeManager {
                 "Restart the runtime so MariaDB can be started before PHP.",
             )
         })?;
-        let database_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
-            .map_err(|error| {
-                error_info(
-                    "php",
-                    "load database credential",
-                    error,
-                    "Run provisioning repair with the same Windows user profile, then retry.",
-                )
-            })?;
-        let mut command = Command::new(&self.runtime.php_executable);
+        let mut command = Command::new(&self.runtime.php_cgi_executable);
         command
             .arg("-c")
             .arg(&self.runtime.php_ini)
-            .arg("-S")
-            .arg(format!("{LOOPBACK}:{port}"))
-            .arg("-t")
-            .arg(&site)
+            .arg("-d")
+            .arg(format!(
+                "auto_prepend_file=\"{}\"",
+                caddy_path(prepend_gate)
+            ))
+            .arg("-b")
+            .arg(format!("{LOOPBACK}:{worker_port}"))
             .env_remove("PHPRC")
             .env("PHP_INI_SCAN_DIR", "")
             .env_remove("PHP_CLI_SERVER_WORKERS")
+            .env("PHP_FCGI_CHILDREN", PHP_FASTCGI_WORKERS.to_string())
+            .env("PHP_FCGI_MAX_REQUESTS", "500")
+            .env("FCGI_WEB_SERVER_ADDRS", LOOPBACK)
             .env("COFFEEPOS_DB_PASSWORD", database_password)
             .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
-            .env("COFFEEPOS_SITE_URL", format!("http://{LOOPBACK}:{port}"))
+            .env(
+                "COFFEEPOS_SITE_URL",
+                format!("http://{LOOPBACK}:{http_port}"),
+            )
             .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
             .env(
                 "COFFEEPOS_DRAIN_MARKER",
                 self.data_root.join(REQUEST_DRAIN_MARKER),
             )
-            .current_dir(&site)
-            .arg(&runtime_router);
-        if managed_router.is_file() {
-            command.env("COFFEEPOS_MANAGED_ROUTER", managed_router);
-        } else {
-            command.env_remove("COFFEEPOS_MANAGED_ROUTER");
-        }
+            .current_dir(&site);
         self.spawn_logged(command, "php", "php.log")
+    }
+
+    fn spawn_web_server(&self, config: &Path) -> Result<ManagedChild, RuntimeErrorInfo> {
+        let caddy_data = self.data_root.join("config/caddy-data");
+        let caddy_config = self.data_root.join("config/caddy-config");
+        fs::create_dir_all(&caddy_data).map_err(|error| {
+            error_info(
+                "web server",
+                "prepare runtime directories",
+                format!("Cannot create Caddy data directory: {error}."),
+                "Check application-data permissions and retry startup.",
+            )
+        })?;
+        fs::create_dir_all(&caddy_config).map_err(|error| {
+            error_info(
+                "web server",
+                "prepare runtime directories",
+                format!("Cannot create Caddy config directory: {error}."),
+                "Check application-data permissions and retry startup.",
+            )
+        })?;
+        let mut command = Command::new(&self.runtime.web_server_executable);
+        command
+            .arg("run")
+            .arg("--config")
+            .arg(config)
+            .arg("--adapter")
+            .arg("caddyfile")
+            .env("XDG_DATA_HOME", caddy_data)
+            .env("XDG_CONFIG_HOME", caddy_config)
+            .current_dir(&self.data_root);
+        self.spawn_logged(command, "web server", "web-server.log")
     }
 
     fn maybe_spawn_wordpress_cron(&mut self, force: bool) -> Result<(), RuntimeErrorInfo> {
@@ -1449,12 +1617,12 @@ impl RuntimeManager {
     ) -> Result<(), RuntimeErrorInfo> {
         let deadline = Instant::now() + self.timeouts.http_readiness;
         loop {
-            if child_finished(&mut self.php, "php", "readiness")? {
+            if self.web_stack_finished("readiness")? {
                 return Err(error_info(
                     "php",
                     "readiness",
-                    "PHP exited before the HTTP probe identified the expected runtime instance.",
-                    "Inspect logs/php.log and verify php.ini, the site directory, and the selected loopback port.",
+                    "The web/PHP serving stack exited before the HTTP probe identified the expected runtime instance.",
+                    "Inspect logs/web-server.log and logs/php.log, then verify the managed runtime bundle and selected loopback ports.",
                 ));
             }
             if http_probe(port, probe_name, nonce) {
@@ -1525,62 +1693,124 @@ impl RuntimeManager {
     }
 
     fn drain_php_requests(&mut self) {
-        if self.php.is_none() {
+        if self.web_server.is_none() {
             return;
         }
-        let Some(port) = self.http_port else {
-            self.log_event(
-                "php request drain probe unavailable: HTTP port missing; waiting full budget",
-            );
-            thread::sleep(self.timeouts.request_drain);
+        let Some(admin_port) = self.web_server_admin_port else {
+            self.log_event("web server graceful drain unavailable: admin port missing");
             return;
         };
-
-        let nonce = probe_nonce();
-        let probe_name = match self.write_php_probe(&nonce) {
-            Ok(name) => name,
+        if let Err(error) = request_caddy_stop(admin_port, self.timeouts.request_drain) {
+            self.log_event(&format!("web server graceful stop request failed: {error}"));
+            return;
+        }
+        let Some(web_server) = self.web_server.as_mut() else {
+            return;
+        };
+        match wait_for_child_exit(
+            &mut web_server.child,
+            self.timeouts.request_drain + Duration::from_secs(1),
+        ) {
+            Ok(_) => {
+                self.web_server = None;
+                self.log_event("web server graceful request drain complete");
+            }
             Err(_) => {
-                self.log_event("php request drain probe unavailable; waiting full budget");
-                thread::sleep(self.timeouts.request_drain);
-                return;
+                self.log_event("web server graceful drain timeout; forcing managed stop");
             }
-        };
-        let drained = match child_finished(&mut self.php, "php", "request drain") {
-            Ok(true) => true,
-            Ok(false) => {
-                http_probe_with_timeout(port, &probe_name, &nonce, self.timeouts.request_drain)
-            }
-            Err(_) => false,
-        };
-        self.remove_php_probe();
-        if drained {
-            self.log_event("php request drain complete");
-        } else {
-            self.log_event("php request drain timeout; forcing managed PHP stop");
         }
     }
 
-    fn prepare_runtime_router_wrapper(&self) -> Result<PathBuf, RuntimeErrorInfo> {
+    fn prepare_runtime_prepend_gate(&self) -> Result<PathBuf, RuntimeErrorInfo> {
         let config_dir = self.data_root.join("config");
         fs::create_dir_all(&config_dir).map_err(|error| {
             error_info(
                 "php",
-                "prepare runtime router",
+                "prepare runtime admission gate",
                 format!("Cannot create the runtime config directory: {error}."),
                 "Check application-data permissions and free disk space, then retry startup.",
             )
         })?;
         self.clear_request_drain_marker()?;
-        let wrapper = config_dir.join("runtime-router.php");
-        fs::write(&wrapper, RUNTIME_ROUTER_WRAPPER.as_bytes()).map_err(|error| {
+        let gate = config_dir.join("runtime-prepend.php");
+        fs::write(&gate, RUNTIME_PREPEND_GATE.as_bytes()).map_err(|error| {
             error_info(
                 "php",
-                "prepare runtime router",
-                format!("Cannot write the managed PHP runtime router wrapper: {error}."),
+                "prepare runtime admission gate",
+                format!("Cannot write the managed PHP runtime admission gate: {error}."),
                 "Check application-data permissions and free disk space, then retry startup.",
             )
         })?;
-        Ok(wrapper)
+        Ok(gate)
+    }
+
+    fn prepare_web_server_config(
+        &self,
+        http_port: u16,
+        admin_port: u16,
+        fastcgi_port: u16,
+    ) -> Result<PathBuf, RuntimeErrorInfo> {
+        let config_dir = self.data_root.join("config");
+        fs::create_dir_all(&config_dir).map_err(|error| {
+            error_info(
+                "web server",
+                "prepare config",
+                format!("Cannot create runtime config directory: {error}."),
+                "Check application-data permissions and retry startup.",
+            )
+        })?;
+        let site = caddy_path(&self.data_root.join("site"));
+        let uploads = caddy_path(&self.data_root.join("uploads"));
+        let grace_millis = self.timeouts.request_drain.as_millis().max(1);
+        let contents = format!(
+            "{{\n    admin {LOOPBACK}:{admin_port}\n    persist_config off\n    auto_https off\n    grace_period {grace_millis}ms\n}}\n\nhttp://{LOOPBACK}:{http_port} {{\n    route {{\n        @blocked path_regexp blocked (?i)^/(wp-config\\.php|\\.env|composer\\.(?:json|lock)|\\.htaccess)$\n        respond @blocked 404\n\n        handle_path /wp-content/uploads/* {{\n            root * \"{uploads}\"\n            file_server\n        }}\n\n        root * \"{site}\"\n        php_fastcgi {LOOPBACK}:{fastcgi_port} {{\n            root \"{site}\"\n            capture_stderr\n        }}\n        file_server\n    }}\n}}\n"
+        );
+        let path = config_dir.join("runtime-Caddyfile");
+        fs::write(&path, contents.as_bytes()).map_err(|error| {
+            error_info(
+                "web server",
+                "prepare config",
+                format!("Cannot write the managed Caddy configuration: {error}."),
+                "Check application-data permissions and retry startup.",
+            )
+        })?;
+        Ok(path)
+    }
+
+    fn wait_fastcgi_workers_ready(&mut self) -> Result<(), RuntimeErrorInfo> {
+        let deadline = Instant::now() + self.timeouts.http_readiness;
+        loop {
+            if child_finished(&mut self.php, "php", "fastcgi readiness")? {
+                return Err(error_info(
+                    "php",
+                    "readiness",
+                    "A managed PHP FastCGI worker exited before the worker pool became ready.",
+                    "Inspect logs/php.log and verify php.ini and the managed FastCGI ports.",
+                ));
+            }
+            if self.php_fastcgi_port.is_some_and(loopback_port_listening) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(error_info(
+                    "php",
+                    "readiness",
+                    "PHP FastCGI workers did not bind all managed ports before the timeout.",
+                    "Inspect logs/php.log and verify the bundled php-cgi executable and managed runtime configuration.",
+                ));
+            }
+            thread::sleep(Duration::from_millis(75));
+        }
+    }
+
+    fn web_stack_finished(&mut self, operation: &str) -> Result<bool, RuntimeErrorInfo> {
+        if child_finished(&mut self.web_server, "web server", operation)? {
+            return Ok(true);
+        }
+        if child_finished(&mut self.php, "php", operation)? {
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn begin_request_drain(&self) -> Result<(), RuntimeErrorInfo> {
@@ -1628,9 +1858,16 @@ impl RuntimeManager {
                 self.cron = None;
             }
         }
+        if let Some(web_server) = self.web_server.as_mut() {
+            if let Err(error) = web_server.terminate("web server", self.timeouts.stop) {
+                failure.get_or_insert(error);
+            } else {
+                self.web_server = None;
+            }
+        }
         if let Some(php) = self.php.as_mut() {
             if let Err(error) = php.terminate("php", self.timeouts.stop) {
-                failure = Some(error);
+                failure.get_or_insert(error);
             } else {
                 self.php = None;
             }
@@ -1659,7 +1896,13 @@ impl RuntimeManager {
                 "Check application-data permissions and free disk space, then retry.",
             )
         })?;
-        for name in ["runtime.log", "database.log", "php.log", "cron.log"] {
+        for name in [
+            "runtime.log",
+            "database.log",
+            "php.log",
+            "web-server.log",
+            "cron.log",
+        ] {
             bound_existing_log(&logs.join(name))?;
         }
         Ok(())
@@ -1780,7 +2023,7 @@ impl RuntimeManager {
         let file_name = format!(".coffeepos-runtime-health-{nonce}.php");
         let path = self.data_root.join("site").join(&file_name);
         let body = format!(
-            "<?php header('Content-Type: text/plain'); echo '{}';\n",
+            "<?php header('Content-Type: text/plain'); if (!function_exists('opcache_get_status') || opcache_get_status(false) === false) {{ http_response_code(500); exit('opcache-disabled'); }} echo '{}';\n",
             nonce
         );
         let mut file = OpenOptions::new()
@@ -1875,6 +2118,12 @@ pub fn resolve_development_manifest(
         "PHP license file",
         Some(manifest_root),
     )?;
+    let _web_server_license = canonical_file_under(
+        &development_root,
+        &manifest.web_server.license_file,
+        "web server license file",
+        Some(manifest_root),
+    )?;
     let _mariadb_license = canonical_file_under(
         &development_root,
         &manifest.mariadb.license_file,
@@ -1909,10 +2158,23 @@ pub fn resolve_development_manifest(
             "PHP executable",
             Some(manifest_root),
         )?),
+        php_cgi_executable: command_compatible_path(canonical_file_under(
+            &development_root,
+            &manifest.php.cgi,
+            "PHP CGI executable",
+            Some(manifest_root),
+        )?),
         php_ini: command_compatible_path(canonical_file_under(
             &development_root,
             &manifest.php.ini,
             "php.ini",
+            Some(manifest_root),
+        )?),
+        web_server_version: manifest.web_server.version,
+        web_server_executable: command_compatible_path(canonical_file_under(
+            &development_root,
+            &manifest.web_server.executable,
+            "web server executable",
             Some(manifest_root),
         )?),
         mariadb_version: manifest.mariadb.version,
@@ -1949,6 +2211,10 @@ fn command_compatible_path(path: PathBuf) -> PathBuf {
         }
     }
     path
+}
+
+fn caddy_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 pub fn choose_loopback_port(excluded: &[u16]) -> Result<u16, RuntimeErrorInfo> {
@@ -1998,6 +2264,11 @@ fn loopback_port_available(port: u16) -> bool {
     TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_ok()
 }
 
+fn loopback_port_listening(port: u16) -> bool {
+    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok()
+}
+
 fn installation_ready(data_root: &Path) -> bool {
     data_root.join("database/mysql").is_dir()
         && data_root.join(DATABASE_RUNTIME_SECRET).is_file()
@@ -2028,6 +2299,15 @@ fn validate_manifest_metadata(manifest: &DevelopmentManifest) -> Result<(), Runt
         &manifest.php.source,
         &manifest.php.checksum_source,
         &manifest.php.license,
+    )?;
+    validate_artifact_metadata(
+        "web server",
+        &manifest.web_server.version,
+        &manifest.web_server.archive,
+        &manifest.web_server.archive_sha256,
+        &manifest.web_server.source,
+        &manifest.web_server.checksum_source,
+        &manifest.web_server.license,
     )?;
     validate_artifact_metadata(
         "MariaDB",
@@ -2293,6 +2573,33 @@ fn http_probe(port: u16, probe_name: &str, nonce: &str) -> bool {
     http_probe_with_timeout(port, probe_name, nonce, Duration::from_millis(500))
 }
 
+fn request_caddy_stop(port: u16, timeout: Duration) -> Result<(), RuntimeErrorInfo> {
+    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let mut stream =
+        TcpStream::connect_timeout(&address, Duration::from_millis(500)).map_err(|error| {
+            error_info(
+                "web server",
+                "graceful stop",
+                format!("Cannot connect to the managed Caddy admin endpoint: {error}."),
+                "The runtime manager will fall back to terminating the managed web server process.",
+            )
+        })?;
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_read_timeout(Some(timeout));
+    let request = format!(
+        "POST /stop HTTP/1.1\r\nHost: {LOOPBACK}:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).map_err(|error| {
+        error_info(
+            "web server",
+            "graceful stop",
+            format!("Cannot send the managed Caddy stop request: {error}."),
+            "The runtime manager will fall back to terminating the managed web server process.",
+        )
+    })?;
+    Ok(())
+}
+
 fn http_probe_with_timeout(
     port: u16,
     probe_name: &str,
@@ -2379,6 +2686,31 @@ fn wordpress_http_probe(port: u16) -> bool {
         }
     }
     wordpress_probe_response_healthy(&response)
+}
+
+#[cfg(test)]
+fn http_status_probe(port: u16, path: &str, expected_status: u16) -> bool {
+    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let request =
+        format!("GET {path} HTTP/1.0\r\nHost: {LOOPBACK}:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = [0_u8; 1024];
+    let Ok(count) = stream.read(&mut response) else {
+        return false;
+    };
+    if count == 0 {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&response[..count]);
+    text.starts_with(&format!("HTTP/1.0 {expected_status} "))
+        || text.starts_with(&format!("HTTP/1.1 {expected_status} "))
 }
 
 fn wordpress_probe_response_healthy(response: &[u8]) -> bool {
@@ -3085,53 +3417,74 @@ mod tests {
         fs::write(path, b"test").unwrap();
     }
 
-    fn manifest_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+    fn manifest_fixture(root: &Path) -> (PathBuf, PathBuf) {
         let development = root.join("runtime/development");
         let php = development.join("php/php-test");
+        let php_cgi = development.join("php/php-cgi-test");
         let php_ini = development.join("php/php.ini");
+        let web_server = development.join("caddy/caddy-test");
         let mariadb = development.join("mariadb/bin/mariadbd-test");
         let client = development.join("mariadb/bin/mariadb-test");
         let install_db = development.join("mariadb/bin/mariadb-install-db-test");
-        for path in [&php, &php_ini, &mariadb, &client, &install_db] {
+        for path in [
+            &php,
+            &php_cgi,
+            &php_ini,
+            &web_server,
+            &mariadb,
+            &client,
+            &install_db,
+        ] {
             touch(path);
         }
-        (development, php, php_ini, mariadb, client, install_db)
+        (development, php)
     }
 
-    fn write_manifest(
-        path: &Path,
-        php: &Path,
-        php_ini: &Path,
-        server: &Path,
-        client: &Path,
-        install_db: &Path,
-    ) {
+    fn write_manifest(path: &Path, php: &Path) {
         let root = path.parent().unwrap();
+        let php_cgi = root.join("php/php-cgi-test");
+        let php_ini = root.join("php/php.ini");
+        let web_server = root.join("caddy/caddy-test");
+        let server = root.join("mariadb/bin/mariadbd-test");
+        let client = root.join("mariadb/bin/mariadb-test");
+        let install_db = root.join("mariadb/bin/mariadb-install-db-test");
         touch(&root.join("php/license.txt"));
+        touch(&root.join("caddy/LICENSE"));
         touch(&root.join("mariadb/COPYING"));
         touch(&root.join("fixture/router.php"));
         fs::create_dir_all(root.join("fixture/site")).unwrap();
         let manifest = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "target": current_target_triple().unwrap(),
             "runtime_version": "test-runtime",
             "php": {
                 "version": "8.4-test",
                 "archive": "php-test.zip",
                 "executable": php,
-                "ini": php_ini,
+                "cgi": &php_cgi,
+                "ini": &php_ini,
                 "source": "test fixture",
                 "checksum_source": "test fixture checksum",
                 "archive_sha256": "a".repeat(64),
                 "license": "PHP-3.01",
                 "license_file": "php/license.txt"
             },
+            "web_server": {
+                "version": "2.11-test",
+                "archive": "caddy-test.zip",
+                "executable": &web_server,
+                "source": "test fixture",
+                "checksum_source": "test fixture checksum",
+                "archive_sha256": "c".repeat(64),
+                "license": "Apache-2.0",
+                "license_file": "caddy/LICENSE"
+            },
             "mariadb": {
                 "version": "11.4-test",
                 "archive": "mariadb-test.zip",
-                "server": server,
-                "client": client,
-                "install_db": install_db,
+                "server": &server,
+                "client": &client,
+                "install_db": &install_db,
                 "source": "test fixture",
                 "checksum_source": "test fixture checksum",
                 "archive_sha256": "b".repeat(64),
@@ -3154,9 +3507,9 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().canonicalize().unwrap();
-        let (development, php, php_ini, mariadb, client, install_db) = manifest_fixture(&project);
+        let (development, php) = manifest_fixture(&project);
         let manifest = development.join("manifest.json");
-        write_manifest(&manifest, &php, &php_ini, &mariadb, &client, &install_db);
+        write_manifest(&manifest, &php);
 
         let resolved = resolve_development_manifest(&project, &manifest).unwrap();
         assert_eq!(resolved.runtime_version, "test-runtime");
@@ -3171,18 +3524,11 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().canonicalize().unwrap();
-        let (development, _php, php_ini, mariadb, client, install_db) = manifest_fixture(&project);
+        let (development, _php) = manifest_fixture(&project);
         let escaped_php = project.join("outside-php");
         touch(&escaped_php);
         let manifest = development.join("manifest.json");
-        write_manifest(
-            &manifest,
-            &escaped_php,
-            &php_ini,
-            &mariadb,
-            &client,
-            &install_db,
-        );
+        write_manifest(&manifest, &escaped_php);
 
         let error = resolve_development_manifest(&project, &manifest).unwrap_err();
         assert!(error.message.contains("outside runtime/development"));
@@ -3195,16 +3541,9 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().canonicalize().unwrap();
-        let (development, _php, php_ini, mariadb, client, install_db) = manifest_fixture(&project);
+        let (development, _php) = manifest_fixture(&project);
         let manifest = development.join("manifest.json");
-        write_manifest(
-            &manifest,
-            Path::new("php/php-test"),
-            &php_ini,
-            &mariadb,
-            &client,
-            &install_db,
-        );
+        write_manifest(&manifest, Path::new("php/php-test"));
 
         let resolved = resolve_development_manifest(&project, &manifest).unwrap();
         assert!(resolved.php_executable.is_absolute());
@@ -3238,7 +3577,10 @@ mod tests {
             runtime_version: "test-runtime".into(),
             php_version: "test-php".into(),
             php_executable: executable.clone(),
+            php_cgi_executable: executable.clone(),
             php_ini: executable.clone(),
+            web_server_version: "test-web-server".into(),
+            web_server_executable: executable.clone(),
             mariadb_version: "test-db".into(),
             mariadb_executable: executable.clone(),
             mariadb_client_executable: executable.clone(),
@@ -3320,11 +3662,13 @@ mod tests {
             state: RuntimeState::Starting,
             runtime_version: Some("test-runtime".into()),
             php_version: Some("test-php".into()),
+            web_server_version: Some("test-web-server".into()),
             mariadb_version: Some("test-db".into()),
             database_port: Some(3307),
             http_port: Some(8081),
             database_pid: None,
             php_pid: None,
+            web_server_pid: None,
             wordpress_health: WordPressHealthState::Checking,
             wordpress_error: None,
             coffeepos_health: CoffeePosHealthInfo::unavailable(),
@@ -3350,11 +3694,13 @@ mod tests {
             state: RuntimeState::Stopped,
             runtime_version: Some("test-runtime".into()),
             php_version: Some("test-php".into()),
+            web_server_version: Some("test-web-server".into()),
             mariadb_version: Some("test-db".into()),
             database_port: None,
             http_port: None,
             database_pid: None,
             php_pid: None,
+            web_server_pid: None,
             wordpress_health: WordPressHealthState::Unavailable,
             wordpress_error: None,
             coffeepos_health: CoffeePosHealthInfo::unavailable(),
@@ -3628,11 +3974,11 @@ mod tests {
         let data = temp.path().canonicalize().unwrap();
         let manager = RuntimeManager::new(fake_runtime(), data.clone()).unwrap();
 
-        let wrapper = manager.prepare_runtime_router_wrapper().unwrap();
-        let wrapper_body = fs::read_to_string(wrapper).unwrap();
-        assert!(wrapper_body.contains("COFFEEPOS_DRAIN_MARKER"));
-        assert!(wrapper_body.contains("COFFEEPOS_MANAGED_ROUTER"));
-        assert!(wrapper_body.contains("503"));
+        let gate = manager.prepare_runtime_prepend_gate().unwrap();
+        let gate_body = fs::read_to_string(gate).unwrap();
+        assert!(gate_body.contains("COFFEEPOS_DRAIN_MARKER"));
+        assert!(gate_body.contains("503"));
+        assert!(gate_body.contains("exit"));
 
         manager.begin_request_drain().unwrap();
         assert!(data.join(REQUEST_DRAIN_MARKER).is_file());
@@ -3640,7 +3986,7 @@ mod tests {
         assert!(!data.join(REQUEST_DRAIN_MARKER).exists());
 
         fs::write(data.join(REQUEST_DRAIN_MARKER), b"stale\n").unwrap();
-        manager.prepare_runtime_router_wrapper().unwrap();
+        manager.prepare_runtime_prepend_gate().unwrap();
         assert!(!data.join(REQUEST_DRAIN_MARKER).exists());
     }
 
@@ -3681,5 +4027,79 @@ mod tests {
 
         let final_state = manager.stop().unwrap();
         assert_eq!(final_state.state, RuntimeState::Stopped);
+    }
+
+    #[test]
+    #[ignore = "requires staged Windows runtime and a disposable pre-provisioned datadir"]
+    fn staged_runtime_concurrent_http_smoke() {
+        let data = PathBuf::from(
+            std::env::var_os("COFFEEPOS_PHASE62_SMOKE_DATA")
+                .expect("COFFEEPOS_PHASE62_SMOKE_DATA must point to disposable test data"),
+        );
+        assert!(data.is_absolute());
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let project = manifest_dir.parent().unwrap().canonicalize().unwrap();
+        let manifest = project
+            .join("runtime/development")
+            .join(current_target_triple().unwrap())
+            .join("manifest.json");
+        let mut manager = RuntimeManager::from_development(&project, &manifest, data).unwrap();
+        let info = manager.start().unwrap();
+        assert_eq!(info.state, RuntimeState::Running);
+        let port = info.http_port.unwrap();
+
+        for _ in 0..2 {
+            assert!(wordpress_http_probe(port));
+        }
+
+        let mut sequential = Vec::new();
+        for _ in 0..8 {
+            let started = Instant::now();
+            assert!(wordpress_http_probe(port));
+            sequential.push(started.elapsed());
+        }
+        let four_sequential: Duration = sequential.iter().take(4).copied().sum();
+
+        let parallel_started = Instant::now();
+        let parallel_ok = thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|_| scope.spawn(|| wordpress_http_probe(port)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .all(|handle| handle.join().unwrap_or(false))
+        });
+        let parallel_wall = parallel_started.elapsed();
+
+        let static_path = "/wp-content/plugins/coffeepos/assets/js/app.js";
+        for _ in 0..2 {
+            assert!(http_status_probe(port, static_path, 200));
+        }
+        let mut static_samples = Vec::new();
+        for _ in 0..8 {
+            let started = Instant::now();
+            assert!(http_status_probe(port, static_path, 200));
+            static_samples.push(started.elapsed());
+        }
+        manager.stop().unwrap();
+
+        assert!(parallel_ok);
+        assert!(parallel_wall * 2 < four_sequential);
+
+        sequential.sort();
+        static_samples.sort();
+        let p50 = sequential[sequential.len() / 2];
+        let p95 = sequential[sequential.len() - 1];
+        let static_p50 = static_samples[static_samples.len() / 2];
+        let static_p95 = static_samples[static_samples.len() - 1];
+        eprintln!(
+            "phase6.2 benchmark dynamic_p50_ms={} dynamic_p95_ms={} four_sequential_ms={} four_parallel_ms={} static_p50_ms={} static_p95_ms={}",
+            p50.as_millis(),
+            p95.as_millis(),
+            four_sequential.as_millis(),
+            parallel_wall.as_millis(),
+            static_p50.as_millis(),
+            static_p95.as_millis()
+        );
     }
 }

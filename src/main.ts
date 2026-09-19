@@ -57,11 +57,13 @@ interface RuntimeInfo {
   state: "not_installed" | "installing" | "stopped" | "starting" | "running" | "stopping";
   runtime_version: string | null;
   php_version: string | null;
+  web_server_version: string | null;
   mariadb_version: string | null;
   database_port: number | null;
   http_port: number | null;
   database_pid: number | null;
   php_pid: number | null;
+  web_server_pid: number | null;
   wordpress_health: "unavailable" | "checking" | "healthy" | "unhealthy";
   wordpress_error: RuntimeErrorInfo | null;
   coffeepos_health: CoffeePosHealthInfo;
@@ -198,6 +200,8 @@ let homeActionKind: "start" | "retry_health" | "refresh" | "open_pos" | null = n
 let posOpenBusy = false;
 let bootstrapBusy = false;
 let diagnosticsBusy = false;
+let runtimeRefreshBusy = false;
+let runtimeMaintenanceBusy = false;
 let currentDiagnostics: HealthDiagnosticsInfo | null = null;
 
 function nativeErrorText(error: unknown): string {
@@ -837,6 +841,8 @@ async function refreshProvisioning(commandError?: string): Promise<boolean> {
 }
 
 async function refreshRuntime(): Promise<void> {
+  if (runtimeRefreshBusy) return;
+  runtimeRefreshBusy = true;
   try {
     runtimeLoadError = null;
     renderRuntime(await invoke<RuntimeInfo>("get_runtime_info"));
@@ -846,6 +852,20 @@ async function refreshRuntime(): Promise<void> {
     setTextIfChanged(runtimeDescription, runtimeLoadError);
     setRuntimeControls(null);
     renderHome();
+  } finally {
+    runtimeRefreshBusy = false;
+  }
+}
+
+async function refreshRuntimeMaintenance(): Promise<void> {
+  if (runtimeMaintenanceBusy || runtimeBusy || provisioningBusy || diagnosticsBusy) return;
+  runtimeMaintenanceBusy = true;
+  try {
+    renderRuntime(await invoke<RuntimeInfo>("refresh_runtime_maintenance"));
+  } catch {
+    // Normal status polling remains the user-visible fallback if maintenance is temporarily unavailable.
+  } finally {
+    runtimeMaintenanceBusy = false;
   }
 }
 
@@ -1124,5 +1144,11 @@ window.setInterval(() => {
     void refreshRuntime();
   }
 }, 2000);
+
+window.setInterval(() => {
+  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy) {
+    void refreshRuntimeMaintenance();
+  }
+}, 5000);
 
 void bootstrap();

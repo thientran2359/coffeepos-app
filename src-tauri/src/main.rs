@@ -27,7 +27,9 @@ struct ShellState {
     store: Mutex<Option<Store>>,
     runtime: Mutex<Option<RuntimeManager>>,
     lifecycle: Mutex<()>,
+    lifecycle_requested: AtomicBool,
     exit_authorized: AtomicBool,
+    shutdown_in_progress: AtomicBool,
     #[cfg(debug_assertions)]
     provisioning: Mutex<()>,
 }
@@ -272,6 +274,48 @@ fn try_lifecycle<'a>(state: &'a ShellState, operation: &str) -> Result<MutexGuar
     }
 }
 
+async fn run_runtime_blocking<T, F>(
+    app: tauri::AppHandle,
+    lifecycle_operation: &'static str,
+    operation: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut RuntimeManager) -> Result<T, runtime::RuntimeErrorInfo> + Send + 'static,
+{
+    let state = app.state::<ShellState>();
+    if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
+        return Err(format!(
+            "Runtime lifecycle is busy while trying to {lifecycle_operation}. Wait for the current operation to finish, then retry."
+        ));
+    }
+    drop(state);
+
+    let worker_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = worker_app.state::<ShellState>();
+        let _lifecycle_guard = try_lifecycle(&state, lifecycle_operation)?;
+        with_runtime(&worker_app, &state, operation)
+    })
+    .await;
+    app.state::<ShellState>()
+        .lifecycle_requested
+        .store(false, Ordering::Release);
+    result.map_err(|error| format!("Runtime worker failed: {error}."))?
+}
+
+async fn read_runtime_blocking(
+    app: tauri::AppHandle,
+    operation: fn(&mut RuntimeManager) -> RuntimeInfo,
+) -> Result<RuntimeInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<ShellState>();
+        with_runtime(&app, &state, |runtime| Ok(operation(runtime)))
+    })
+    .await
+    .map_err(|error| format!("Runtime status worker failed: {error}."))?
+}
+
 #[cfg(windows)]
 fn shutdown_message_box(text: &str, title: &str, flags: u32) -> i32 {
     use std::ptr;
@@ -506,47 +550,28 @@ fn copy_admin_password(app: tauri::AppHandle, state: State<'_, ShellState>) -> R
 }
 
 #[tauri::command]
-fn get_runtime_info(
-    app: tauri::AppHandle,
-    state: State<'_, ShellState>,
-) -> Result<RuntimeInfo, String> {
-    with_runtime(&app, &state, |runtime| Ok(runtime.refresh()))
+async fn get_runtime_info(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
+    read_runtime_blocking(app, RuntimeManager::refresh).await
 }
 
 #[tauri::command]
-fn start_runtime(
-    app: tauri::AppHandle,
-    state: State<'_, ShellState>,
-) -> Result<RuntimeInfo, String> {
-    let _lifecycle_guard = try_lifecycle(&state, "start the runtime")?;
-    with_runtime(&app, &state, RuntimeManager::start)
+async fn start_runtime(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
+    run_runtime_blocking(app, "start the runtime", RuntimeManager::start).await
 }
 
 #[tauri::command]
-fn stop_runtime(
-    app: tauri::AppHandle,
-    state: State<'_, ShellState>,
-) -> Result<RuntimeInfo, String> {
-    let _lifecycle_guard = try_lifecycle(&state, "stop the runtime")?;
-    with_runtime(&app, &state, RuntimeManager::stop)
+async fn stop_runtime(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
+    run_runtime_blocking(app, "stop the runtime", RuntimeManager::stop).await
 }
 
 #[tauri::command]
-fn restart_runtime(
-    app: tauri::AppHandle,
-    state: State<'_, ShellState>,
-) -> Result<RuntimeInfo, String> {
-    let _lifecycle_guard = try_lifecycle(&state, "restart the runtime")?;
-    with_runtime(&app, &state, RuntimeManager::restart)
+async fn restart_runtime(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
+    run_runtime_blocking(app, "restart the runtime", RuntimeManager::restart).await
 }
 
 #[tauri::command]
-fn retry_runtime_health(
-    app: tauri::AppHandle,
-    state: State<'_, ShellState>,
-) -> Result<RuntimeInfo, String> {
-    let _lifecycle_guard = try_lifecycle(&state, "recheck runtime health")?;
-    with_runtime(&app, &state, |runtime| {
+async fn retry_runtime_health(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
+    run_runtime_blocking(app, "recheck runtime health", |runtime| {
         let info = runtime.refresh();
         if info.state != RuntimeState::Running {
             return Err(runtime::RuntimeErrorInfo {
@@ -558,15 +583,98 @@ fn retry_runtime_health(
         }
         Ok(runtime.refresh_wordpress_health())
     })
+    .await
 }
 
 #[tauri::command]
-fn get_health_diagnostics(
-    app: tauri::AppHandle,
-    state: State<'_, ShellState>,
-) -> Result<HealthDiagnosticsInfo, String> {
-    let _lifecycle_guard = try_lifecycle(&state, "check health diagnostics")?;
-    with_runtime(&app, &state, |runtime| Ok(runtime.health_diagnostics()))
+async fn get_health_diagnostics(app: tauri::AppHandle) -> Result<HealthDiagnosticsInfo, String> {
+    run_runtime_blocking(app, "check health diagnostics", |runtime| {
+        Ok(runtime.health_diagnostics())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn refresh_runtime_maintenance(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<ShellState>();
+        if state.shutdown_in_progress.load(Ordering::Acquire)
+            || state.lifecycle_requested.load(Ordering::Acquire)
+        {
+            return Err("Runtime maintenance skipped while lifecycle work is pending.".into());
+        }
+        match state.lifecycle.try_lock() {
+            Ok(guard) => drop(guard),
+            Err(TryLockError::WouldBlock) => {
+                return Err("Runtime maintenance skipped while lifecycle work is active.".into());
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(
+                    "Runtime lifecycle state unavailable. Restart CoffeePOS Desktop before retrying."
+                        .into(),
+                );
+            }
+        }
+
+        let (snapshot, probe) = {
+            let mut guard = match state.runtime.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => {
+                    return Err("Runtime maintenance skipped while runtime state is busy.".into());
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(
+                        "Runtime state unavailable. Restart CoffeePOS Desktop before retrying."
+                            .into(),
+                    );
+                }
+            };
+            let runtime = guard.as_mut().ok_or_else(|| {
+                "Runtime maintenance skipped until runtime state is initialized.".to_string()
+            })?;
+            runtime.prepare_background_maintenance()
+        };
+
+        let Some(probe) = probe else {
+            return Ok(snapshot);
+        };
+        if state.shutdown_in_progress.load(Ordering::Acquire)
+            || state.lifecycle_requested.load(Ordering::Acquire)
+        {
+            return Ok(snapshot);
+        }
+        let health = RuntimeManager::run_background_health_probe(&probe);
+        if state.shutdown_in_progress.load(Ordering::Acquire)
+            || state.lifecycle_requested.load(Ordering::Acquire)
+        {
+            return Ok(snapshot);
+        }
+        match state.lifecycle.try_lock() {
+            Ok(guard) => drop(guard),
+            Err(TryLockError::WouldBlock) => return Ok(snapshot),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(
+                    "Runtime lifecycle state unavailable. Restart CoffeePOS Desktop before retrying."
+                        .into(),
+                );
+            }
+        }
+        let mut guard = match state.runtime.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(snapshot),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(
+                    "Runtime state unavailable. Restart CoffeePOS Desktop before retrying.".into(),
+                );
+            }
+        };
+        let runtime = guard.as_mut().ok_or_else(|| {
+            "Runtime maintenance skipped because runtime state is unavailable.".to_string()
+        })?;
+        Ok(runtime.commit_background_health(&probe, health))
+    })
+    .await
+    .map_err(|error| format!("Runtime maintenance worker failed: {error}."))?
 }
 
 #[tauri::command]
@@ -759,10 +867,24 @@ fn main() {
                 return;
             }
             api.prevent_close();
+            if state.shutdown_in_progress.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
+                state.shutdown_in_progress.store(false, Ordering::Release);
+                show_shutdown_notice(
+                    "CoffeePOS đang bận",
+                    "CoffeePOS đang hoàn tất một thao tác hệ thống. Hãy thử thoát lại sau khi thao tác hiện tại kết thúc.",
+                    false,
+                );
+                return;
+            }
 
             let lifecycle_guard = match state.lifecycle.try_lock() {
                 Ok(guard) => guard,
                 Err(TryLockError::WouldBlock) => {
+                    state.lifecycle_requested.store(false, Ordering::Release);
+                    state.shutdown_in_progress.store(false, Ordering::Release);
                     show_shutdown_notice(
                         "CoffeePOS đang bận",
                         "CoffeePOS đang hoàn tất cài đặt hoặc thay đổi trạng thái hệ thống. Hãy chờ thao tác hiện tại kết thúc rồi thử thoát lại.",
@@ -771,6 +893,8 @@ fn main() {
                     return;
                 }
                 Err(TryLockError::Poisoned(_)) => {
+                    state.lifecycle_requested.store(false, Ordering::Release);
+                    state.shutdown_in_progress.store(false, Ordering::Release);
                     show_shutdown_notice(
                         "Không thể thoát an toàn",
                         "Trạng thái vòng đời runtime không còn khả dụng. Hãy giữ ứng dụng mở và kiểm tra Chẩn đoán trước khi thử lại.",
@@ -780,9 +904,21 @@ fn main() {
                 }
             };
 
-            let mut runtime_guard = match state.runtime.lock() {
+            let runtime_guard = match state.runtime.try_lock() {
                 Ok(guard) => guard,
-                Err(_) => {
+                Err(TryLockError::WouldBlock) => {
+                    state.lifecycle_requested.store(false, Ordering::Release);
+                    state.shutdown_in_progress.store(false, Ordering::Release);
+                    show_shutdown_notice(
+                        "CoffeePOS đang bận",
+                        "CoffeePOS đang cập nhật trạng thái hệ thống. Hãy thử thoát lại sau khi thao tác hiện tại kết thúc.",
+                        false,
+                    );
+                    return;
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    state.lifecycle_requested.store(false, Ordering::Release);
+                    state.shutdown_in_progress.store(false, Ordering::Release);
                     show_shutdown_notice(
                         "Không thể thoát an toàn",
                         "Không thể đọc trạng thái runtime để dừng cửa hàng an toàn. Hãy giữ ứng dụng mở và thử lại.",
@@ -794,30 +930,46 @@ fn main() {
 
             if let Some(runtime) = runtime_guard.as_ref() {
                 if runtime.requires_exit_confirmation() && !confirm_runtime_exit() {
+                    drop(runtime_guard);
+                    drop(lifecycle_guard);
+                    state.lifecycle_requested.store(false, Ordering::Release);
+                    state.shutdown_in_progress.store(false, Ordering::Release);
                     return;
                 }
             }
-
-            if let Some(runtime) = runtime_guard.as_mut() {
-                if let Err(error) = runtime.stop() {
-                    if runtime.requires_exit_confirmation() {
-                        show_shutdown_notice(
-                            "Chưa thể dừng cửa hàng",
-                            &format!(
-                                "CoffeePOS chưa dừng hoàn toàn nên ứng dụng vẫn mở để tránh bỏ lại tiến trình.\n\n{}",
-                                error
-                            ),
-                            true,
-                        );
-                        return;
-                    }
-                }
-            }
-
             drop(runtime_guard);
             drop(lifecycle_guard);
-            state.exit_authorized.store(true, Ordering::Release);
-            window.app_handle().exit(0);
+            let app = window.app_handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let state = app.state::<ShellState>();
+                let result = (|| -> Result<(), String> {
+                    let _lifecycle_guard = try_lifecycle(&state, "stop the runtime for exit")?;
+                    let mut runtime_guard = state.runtime.lock().map_err(|_| {
+                        "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string()
+                    })?;
+                    if let Some(runtime) = runtime_guard.as_mut() {
+                        if let Err(error) = runtime.stop() {
+                            if runtime.requires_exit_confirmation() {
+                                return Err(format!(
+                                    "CoffeePOS chưa dừng hoàn toàn nên ứng dụng vẫn mở để tránh bỏ lại tiến trình.\n\n{error}"
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        state.exit_authorized.store(true, Ordering::Release);
+                        app.exit(0);
+                    }
+                    Err(message) => {
+                        state.lifecycle_requested.store(false, Ordering::Release);
+                        state.shutdown_in_progress.store(false, Ordering::Release);
+                        show_shutdown_notice("Chưa thể dừng cửa hàng", &message, true);
+                    }
+                }
+            });
         })
         .invoke_handler(tauri::generate_handler![
             get_shell_info,
@@ -830,6 +982,7 @@ fn main() {
             stop_runtime,
             restart_runtime,
             retry_runtime_health,
+            refresh_runtime_maintenance,
             get_health_diagnostics,
             open_wordpress,
             open_pos,
