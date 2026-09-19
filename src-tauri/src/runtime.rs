@@ -2012,6 +2012,7 @@ impl RuntimeManager {
             lan_port,
             &canonical_origin,
         )?;
+        self.validate_web_server_config(&web_server_config)?;
         self.web_server = Some(self.spawn_web_server(&web_server_config)?);
         let nonce = probe_nonce();
         let probe_name = self.write_php_probe(&nonce)?;
@@ -2168,6 +2169,58 @@ impl RuntimeManager {
             .env("XDG_CONFIG_HOME", caddy_config)
             .current_dir(&self.data_root);
         self.spawn_logged(command, "web server", "web-server.log")
+    }
+
+    fn validate_web_server_config(&self, config: &Path) -> Result<(), RuntimeErrorInfo> {
+        let caddy_data = self.data_root.join("config/caddy-data");
+        let caddy_config = self.data_root.join("config/caddy-config");
+        fs::create_dir_all(&caddy_data).map_err(|error| {
+            error_info(
+                "web server",
+                "prepare TLS state",
+                format!("Cannot create Caddy data directory: {error}."),
+                "Check application-data permissions and retry startup.",
+            )
+        })?;
+        fs::create_dir_all(&caddy_config).map_err(|error| {
+            error_info(
+                "web server",
+                "prepare TLS state",
+                format!("Cannot create Caddy config directory: {error}."),
+                "Check application-data permissions and retry startup.",
+            )
+        })?;
+        let mut command = Command::new(&self.runtime.web_server_executable);
+        command
+            .arg("validate")
+            .arg("--config")
+            .arg(config)
+            .arg("--adapter")
+            .arg("caddyfile")
+            .env("XDG_DATA_HOME", caddy_data)
+            .env("XDG_CONFIG_HOME", caddy_config)
+            .current_dir(&self.data_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_child_command(&mut command);
+        let status = run_command_bounded(
+            command,
+            self.timeouts.probe_command,
+            "web server",
+            "validate listener and TLS configuration",
+            &self.containment,
+        )?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(network_error(
+                "network_tls_prepare_failed",
+                "prepare TLS listener",
+                "Caddy rejected the generated listener or local TLS configuration.",
+                "CoffeePOS has not advertised the candidate LAN listener. Keep local-only mode and retry after checking the selected adapter and Caddy runtime.",
+            ))
+        }
     }
 
     fn maybe_spawn_wordpress_cron(&mut self, force: bool) -> Result<(), RuntimeErrorInfo> {
@@ -4492,6 +4545,44 @@ mod tests {
         let _selected_listener = TcpListener::bind((LOOPBACK, selected)).unwrap();
     }
 
+    #[test]
+    fn lan_caddy_config_keeps_internal_services_loopback_and_blocks_native_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().canonicalize().unwrap();
+        fs::create_dir_all(data.join("site")).unwrap();
+        fs::create_dir_all(data.join("uploads")).unwrap();
+        let mut manager = RuntimeManager::new(fake_runtime(), data).unwrap();
+        manager.configured_network_mode = NetworkMode::Lan;
+        manager.lan_candidate = Some(LanCandidate {
+            adapter_id: "00112233445566778899aabbccddeeff".into(),
+            adapter_name: "Private Ethernet".into(),
+            address: Ipv4Addr::new(192, 168, 50, 25),
+            network_profile: NetworkProfile::Private,
+            recommended: true,
+        });
+
+        let path = manager
+            .prepare_web_server_config(
+                48100,
+                48101,
+                48102,
+                Some(48103),
+                "https://192.168.50.25:48103",
+            )
+            .unwrap();
+        let caddyfile = fs::read_to_string(path).unwrap();
+
+        assert!(caddyfile.contains("admin 127.0.0.1:48101"));
+        assert!(caddyfile.contains("http://127.0.0.1:48100"));
+        assert!(caddyfile.contains("php_fastcgi 127.0.0.1:48102"));
+        assert!(caddyfile.contains("https://192.168.50.25:48103"));
+        assert!(caddyfile.contains("tls internal"));
+        assert!(caddyfile.contains("/wp-json/coffeepos/v1/system/status"));
+        assert!(caddyfile.contains("/.coffeepos-runtime-health-*"));
+        assert!(caddyfile.contains("respond @internal 404"));
+        assert!(!caddyfile.contains("0.0.0.0"));
+    }
+
     fn fake_runtime() -> ResolvedRuntime {
         let executable = std::env::current_exe().unwrap();
         let base = executable.parent().unwrap().to_path_buf();
@@ -4596,6 +4687,19 @@ mod tests {
             wordpress_health: WordPressHealthState::Checking,
             wordpress_error: None,
             coffeepos_health: CoffeePosHealthInfo::unavailable(),
+            network: NetworkInfo {
+                configured_mode: NetworkMode::LocalOnly,
+                effective_mode: NetworkMode::LocalOnly,
+                adapter_id: None,
+                adapter_name: None,
+                lan_address: None,
+                internal_origin: None,
+                canonical_origin: None,
+                lan_listener_state: LanListenerState::Disabled,
+                tls_state: TlsState::Disabled,
+                network_profile: None,
+                last_error: None,
+            },
             last_error: None,
         };
         let value = serde_json::to_value(info).unwrap();
@@ -4632,6 +4736,19 @@ mod tests {
             wordpress_health: WordPressHealthState::Unavailable,
             wordpress_error: None,
             coffeepos_health: CoffeePosHealthInfo::unavailable(),
+            network: NetworkInfo {
+                configured_mode: NetworkMode::LocalOnly,
+                effective_mode: NetworkMode::LocalOnly,
+                adapter_id: None,
+                adapter_name: None,
+                lan_address: None,
+                internal_origin: None,
+                canonical_origin: None,
+                lan_listener_state: LanListenerState::Disabled,
+                tls_state: TlsState::Disabled,
+                network_profile: None,
+                last_error: None,
+            },
             last_error: Some(database_error.clone()),
         };
 

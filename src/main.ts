@@ -620,6 +620,7 @@ let settingsBusy = false;
 let networkBusy = false;
 let networkConfirmOpen = false;
 let networkFeedback = "";
+let networkFeedbackError = false;
 let languageBusy = false;
 let persistedLanguage: AppLanguage | null = null;
 let currentShellInfo: ShellInfo | null = null;
@@ -975,12 +976,12 @@ function setBackupControls(): void {
   const restoring = restoreSystemBusy();
   const eligible = currentProvisioning?.state === "ready" && !repairRouteRequired;
   backupCard.setAttribute("aria-busy", active || mutating || restoring ? "true" : "false");
-  backupCreate.disabled = !eligible || backupSystemBusy();
-  backupPassword.disabled = mutating || active || restoring;
-  backupPasswordConfirm.disabled = mutating || active || restoring;
-  backupPasswordCancel.disabled = mutating || active || restoring;
-  backupChooseDestination.disabled = !eligible || mutating || active || restoring;
-  backupCancel.disabled = !backupCancellationAvailable() || backupOperation === "cancel" || restoring;
+  backupCreate.disabled = !eligible || backupSystemBusy() || networkBusy;
+  backupPassword.disabled = mutating || active || restoring || networkBusy;
+  backupPasswordConfirm.disabled = mutating || active || restoring || networkBusy;
+  backupPasswordCancel.disabled = mutating || active || restoring || networkBusy;
+  backupChooseDestination.disabled = !eligible || mutating || active || restoring || networkBusy;
+  backupCancel.disabled = !backupCancellationAvailable() || backupOperation === "cancel" || restoring || networkBusy;
   backupOpenFolder.disabled = restoring || backupOperation === "open_folder" || !currentBackupStatus?.succeeded || !currentBackupStatus.operation_id;
   backupCreateAnother.disabled = backupSystemBusy();
   backupRetry.disabled = backupSystemBusy() || !eligible;
@@ -992,7 +993,8 @@ function syncOperationControls(): void {
   setRuntimeControls(currentRuntime);
   setHealthControls();
   setRepairControls();
-  settingsSave.disabled = settingsBusy || backupSystemBusy();
+  settingsSave.disabled = settingsBusy || backupSystemBusy() || networkBusy;
+  renderNetworkSettings();
   renderHome();
 }
 
@@ -1288,21 +1290,22 @@ function setRestoreControls(): void {
 
   restoreCard.setAttribute("aria-busy", active || mutating || inspecting ? "true" : "false");
   restoreScreen.setAttribute("aria-busy", active || mutating ? "true" : "false");
-  setupRestore.disabled = !freshEligible || otherMaintenance || restoreSystemBusy();
-  restoreInstalledStart.disabled = !installedEligible || otherMaintenance || restoreSystemBusy();
-  restorePassword.disabled = active || mutating || inspecting;
-  restoreInspect.disabled = active || mutating || inspecting || otherMaintenance;
-  restorePasswordCancel.disabled = active || mutating || inspecting;
-  restoreReviewCancel.disabled = active || mutating;
+  setupRestore.disabled = !freshEligible || otherMaintenance || restoreSystemBusy() || networkBusy;
+  restoreInstalledStart.disabled = !installedEligible || otherMaintenance || restoreSystemBusy() || networkBusy;
+  restorePassword.disabled = active || mutating || inspecting || networkBusy;
+  restoreInspect.disabled = active || mutating || inspecting || otherMaintenance || networkBusy;
+  restorePasswordCancel.disabled = active || mutating || inspecting || networkBusy;
+  restoreReviewCancel.disabled = active || mutating || networkBusy;
   restoreApply.disabled = active
     || mutating
     || !restoreCandidateId()
     || compatibility?.compatible === false
-    || otherMaintenance;
-  restoreCancel.disabled = !restoreCancellationAvailable() || restoreOperation === "cancel";
-  restoreFailureBack.disabled = active || mutating;
-  restoreRetry.disabled = active || mutating || otherMaintenance;
-  restoreRecoveryRefresh.disabled = restoreStatusRefreshBusy;
+    || otherMaintenance
+    || networkBusy;
+  restoreCancel.disabled = !restoreCancellationAvailable() || restoreOperation === "cancel" || networkBusy;
+  restoreFailureBack.disabled = active || mutating || networkBusy;
+  restoreRetry.disabled = active || mutating || otherMaintenance || networkBusy;
+  restoreRecoveryRefresh.disabled = restoreStatusRefreshBusy || networkBusy;
 }
 
 function renderRestoreInspection(inspection: RestoreInspection): void {
@@ -1817,7 +1820,7 @@ function repairClassificationLabel(classification: RepairClassification): string
 }
 
 function setRepairControls(): void {
-  const busy = repairOperation !== null || bootstrapBusy || provisioningBusy || runtimeBusy || diagnosticsBusy || backupSystemBusy();
+  const busy = repairOperation !== null || bootstrapBusy || provisioningBusy || runtimeBusy || networkBusy || diagnosticsBusy || backupSystemBusy();
   const eligible = currentProvisioning?.state === "ready" || currentProvisioning?.state === "needs_repair";
   repairInspect.disabled = busy || !eligible;
   repairApply.disabled = busy || !eligible || !currentRepairPlan?.can_apply;
@@ -2461,14 +2464,14 @@ function applySetupInfo(info: SetupInfo): void {
   passwordHint.textContent = info.password_configured
     ? t("onboarding.password_hint_existing")
     : t("onboarding.password_hint_new");
-  name.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
-  adminUsername.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
-  adminEmail.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
-  adminPassword.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
-  adminPasswordConfirm.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
-  save.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
+  name.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || networkBusy || restoreSystemBusy();
+  adminUsername.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || networkBusy || restoreSystemBusy();
+  adminEmail.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || networkBusy || restoreSystemBusy();
+  adminPassword.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || networkBusy || restoreSystemBusy();
+  adminPasswordConfirm.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || networkBusy || restoreSystemBusy();
+  save.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || networkBusy || restoreSystemBusy();
   provisionWordPress.disabled =
-    !info.editable || !info.password_configured || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
+    !info.editable || !info.password_configured || setupProfileBusy || provisioningBusy || runtimeBusy || networkBusy || restoreSystemBusy();
   element("review-store-name").textContent = info.store_name;
   element("review-admin-username").textContent = info.admin_username;
   element("review-admin-email").textContent = info.admin_email;
@@ -2590,6 +2593,9 @@ function selectInstalledView(view: InstalledView, moveFocus = true): void {
     if (currentSystemSection === "logs") void refreshLogCatalogAndTail(true);
     else if (currentSystemSection === "backup") void refreshBackupStatus();
     else if (currentSystemSection === "diagnostics") void refreshHealthDiagnostics();
+  }
+  if (view === "settings" && moveFocus && isTauri() && !networkBusy && !backupSystemBusy()) {
+    void refreshRuntime();
   }
 }
 
@@ -2828,7 +2834,7 @@ function renderHome(): void {
 }
 
 function setRuntimeControls(info: RuntimeInfo | null): void {
-  if (provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation !== null || backupSystemBusy() || repairRouteRequired || !info) {
+  if (provisioningBusy || runtimeBusy || networkBusy || diagnosticsBusy || repairOperation !== null || backupSystemBusy() || repairRouteRequired || !info) {
     runtimeStart.disabled = true;
     runtimeStop.disabled = true;
     runtimeRestart.disabled = true;
@@ -2849,6 +2855,62 @@ function setRuntimeControls(info: RuntimeInfo | null): void {
   runtimeStop.disabled = info.state !== "running";
   runtimeRestart.disabled = info.state === "starting" || info.state === "stopping" || info.state === "installing";
   openWordPress.disabled = info.state !== "running" || info.wordpress_health !== "healthy" || !info.http_port;
+}
+
+function renderNetworkSettings(): void {
+  const network = currentRuntime?.network ?? null;
+  const blocked = networkBusy
+    || provisioningBusy
+    || runtimeBusy
+    || repairOperation !== null
+    || backupSystemBusy()
+    || repairRouteRequired
+    || currentProvisioning?.state !== "ready"
+    || !isTauri();
+
+  settingsNetwork.setAttribute("aria-busy", networkBusy ? "true" : "false");
+  settingsNetworkConfirmation.hidden = !networkConfirmOpen || networkBusy;
+  settingsNetworkConfirm.disabled = blocked;
+  settingsNetworkCancel.disabled = networkBusy;
+
+  if (networkBusy) {
+    setTextIfChanged(settingsNetworkState, t("settings.network_state.applying"));
+  } else if (!network) {
+    setTextIfChanged(settingsNetworkState, t("settings.network_state.unavailable"));
+  } else if (network.configured_mode === "lan" && network.effective_mode === "lan") {
+    setTextIfChanged(settingsNetworkState, t("settings.network_state.lan"));
+  } else if (network.configured_mode === "lan") {
+    setTextIfChanged(settingsNetworkState, t("settings.network_state.configured"));
+  } else {
+    setTextIfChanged(settingsNetworkState, t("settings.network_state.local_only"));
+  }
+
+  if (!network) {
+    setTextIfChanged(settingsNetworkDetail, t("settings.network_detail.unavailable"));
+  } else if (network.configured_mode === "lan" && network.effective_mode === "lan") {
+    setTextIfChanged(
+      settingsNetworkDetail,
+      t("settings.network_detail.lan", { adapter: network.adapter_name ?? t("settings.network_adapter_unknown") }),
+    );
+  } else if (network.configured_mode === "lan") {
+    setTextIfChanged(
+      settingsNetworkDetail,
+      t("settings.network_detail.configured", { adapter: network.adapter_name ?? t("settings.network_adapter_unknown") }),
+    );
+  } else {
+    setTextIfChanged(settingsNetworkDetail, t("settings.network_detail.local_only"));
+  }
+
+  const configuredLan = network?.configured_mode === "lan";
+  setTextIfChanged(settingsNetworkToggle, t(configuredLan ? "settings.network_disable" : "settings.network_enable"));
+  settingsNetworkToggle.disabled = blocked || !network;
+
+  const nativeNetworkError = network?.last_error
+    ? localizedErrorCode(network.last_error.code, "errors.network")
+    : "";
+  const statusText = networkFeedback || nativeNetworkError;
+  setTextIfChanged(settingsNetworkStatus, statusText);
+  settingsNetworkStatus.classList.toggle("error", Boolean(statusText) && (networkFeedbackError || (!networkFeedback && Boolean(nativeNetworkError))));
 }
 
 function renderRuntime(info: RuntimeInfo): void {
@@ -2883,6 +2945,7 @@ function renderRuntime(info: RuntimeInfo): void {
     })
     : "";
   setRuntimeControls(info);
+  renderNetworkSettings();
   setHealthControls();
 
   if (provisioningBusy) {
@@ -3078,6 +3141,7 @@ async function refreshRuntime(): Promise<void> {
     runtimeLoadError = localizedNativeError(error, "errors.runtime");
     setTextIfChanged(runtimeDescription, runtimeLoadError);
     setRuntimeControls(null);
+    renderNetworkSettings();
     renderHome();
   } finally {
     runtimeRefreshBusy = false;
@@ -3168,7 +3232,7 @@ async function copyAdminPassword(status: HTMLElement, button: HTMLButtonElement)
 }
 
 async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restart_runtime" | "retry_runtime_health"): Promise<void> {
-  if (provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation || backupSystemBusy() || repairRouteRequired || currentProvisioning?.state !== "ready") return;
+  if (provisioningBusy || runtimeBusy || networkBusy || diagnosticsBusy || repairOperation || backupSystemBusy() || repairRouteRequired || currentProvisioning?.state !== "ready") return;
   runtimeBusy = true;
   runtimeTransition = command === "stop_runtime" ? "stopping" : command === "retry_runtime_health" ? "checking" : "starting";
   if (runtimeTransition === "starting") runtimeStartupProgress = "preparing";
@@ -3215,7 +3279,7 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
 }
 
 async function runHomeAction(): Promise<void> {
-  if (homeAction.disabled || provisioningBusy || runtimeBusy || diagnosticsBusy || repairOperation || backupSystemBusy() || posOpenBusy) return;
+  if (homeAction.disabled || provisioningBusy || runtimeBusy || networkBusy || diagnosticsBusy || repairOperation || backupSystemBusy() || posOpenBusy) return;
   if (homeActionKind === "start") {
     await runtimeAction("start_runtime");
   } else if (homeActionKind === "retry_health") {
@@ -3230,7 +3294,7 @@ async function runHomeAction(): Promise<void> {
 }
 
 async function saveAppSettings(): Promise<void> {
-  if (settingsBusy || backupSystemBusy()) return;
+  if (settingsBusy || networkBusy || backupSystemBusy()) return;
   settingsBusy = true;
   settingsSave.disabled = true;
   setTextIfChanged(settingsSaveStatus, t("settings.saving"));
@@ -3242,12 +3306,45 @@ async function saveAppSettings(): Promise<void> {
     setTextIfChanged(settingsSaveStatus, localizedNativeError(error, "errors.config"));
   } finally {
     settingsBusy = false;
-    settingsSave.disabled = backupSystemBusy();
+    settingsSave.disabled = backupSystemBusy() || networkBusy;
+  }
+}
+
+async function applyNetworkMode(mode: "local_only" | "lan"): Promise<void> {
+  if (
+    networkBusy
+    || provisioningBusy
+    || runtimeBusy
+    || repairOperation
+    || backupSystemBusy()
+    || repairRouteRequired
+    || currentProvisioning?.state !== "ready"
+    || !isTauri()
+  ) return;
+
+  networkBusy = true;
+  networkConfirmOpen = false;
+  networkFeedback = t(mode === "lan" ? "settings.network_enabling" : "settings.network_disabling");
+  networkFeedbackError = false;
+  syncOperationControls();
+  renderNetworkSettings();
+  try {
+    const info = await invoke<RuntimeInfo>("set_network_mode", { networkMode: mode });
+    renderRuntime(info);
+    networkFeedback = t(mode === "lan" ? "settings.network_enabled" : "settings.network_disabled");
+  } catch (error) {
+    networkFeedback = localizedNativeError(error, "errors.network");
+    networkFeedbackError = true;
+  } finally {
+    networkBusy = false;
+    await refreshRuntime();
+    syncOperationControls();
+    renderNetworkSettings();
   }
 }
 
 async function openManagedWordPress(): Promise<void> {
-  if (provisioningBusy || runtimeBusy || repairOperation || backupSystemBusy() || repairRouteRequired || openWordPress.disabled) return;
+  if (provisioningBusy || runtimeBusy || networkBusy || repairOperation || backupSystemBusy() || repairRouteRequired || openWordPress.disabled) return;
   openWordPress.disabled = true;
   openWordPressStatus.textContent = t("runtime.opening_wordpress");
   try {
@@ -3262,7 +3359,7 @@ async function openManagedWordPress(): Promise<void> {
 }
 
 async function openPos(): Promise<void> {
-  if (provisioningBusy || runtimeBusy || repairOperation || backupSystemBusy() || repairRouteRequired || posOpenBusy || currentProvisioning?.state !== "ready") return;
+  if (provisioningBusy || runtimeBusy || networkBusy || repairOperation || backupSystemBusy() || repairRouteRequired || posOpenBusy || currentProvisioning?.state !== "ready") return;
   posOpenBusy = true;
   renderHome();
   setTextIfChanged(homeOpenStatus, t("runtime.opening_pos"));
@@ -3383,6 +3480,24 @@ appSettingsForm.addEventListener("submit", (event) => {
   event.preventDefault();
   void saveAppSettings();
 });
+settingsNetworkToggle.addEventListener("click", () => {
+  if (settingsNetworkToggle.disabled || networkBusy) return;
+  if (currentRuntime?.network.configured_mode === "lan") {
+    void applyNetworkMode("local_only");
+    return;
+  }
+  networkConfirmOpen = true;
+  networkFeedback = "";
+  networkFeedbackError = false;
+  renderNetworkSettings();
+  settingsNetworkConfirm.focus();
+});
+settingsNetworkConfirm.addEventListener("click", () => void applyNetworkMode("lan"));
+settingsNetworkCancel.addEventListener("click", () => {
+  networkConfirmOpen = false;
+  renderNetworkSettings();
+  settingsNetworkToggle.focus();
+});
 
 for (const button of navButtons) {
   button.addEventListener("click", () => {
@@ -3485,7 +3600,7 @@ setupForm.addEventListener("submit", async (event) => {
 });
 
 window.setInterval(() => {
-  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !provisioningBusy && !runtimeBusy && !diagnosticsBusy && !repairOperation && !backupSystemBusy()) {
+  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !provisioningBusy && !runtimeBusy && !networkBusy && !diagnosticsBusy && !repairOperation && !backupSystemBusy()) {
     void refreshRuntime();
   }
 }, 2000);
@@ -3499,7 +3614,7 @@ window.setInterval(() => {
 }, 500);
 
 window.setInterval(() => {
-  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !repairOperation && !backupSystemBusy()) {
+  if (isTauri() && currentProvisioning?.state === "ready" && !bootstrapBusy && !networkBusy && !repairOperation && !backupSystemBusy()) {
     void refreshRuntimeMaintenance();
   }
 }, 5000);

@@ -2045,6 +2045,8 @@ mod tests {
         assert!(!object.contains_key("startup_view"));
         assert!(!object.contains_key("app_language"));
         assert!(!object.contains_key("bind_host"));
+        assert!(!object.contains_key("network_mode"));
+        assert!(!object.contains_key("lan_adapter_id"));
         assert!(!object.contains_key("data_root"));
     }
 

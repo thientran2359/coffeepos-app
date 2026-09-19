@@ -2436,6 +2436,35 @@ fn recover_restore_transaction(
         )
         && runtime.refresh().state != RuntimeState::Running
     {
+        let resume_preference = read_network_preference(app, state).map_err(|error| {
+            restore_command_error(
+                "recover runtime",
+                "network_preference_unavailable",
+                error.message,
+                "Restore recovery is complete, but the runtime remains stopped until the target network preference can be read safely.",
+            )
+        })?;
+        if let Err(network_error) =
+            runtime.configure_network(resume_preference.0, resume_preference.1.as_deref())
+        {
+            runtime
+                .configure_network(NetworkMode::LocalOnly, None)
+                .map_err(|error| restore_error_from_runtime("recover local-only runtime", error))?;
+            persist_network_preference(app, state, NetworkMode::LocalOnly, None).map_err(|error| {
+                restore_command_error(
+                    "recover runtime",
+                    "network_fallback_persist_failed",
+                    error.message,
+                    "Restore recovery is complete, but CoffeePOS could not persist the safe local-only fallback.",
+                )
+            })?;
+            if let Ok(mut operation) = state.restore_operation.lock() {
+                operation.status.warnings.push(format!(
+                    "network_resume_fallback_local: {}",
+                    network_error.message
+                ));
+            }
+        }
         if let Err(error) = runtime.start() {
             if let Ok(mut operation) = state.restore_operation.lock() {
                 operation
