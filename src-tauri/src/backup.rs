@@ -54,6 +54,18 @@ impl BackupStage {
             Self::Idle | Self::Succeeded | Self::Cancelled | Self::Failed
         )
     }
+
+    pub(crate) fn is_cancellable(&self) -> bool {
+        matches!(
+            self,
+            Self::SelectingDestination
+                | Self::Preflight
+                | Self::Quiesce
+                | Self::Database
+                | Self::Uploads
+                | Self::Archive
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -201,6 +213,14 @@ impl BackupOperationState {
                 "Refresh backup status before trying another action.",
             ));
         }
+        if !self.status.stage.is_cancellable() {
+            return Err(backup_error(
+                "cleanup",
+                "cancel_unavailable",
+                "CoffeePOS has reached a backup stage that must finish atomically.",
+                "Keep CoffeePOS open while validation, finalization, cleanup, and runtime resume finish.",
+            ));
+        }
         let cancel = self.cancel.as_ref().ok_or_else(|| {
             backup_error(
                 "cleanup",
@@ -276,6 +296,7 @@ enum JournalStage {
     SnapshotSealed,
     ArchiveWriting,
     ArchiveValidated,
+    FinalizePrepared,
     Finalized,
     Cleanup,
 }
@@ -288,6 +309,14 @@ struct BackupJournal {
     stage: JournalStage,
     destination_temp: String,
     runtime_was_running: Option<bool>,
+    #[serde(default)]
+    destination_final: Option<String>,
+    #[serde(default)]
+    destination_previous: Option<String>,
+    #[serde(default)]
+    expected_destination_identity: Option<BackupDestinationIdentity>,
+    #[serde(default)]
+    new_archive_identity: Option<BackupDestinationIdentity>,
 }
 
 pub(crate) fn new_operation_id() -> Result<String, BackupErrorInfo> {
@@ -353,9 +382,82 @@ pub(crate) fn preflight_before_quiesce(
     ))
 }
 
+pub(crate) fn preflight_restore_recovery(
+    context: &BackupCreateContext,
+    selection: &BackupDestinationSelection,
+) -> Result<(BackupDestinationPlan, u64, u64, Vec<BackupWarning>), BackupErrorInfo> {
+    // Restore owns the outer transaction and intentionally has config/restore.json present.
+    // Keep every ordinary backup preflight invariant except the generic pending-transaction
+    // rejection so the rollback snapshot can be created inside that fenced transaction.
+    validate_operation_id_component(&context.admin_username, "administrator identity")?;
+    require_secret(
+        &context.data_root.join(WORDPRESS_ADMIN_SECRET),
+        "administrator",
+    )?;
+    require_secret(
+        &context.data_root.join(DATABASE_RUNTIME_SECRET),
+        "runtime database",
+    )?;
+    require_secret(
+        &context.data_root.join(DATABASE_WORDPRESS_SECRET),
+        "WordPress database",
+    )?;
+    let destination = validate_destination(&context.data_root, &selection.path)?;
+    let current_identity = backup_format::capture_destination_identity(&destination, "preflight")?;
+    if current_identity != selection.existing_identity {
+        return Err(destination_changed_error("preflight"));
+    }
+    let uploads = enumerate_uploads(&context.data_root.join("uploads"))?;
+    let upload_bytes = uploads.iter().try_fold(0_u64, |sum, item| {
+        sum.checked_add(item.size)
+            .ok_or_else(|| size_error("preflight"))
+    })?;
+    let database_bytes = estimate_directory_bytes(&context.data_root.join("database"))?;
+    preflight_capacity(
+        &context.data_root,
+        &destination,
+        database_bytes,
+        upload_bytes,
+    )?;
+    probe_destination_writable(&destination)?;
+    let warnings = unmanaged_extension_warnings(&context.data_root)?;
+    Ok((
+        BackupDestinationPlan {
+            path: destination,
+            expected_existing_identity: selection.existing_identity.clone(),
+        },
+        uploads.len() as u64,
+        upload_bytes,
+        warnings,
+    ))
+}
+
 pub(crate) fn run_backup<F>(
     runtime: &mut RuntimeManager,
     request: BackupRunRequest<'_>,
+    report: F,
+) -> Result<RuntimeInfo, BackupErrorInfo>
+where
+    F: FnMut(BackupProgress),
+{
+    run_backup_with_success_resume_policy(runtime, request, true, report)
+}
+
+pub(crate) fn run_backup_keep_runtime_stopped<F>(
+    runtime: &mut RuntimeManager,
+    request: BackupRunRequest<'_>,
+    report: F,
+) -> Result<RuntimeInfo, BackupErrorInfo>
+where
+    F: FnMut(BackupProgress),
+{
+    run_backup_with_success_resume_policy(runtime, request, false, report)
+}
+
+fn run_backup_with_success_resume_policy<F>(
+    runtime: &mut RuntimeManager,
+    request: BackupRunRequest<'_>,
+    resume_previous_running_state_on_success: bool,
     mut report: F,
 ) -> Result<RuntimeInfo, BackupErrorInfo>
 where
@@ -387,6 +489,10 @@ where
         stage: JournalStage::Planned,
         destination_temp: temp_path.to_string_lossy().into_owned(),
         runtime_was_running: None,
+        destination_final: Some(destination.path.to_string_lossy().into_owned()),
+        destination_previous: None,
+        expected_destination_identity: destination.expected_existing_identity.clone(),
+        new_archive_identity: None,
     };
     let before = runtime.refresh();
     journal.runtime_was_running = Some(before.state == RuntimeState::Running);
@@ -401,7 +507,29 @@ where
         Ok(session) => session,
         Err(error) => {
             let mapped = database_error(error);
-            cleanup_pre_session_failure(&context.data_root, operation_id, &temp_path);
+            let recovery_pending = runtime.backup_maintenance_active()
+                || runtime.backup_recovery_context().is_some()
+                || mapped.code == "child_cleanup_unconfirmed";
+            if recovery_pending {
+                // DatabaseBackupSession::cleanup_after_failure intentionally leaves the
+                // maintenance fence, retained child handles and durable staging evidence intact
+                // when cleanup cannot be confirmed. Keep the Phase 7.3 journal too so retry or
+                // relaunch recovery cannot skip that retained state.
+                return Err(mapped);
+            }
+            if let Err(cleanup) =
+                cleanup_pre_session_failure(&context.data_root, operation_id, &temp_path)
+            {
+                return Err(backup_error(
+                    "cleanup",
+                    "cleanup_failed",
+                    "The backup could not start and CoffeePOS could not fully clean its owned staging.",
+                    format!(
+                        "Backup error: {} Cleanup error: {} Keep CoffeePOS open and retry recovery before another managed operation.",
+                        mapped.message, cleanup.message
+                    ),
+                ));
+            }
             return Err(mapped);
         }
     };
@@ -644,25 +772,56 @@ where
             destination_changed_error("finalize"),
         ));
     }
-    let current_identity =
-        match backup_format::capture_destination_identity(&final_destination, "finalize") {
-            Ok(identity) => identity,
+    if let Err(error) = ensure_destination_identity(destination, "finalize") {
+        return Err(fail_with_session(
+            session, runtime, context, &temp_path, error,
+        ));
+    }
+    journal.stage = JournalStage::FinalizePrepared;
+    journal.new_archive_identity =
+        match backup_format::capture_destination_identity(&temp_path, "finalize") {
+            Ok(Some(identity)) => Some(identity),
+            Ok(None) => {
+                return Err(fail_with_session(
+                    session,
+                    runtime,
+                    context,
+                    &temp_path,
+                    backup_error(
+                        "finalize",
+                        "validated_archive_missing",
+                        "The validated encrypted backup temp file disappeared before finalization.",
+                        "Retry backup; CoffeePOS did not modify the selected destination.",
+                    ),
+                ))
+            }
             Err(error) => {
                 return Err(fail_with_session(
                     session, runtime, context, &temp_path, error,
                 ))
             }
         };
-    if current_identity != destination.expected_existing_identity {
+    let previous_path = if destination.expected_existing_identity.is_some() {
+        match destination_previous_path(&destination.path, operation_id) {
+            Ok(path) => {
+                journal.destination_previous = Some(path.to_string_lossy().into_owned());
+                Some(path)
+            }
+            Err(error) => {
+                return Err(fail_with_session(
+                    session, runtime, context, &temp_path, error,
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(error) = persist_journal(&context.data_root, &journal) {
         return Err(fail_with_session(
-            session,
-            runtime,
-            context,
-            &temp_path,
-            destination_changed_error("finalize"),
+            session, runtime, context, &temp_path, error,
         ));
     }
-    if let Err(error) = atomic_finalize(&temp_path, destination) {
+    if let Err(error) = atomic_finalize(&temp_path, destination, previous_path.as_deref()) {
         return Err(fail_with_session(
             session, runtime, context, &temp_path, error,
         ));
@@ -670,6 +829,27 @@ where
     journal.stage = JournalStage::Finalized;
     if let Err(error) = persist_journal(&context.data_root, &journal) {
         return Err(fail_after_finalize(session, runtime, context, error));
+    }
+    if let Some(previous) = previous_path.as_deref() {
+        if let Err(error) = ensure_committed_final_identity(
+            &destination.path,
+            journal
+                .new_archive_identity
+                .as_ref()
+                .expect("new archive identity captured before finalization"),
+        ) {
+            return Err(fail_after_finalize(session, runtime, context, error));
+        }
+        if let Err(error) = remove_committed_previous(
+            previous,
+            destination
+                .expected_existing_identity
+                .as_ref()
+                .expect("existing destination identity checked above"),
+            operation_id,
+        ) {
+            return Err(fail_after_finalize(session, runtime, context, error));
+        }
     }
 
     report(BackupProgress {
@@ -683,7 +863,12 @@ where
     });
     journal.stage = JournalStage::Cleanup;
     let _ = persist_journal(&context.data_root, &journal);
-    let runtime_info = session.cleanup(runtime).map_err(|error| {
+    let runtime_cleanup = if resume_previous_running_state_on_success {
+        session.cleanup(runtime)
+    } else {
+        session.cleanup_without_resume(runtime)
+    };
+    let runtime_info = runtime_cleanup.map_err(|error| {
         backup_error(
             "resume",
             "runtime_resume_failed",
@@ -735,11 +920,7 @@ pub(crate) fn recover_interrupted_backup(data_root: &Path) -> Result<(), BackupE
         .map_err(database_error)?;
 
     let temp_path = PathBuf::from(&journal.destination_temp);
-    let temp_result = if temp_path.exists() {
-        remove_owned_destination_temp(&temp_path, &journal.operation_id)
-    } else {
-        Ok(())
-    };
+    let temp_result = recover_destination_transaction(&journal, &temp_path);
     let staging_result =
         backup_database::cleanup_interrupted_database_staging(data_root, &journal.operation_id)
             .map_err(database_error);
@@ -757,6 +938,140 @@ pub(crate) fn recover_interrupted_backup(data_root: &Path) -> Result<(), BackupE
             ),
         )),
     }
+}
+
+fn recover_destination_transaction(
+    journal: &BackupJournal,
+    temp_path: &Path,
+) -> Result<(), BackupErrorInfo> {
+    let Some(final_text) = journal.destination_final.as_deref() else {
+        // Backward-compatible recovery for markers created before destination transaction metadata
+        // was added. Those markers never created an owned `.previous` artifact.
+        return if temp_path.exists() {
+            remove_owned_destination_temp(temp_path, &journal.operation_id)
+        } else {
+            Ok(())
+        };
+    };
+    let final_path = PathBuf::from(final_text);
+    let previous = journal.destination_previous.as_deref().map(PathBuf::from);
+
+    if let Some(previous) = previous.as_deref() {
+        let expected_name = format!(".coffeepos-backup-{}.previous", journal.operation_id);
+        if previous.file_name().and_then(|value| value.to_str()) != Some(expected_name.as_str()) {
+            return Err(recovery_error());
+        }
+        validate_owned_previous_path(previous, &final_path)?;
+    }
+
+    match journal.stage {
+        JournalStage::Finalized | JournalStage::Cleanup => {
+            if let Some(previous) = previous.as_deref() {
+                if previous.exists() {
+                    let new_identity = journal
+                        .new_archive_identity
+                        .as_ref()
+                        .ok_or_else(recovery_error)?;
+                    ensure_committed_final_identity(&final_path, new_identity)?;
+                    let expected = journal
+                        .expected_destination_identity
+                        .as_ref()
+                        .ok_or_else(recovery_error)?;
+                    remove_committed_previous(previous, expected, &journal.operation_id)?;
+                }
+            }
+            if temp_path.exists() {
+                remove_owned_destination_temp(temp_path, &journal.operation_id)?;
+            }
+            Ok(())
+        }
+        JournalStage::FinalizePrepared => {
+            recover_prepared_destination(journal, temp_path, &final_path, previous.as_deref())
+        }
+        _ => {
+            if previous.as_ref().is_some_and(|path| path.exists()) {
+                return Err(destination_recovery_required_error());
+            }
+            if temp_path.exists() {
+                remove_owned_destination_temp(temp_path, &journal.operation_id)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn recover_prepared_destination(
+    journal: &BackupJournal,
+    temp_path: &Path,
+    final_path: &Path,
+    previous: Option<&Path>,
+) -> Result<(), BackupErrorInfo> {
+    let new_identity = journal
+        .new_archive_identity
+        .as_ref()
+        .ok_or_else(recovery_error)?;
+    let final_identity = backup_format::capture_destination_identity(final_path, "cleanup")?;
+
+    if let Some(previous) = previous {
+        if previous.exists() {
+            if final_identity.as_ref() == Some(new_identity) {
+                if temp_path.exists() {
+                    return Err(destination_recovery_required_error());
+                }
+                move_without_replace(final_path, temp_path, "cleanup")?;
+            } else if final_identity.is_some() {
+                // A third party now owns the public destination. Preserve both it and the previous
+                // object; automatic recovery must not overwrite either one.
+                return Err(destination_recovery_required_error());
+            }
+            move_without_replace(previous, final_path, "cleanup")?;
+            if temp_path.exists() {
+                let temp_identity =
+                    backup_format::capture_destination_identity(temp_path, "cleanup")?;
+                if temp_identity.as_ref() != Some(new_identity) {
+                    return Err(destination_recovery_required_error());
+                }
+                remove_owned_destination_temp(temp_path, &journal.operation_id)?;
+            }
+            return Ok(());
+        }
+
+        // `.previous` was never created: the existing destination must still be the object that
+        // the user confirmed in Save As, otherwise recovery cannot prove ownership.
+        if final_identity != journal.expected_destination_identity {
+            return Err(destination_recovery_required_error());
+        }
+        if temp_path.exists() {
+            let temp_identity = backup_format::capture_destination_identity(temp_path, "cleanup")?;
+            if temp_identity.as_ref() != Some(new_identity) {
+                return Err(destination_recovery_required_error());
+            }
+            remove_owned_destination_temp(temp_path, &journal.operation_id)?;
+        }
+        return Ok(());
+    }
+
+    // Destination did not exist when Save As returned. If the validated archive already acquired
+    // the public name before the crash, move that exact object back to its owned temp name and
+    // discard it; a different object at the destination is preserved and requires manual recovery.
+    match final_identity {
+        None => {}
+        Some(ref identity) if identity == new_identity => {
+            if temp_path.exists() {
+                return Err(destination_recovery_required_error());
+            }
+            move_without_replace(final_path, temp_path, "cleanup")?;
+        }
+        Some(_) => return Err(destination_recovery_required_error()),
+    }
+    if temp_path.exists() {
+        let temp_identity = backup_format::capture_destination_identity(temp_path, "cleanup")?;
+        if temp_identity.as_ref() != Some(new_identity) {
+            return Err(destination_recovery_required_error());
+        }
+        remove_owned_destination_temp(temp_path, &journal.operation_id)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn open_backup_folder(path: &Path) -> Result<(), BackupErrorInfo> {
@@ -1162,7 +1477,15 @@ fn fail_with_session(
     temp_path: &Path,
     primary: BackupErrorInfo,
 ) -> BackupErrorInfo {
-    let _ = remove_owned_destination_temp(temp_path, session.operation_id());
+    let preserve_recovery = matches!(
+        primary.code.as_str(),
+        "child_cleanup_unconfirmed" | "destination_recovery_required"
+    );
+    let temp_cleanup = if preserve_recovery {
+        Ok(())
+    } else {
+        remove_owned_destination_temp(temp_path, session.operation_id())
+    };
     if primary.code == "child_cleanup_unconfirmed" {
         // Phase 7.2 deliberately keeps the maintenance fence, retained Child handle and owned
         // staging alive on this code. The staging now also contains durable process evidence for
@@ -1171,32 +1494,61 @@ fn fail_with_session(
     }
     match session.cleanup(runtime) {
         Ok(_) => {
-            let _ = remove_journal(&context.data_root);
+            if preserve_recovery {
+                return primary;
+            }
+            if let Err(cleanup) = temp_cleanup {
+                return backup_error(
+                    "cleanup",
+                    "cleanup_failed",
+                    "The backup did not complete and CoffeePOS could not remove its owned encrypted temp file safely.",
+                    format!(
+                        "Backup error: {} Temp cleanup: {} The recovery marker was preserved so relaunch recovery can retry cleanup.",
+                        primary.message, cleanup.message
+                    ),
+                );
+            }
+            if let Err(cleanup) = remove_journal(&context.data_root) {
+                return backup_error(
+                    "cleanup",
+                    "cleanup_failed",
+                    "The backup did not complete and CoffeePOS could not clear its recovery marker safely.",
+                    format!(
+                        "Backup error: {} Marker cleanup: {} Keep CoffeePOS open or relaunch it so recovery can finish.",
+                        primary.message, cleanup.message
+                    ),
+                );
+            }
             primary
         }
-        Err(cleanup) => backup_error(
-            "resume",
-            "cleanup_failed",
-            "The backup did not complete and CoffeePOS could not fully restore the previous runtime state.",
-            format!(
-                "Backup error: {} Cleanup error: {} Keep CoffeePOS open and recover runtime state before retrying.",
-                primary.message, cleanup.message
-            ),
-        ),
+        Err(cleanup) => {
+            let temp_detail = temp_cleanup
+                .err()
+                .map(|error| format!(" Temp cleanup: {}", error.message))
+                .unwrap_or_default();
+            backup_error(
+                "resume",
+                "cleanup_failed",
+                "The backup did not complete and CoffeePOS could not fully restore the previous runtime state.",
+                format!(
+                    "Backup error: {} Cleanup error: {}{} Keep CoffeePOS open and recover runtime state before retrying.",
+                    primary.message, cleanup.message, temp_detail
+                ),
+            )
+        }
     }
 }
 
 fn fail_after_finalize(
     session: DatabaseBackupSession,
     runtime: &mut RuntimeManager,
-    context: &BackupCreateContext,
+    _context: &BackupCreateContext,
     primary: BackupErrorInfo,
 ) -> BackupErrorInfo {
     match session.cleanup(runtime) {
-        Ok(_) => {
-            let _ = remove_journal(&context.data_root);
-            primary
-        }
+        // Final destination has already changed. Preserve the durable marker so relaunch can
+        // reconcile any owned `.previous` file before normal startup.
+        Ok(_) => primary,
         Err(cleanup) => backup_error(
             "resume",
             "cleanup_failed",
@@ -1209,10 +1561,15 @@ fn fail_after_finalize(
     }
 }
 
-fn cleanup_pre_session_failure(data_root: &Path, operation_id: &str, temp_path: &Path) {
-    let _ = remove_owned_destination_temp(temp_path, operation_id);
-    let _ = backup_database::cleanup_interrupted_database_staging(data_root, operation_id);
-    let _ = remove_journal(data_root);
+fn cleanup_pre_session_failure(
+    data_root: &Path,
+    operation_id: &str,
+    temp_path: &Path,
+) -> Result<(), BackupErrorInfo> {
+    remove_owned_destination_temp(temp_path, operation_id)?;
+    backup_database::cleanup_interrupted_database_staging(data_root, operation_id)
+        .map_err(database_error)?;
+    remove_journal(data_root)
 }
 
 fn remove_owned_destination_temp(path: &Path, operation_id: &str) -> Result<(), BackupErrorInfo> {
@@ -1253,43 +1610,91 @@ fn remove_owned_destination_temp(path: &Path, operation_id: &str) -> Result<(), 
 fn atomic_finalize(
     temp: &Path,
     destination: &BackupDestinationPlan,
+    previous: Option<&Path>,
 ) -> Result<(), BackupErrorInfo> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    let Some(expected_identity) = destination.expected_existing_identity.as_ref() else {
+        return move_without_replace(temp, &destination.path, "finalize");
     };
-    let from: Vec<u16> = temp
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let to: Vec<u16> = destination
-        .path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let flags = if destination.expected_existing_identity.is_some() {
-        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
-    } else {
-        MOVEFILE_WRITE_THROUGH
-    };
-    let result = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) };
-    if result == 0 {
-        return Err(backup_error(
-            "finalize",
-            "atomic_finalize_failed",
-            "Windows could not atomically finalize the validated CoffeePOS backup.",
-            "The incomplete temp file will be cleaned; check destination permissions and retry.",
-        ));
+    let previous = previous.ok_or_else(destination_recovery_required_error)?;
+    validate_owned_previous_path(previous, &destination.path)?;
+    if previous.exists() {
+        return Err(destination_recovery_required_error());
+    }
+
+    // Every rename is non-overwriting. A race may move an unexpected target object into the owned
+    // `.previous` slot, but that object remains intact and is verified before the new backup is
+    // allowed to take the public destination name.
+    move_without_replace(&destination.path, previous, "finalize")?;
+    let moved_identity = backup_format::capture_destination_identity(previous, "finalize")?;
+    if moved_identity.as_ref() != Some(expected_identity) {
+        if move_without_replace(previous, &destination.path, "finalize").is_ok() {
+            return Err(destination_changed_error("finalize"));
+        }
+        return Err(destination_recovery_required_error());
+    }
+
+    if let Err(primary) = move_without_replace(temp, &destination.path, "finalize") {
+        if move_without_replace(previous, &destination.path, "finalize").is_ok() {
+            return Err(primary);
+        }
+        return Err(destination_recovery_required_error());
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn move_without_replace(from: &Path, to: &Path, action: &str) -> Result<(), BackupErrorInfo> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    let from_wide: Vec<u16> = from
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let to_wide: Vec<u16> = to
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let result =
+        unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if result == 0 {
+        Err(backup_error(
+            action,
+            "atomic_finalize_failed",
+            "Windows could not atomically move a CoffeePOS backup finalization artifact.",
+            "CoffeePOS preserved the involved files and will recover owned finalization state before normal startup.",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn move_without_replace(from: &Path, to: &Path, action: &str) -> Result<(), BackupErrorInfo> {
+    if to.exists() {
+        return Err(backup_error(
+            action,
+            "atomic_finalize_failed",
+            "The backup destination changed before finalization.",
+            "Choose the destination again and retry backup.",
+        ));
+    }
+    fs::rename(from, to).map_err(|_| {
+        backup_error(
+            action,
+            "atomic_finalize_failed",
+            "CoffeePOS could not move a backup finalization artifact.",
+            "Check destination permissions and retry backup.",
+        )
+    })
 }
 
 #[cfg(not(windows))]
 fn atomic_finalize(
     temp: &Path,
     destination: &BackupDestinationPlan,
+    _previous: Option<&Path>,
 ) -> Result<(), BackupErrorInfo> {
     fs::rename(temp, &destination.path).map_err(|_| {
         backup_error(
@@ -1299,6 +1704,77 @@ fn atomic_finalize(
             "Check destination permissions and retry.",
         )
     })
+}
+
+fn destination_previous_path(
+    destination: &Path,
+    operation_id: &str,
+) -> Result<PathBuf, BackupErrorInfo> {
+    validate_operation_id(operation_id)?;
+    let parent = destination.parent().ok_or_else(invalid_destination_error)?;
+    Ok(parent.join(format!(".coffeepos-backup-{operation_id}.previous")))
+}
+
+fn validate_owned_previous_path(
+    previous: &Path,
+    destination: &Path,
+) -> Result<(), BackupErrorInfo> {
+    let name = previous
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(recovery_error)?;
+    if !name.starts_with(".coffeepos-backup-") || !name.ends_with(".previous") {
+        return Err(recovery_error());
+    }
+    let previous_parent = previous.parent().ok_or_else(recovery_error)?;
+    let destination_parent = destination.parent().ok_or_else(recovery_error)?;
+    if !same_windows_path(previous_parent, destination_parent) {
+        return Err(recovery_error());
+    }
+    reject_reparse_ancestors(previous_parent, "cleanup")
+}
+
+fn remove_committed_previous(
+    previous: &Path,
+    expected_identity: &BackupDestinationIdentity,
+    operation_id: &str,
+) -> Result<(), BackupErrorInfo> {
+    let expected_name = format!(".coffeepos-backup-{operation_id}.previous");
+    if previous.file_name().and_then(|value| value.to_str()) != Some(expected_name.as_str()) {
+        return Err(recovery_error());
+    }
+    let identity = backup_format::capture_destination_identity(previous, "cleanup")?;
+    if identity.as_ref() != Some(expected_identity) {
+        return Err(destination_recovery_required_error());
+    }
+    fs::remove_file(previous).map_err(|_| {
+        backup_error(
+            "cleanup",
+            "destination_previous_cleanup_failed",
+            "CoffeePOS finalized the backup but could not remove the owned previous destination file.",
+            "Keep CoffeePOS open; relaunch recovery will verify and remove the owned previous file before normal startup.",
+        )
+    })
+}
+
+fn ensure_committed_final_identity(
+    destination: &Path,
+    expected_identity: &BackupDestinationIdentity,
+) -> Result<(), BackupErrorInfo> {
+    let identity = backup_format::capture_destination_identity(destination, "cleanup")?;
+    if identity.as_ref() != Some(expected_identity) {
+        return Err(destination_recovery_required_error());
+    }
+    Ok(())
+}
+
+fn destination_recovery_required_error() -> BackupErrorInfo {
+    backup_error(
+        "finalize",
+        "destination_recovery_required",
+        "CoffeePOS could not reconcile the selected backup destination atomically.",
+        "No destination object was intentionally overwritten. Keep CoffeePOS open or relaunch it so owned backup recovery can reconcile the preserved files before normal startup.",
+    )
 }
 
 #[cfg(windows)]
@@ -1409,6 +1885,18 @@ fn same_windows_path(left: &Path, right: &Path) -> bool {
         .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
         .collect::<Vec<_>>();
     left == right
+}
+
+fn ensure_destination_identity(
+    destination: &BackupDestinationPlan,
+    action: &str,
+) -> Result<(), BackupErrorInfo> {
+    let current = backup_format::capture_destination_identity(&destination.path, action)?;
+    if current == destination.expected_existing_identity {
+        Ok(())
+    } else {
+        Err(destination_changed_error(action))
+    }
 }
 
 fn destination_changed_error(action: &str) -> BackupErrorInfo {
@@ -1557,6 +2045,236 @@ mod tests {
         assert!(!object.contains_key("startup_view"));
         assert!(!object.contains_key("bind_host"));
         assert!(!object.contains_key("data_root"));
+    }
+
+    #[test]
+    fn cancellation_is_rejected_after_archive_stage() {
+        let operation_id = "44556677889900112233aabbccddeeff";
+        let mut state = BackupOperationState::default();
+        let cancel = state.begin(operation_id.to_string()).unwrap();
+        state.status.stage = BackupStage::Validate;
+
+        let error = state.request_cancel(operation_id).unwrap_err();
+        assert_eq!(error.code, "cancel_unavailable");
+        assert!(!cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancellation_remains_available_during_archive_stage() {
+        let operation_id = "55667788990011223344aabbccddeeff";
+        let mut state = BackupOperationState::default();
+        let cancel = state.begin(operation_id.to_string()).unwrap();
+        state.status.stage = BackupStage::Archive;
+
+        state.request_cancel(operation_id).unwrap();
+        assert!(cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pre_session_cleanup_failure_preserves_recovery_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let operation_id = "66778899001122334455aabbccddeeff";
+        let temp_path = root
+            .path()
+            .join(format!(".coffeepos-backup-{operation_id}.partial"));
+        let staging = root
+            .path()
+            .join("backups/.database-staging")
+            .join(format!("db-{operation_id}"));
+        fs::create_dir_all(&staging).unwrap();
+        let journal = BackupJournal {
+            schema_version: BACKUP_JOURNAL_SCHEMA_VERSION,
+            operation_id: operation_id.into(),
+            stage: JournalStage::Planned,
+            destination_temp: temp_path.to_string_lossy().into_owned(),
+            runtime_was_running: Some(false),
+            destination_final: None,
+            destination_previous: None,
+            expected_destination_identity: None,
+            new_archive_identity: None,
+        };
+        persist_journal(root.path(), &journal).unwrap();
+
+        let error = cleanup_pre_session_failure(root.path(), operation_id, &temp_path).unwrap_err();
+        assert_eq!(error.code, "staging_ownership_invalid");
+        assert!(root.path().join(BACKUP_JOURNAL).exists());
+        assert!(staging.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn destination_identity_rejects_file_that_appears_after_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("late.coffeepos-backup");
+        let selection =
+            BackupDestinationSelection::capture(destination.clone(), "preflight").unwrap();
+        assert!(selection.existing_identity.is_none());
+        let plan = BackupDestinationPlan {
+            path: destination.clone(),
+            expected_existing_identity: selection.existing_identity,
+        };
+
+        fs::write(&destination, b"unrelated-new-file").unwrap();
+        let error = ensure_destination_identity(&plan, "finalize").unwrap_err();
+        assert_eq!(error.code, "destination_changed");
+
+        let encrypted_temp = temp.path().join("new.partial");
+        fs::write(&encrypted_temp, b"new-backup").unwrap();
+        let finalize_error = atomic_finalize(&encrypted_temp, &plan, None).unwrap_err();
+        assert_eq!(finalize_error.code, "atomic_finalize_failed");
+        assert_eq!(fs::read(&destination).unwrap(), b"unrelated-new-file");
+        assert_eq!(fs::read(&encrypted_temp).unwrap(), b"new-backup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn destination_identity_rejects_replaced_confirmed_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("existing.coffeepos-backup");
+        fs::write(&destination, b"confirmed-existing-file").unwrap();
+        let selection =
+            BackupDestinationSelection::capture(destination.clone(), "preflight").unwrap();
+        assert!(selection.existing_identity.is_some());
+        let plan = BackupDestinationPlan {
+            path: destination.clone(),
+            expected_existing_identity: selection.existing_identity,
+        };
+        let operation_id = "00112233445566778899aabbccddeeff";
+        let previous = destination_previous_path(&destination, operation_id).unwrap();
+
+        // Simulate the exact race the finalize transaction must survive: the identity check passed,
+        // then another process replaced the selected file before the first rename executes.
+        fs::remove_file(&destination).unwrap();
+        fs::write(&destination, b"replacement-after-confirmation").unwrap();
+        let encrypted_temp = temp.path().join("new.partial");
+        fs::write(&encrypted_temp, b"new-backup").unwrap();
+        let error = atomic_finalize(&encrypted_temp, &plan, Some(&previous)).unwrap_err();
+        assert_eq!(error.code, "destination_changed");
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"replacement-after-confirmation"
+        );
+        assert_eq!(fs::read(&encrypted_temp).unwrap(), b"new-backup");
+        assert!(!previous.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepared_destination_recovery_restores_confirmed_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let operation_id = "11223344556677889900aabbccddeeff";
+        let destination = temp.path().join("store.coffeepos-backup");
+        let encrypted_temp = temp
+            .path()
+            .join(format!(".coffeepos-backup-{operation_id}.partial"));
+        let previous = destination_previous_path(&destination, operation_id).unwrap();
+        fs::write(&destination, b"old-confirmed-backup").unwrap();
+        let expected = backup_format::capture_destination_identity(&destination, "test")
+            .unwrap()
+            .unwrap();
+        fs::write(&encrypted_temp, b"new-validated-backup").unwrap();
+        let new_identity = backup_format::capture_destination_identity(&encrypted_temp, "test")
+            .unwrap()
+            .unwrap();
+
+        move_without_replace(&destination, &previous, "test").unwrap();
+        move_without_replace(&encrypted_temp, &destination, "test").unwrap();
+        let journal = BackupJournal {
+            schema_version: BACKUP_JOURNAL_SCHEMA_VERSION,
+            operation_id: operation_id.into(),
+            stage: JournalStage::FinalizePrepared,
+            destination_temp: encrypted_temp.to_string_lossy().into_owned(),
+            runtime_was_running: Some(false),
+            destination_final: Some(destination.to_string_lossy().into_owned()),
+            destination_previous: Some(previous.to_string_lossy().into_owned()),
+            expected_destination_identity: Some(expected),
+            new_archive_identity: Some(new_identity),
+        };
+
+        recover_destination_transaction(&journal, &encrypted_temp).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"old-confirmed-backup");
+        assert!(!previous.exists());
+        assert!(!encrypted_temp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finalized_destination_recovery_keeps_new_backup_and_removes_previous() {
+        let temp = tempfile::tempdir().unwrap();
+        let operation_id = "22334455667788990011aabbccddeeff";
+        let destination = temp.path().join("store.coffeepos-backup");
+        let encrypted_temp = temp
+            .path()
+            .join(format!(".coffeepos-backup-{operation_id}.partial"));
+        let previous = destination_previous_path(&destination, operation_id).unwrap();
+        fs::write(&destination, b"old-confirmed-backup").unwrap();
+        let expected = backup_format::capture_destination_identity(&destination, "test")
+            .unwrap()
+            .unwrap();
+        fs::write(&encrypted_temp, b"new-validated-backup").unwrap();
+        let new_identity = backup_format::capture_destination_identity(&encrypted_temp, "test")
+            .unwrap()
+            .unwrap();
+        move_without_replace(&destination, &previous, "test").unwrap();
+        move_without_replace(&encrypted_temp, &destination, "test").unwrap();
+        let journal = BackupJournal {
+            schema_version: BACKUP_JOURNAL_SCHEMA_VERSION,
+            operation_id: operation_id.into(),
+            stage: JournalStage::Finalized,
+            destination_temp: encrypted_temp.to_string_lossy().into_owned(),
+            runtime_was_running: Some(false),
+            destination_final: Some(destination.to_string_lossy().into_owned()),
+            destination_previous: Some(previous.to_string_lossy().into_owned()),
+            expected_destination_identity: Some(expected),
+            new_archive_identity: Some(new_identity),
+        };
+
+        recover_destination_transaction(&journal, &encrypted_temp).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new-validated-backup");
+        assert!(!previous.exists());
+        assert!(!encrypted_temp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finalized_destination_recovery_preserves_previous_if_final_was_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let operation_id = "33445566778899001122aabbccddeeff";
+        let destination = temp.path().join("store.coffeepos-backup");
+        let encrypted_temp = temp
+            .path()
+            .join(format!(".coffeepos-backup-{operation_id}.partial"));
+        let previous = destination_previous_path(&destination, operation_id).unwrap();
+        fs::write(&destination, b"old-confirmed-backup").unwrap();
+        let expected = backup_format::capture_destination_identity(&destination, "test")
+            .unwrap()
+            .unwrap();
+        fs::write(&encrypted_temp, b"new-validated-backup").unwrap();
+        let new_identity = backup_format::capture_destination_identity(&encrypted_temp, "test")
+            .unwrap()
+            .unwrap();
+        move_without_replace(&destination, &previous, "test").unwrap();
+        move_without_replace(&encrypted_temp, &destination, "test").unwrap();
+        let journal = BackupJournal {
+            schema_version: BACKUP_JOURNAL_SCHEMA_VERSION,
+            operation_id: operation_id.into(),
+            stage: JournalStage::Finalized,
+            destination_temp: encrypted_temp.to_string_lossy().into_owned(),
+            runtime_was_running: Some(false),
+            destination_final: Some(destination.to_string_lossy().into_owned()),
+            destination_previous: Some(previous.to_string_lossy().into_owned()),
+            expected_destination_identity: Some(expected),
+            new_archive_identity: Some(new_identity),
+        };
+
+        fs::remove_file(&destination).unwrap();
+        fs::write(&destination, b"third-party-replacement").unwrap();
+
+        let error = recover_destination_transaction(&journal, &encrypted_temp).unwrap_err();
+        assert_eq!(error.code, "destination_recovery_required");
+        assert_eq!(fs::read(&destination).unwrap(), b"third-party-replacement");
+        assert_eq!(fs::read(&previous).unwrap(), b"old-confirmed-backup");
+        assert!(!encrypted_temp.exists());
     }
 
     #[cfg(windows)]

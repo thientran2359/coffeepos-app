@@ -200,6 +200,49 @@ interface BackupResult {
 
 type BackupView = "landing" | "password" | "progress" | "success" | "failure";
 
+interface RestoreInspection {
+  candidate_id?: string;
+  restore_candidate_id?: string;
+  backup?: unknown;
+  backup_id?: string;
+  store_name?: string;
+  created_at?: number | string | null;
+  wordpress_version?: string;
+  woocommerce_version?: string;
+  coffeepos_version?: string;
+  uploads_bytes?: number;
+  compatible?: boolean;
+  compatibility?: unknown;
+  warnings?: string[];
+  manifest?: unknown;
+  [key: string]: unknown;
+}
+
+interface RestoreStatus {
+  operation_id: string | null;
+  stage: string;
+  started_at?: number | null;
+  finished_at?: number | null;
+  succeeded?: boolean;
+  failed?: boolean;
+  cancelled?: boolean;
+  rolled_back?: boolean;
+  needs_recovery?: boolean;
+  recovery_required?: boolean;
+  original_state?: "existing_store" | "no_previous_store" | null;
+  warnings?: string[];
+  last_error?: BackupErrorInfo | RuntimeErrorInfo | null;
+  [key: string]: unknown;
+}
+
+interface RestoreResult {
+  operation_id?: string;
+  status?: string;
+}
+
+type RestoreView = "password" | "review" | "progress" | "success" | "failure" | "recovery";
+type RestoreEntrySource = "fresh" | "installed";
+
 type SetupStep = "welcome" | "details" | "review" | "progress" | "complete";
 
 function element<T extends HTMLElement>(id: string): T {
@@ -207,6 +250,137 @@ function element<T extends HTMLElement>(id: string): T {
   if (!node) throw new Error(`Missing UI element: ${id}`);
   return node as T;
 }
+
+function installRestoreUi(): void {
+  const setupWelcomeActions = document.querySelector<HTMLElement>("#setup-welcome .actions");
+  if (setupWelcomeActions && !document.getElementById("setup-restore")) {
+    const button = document.createElement("button");
+    button.id = "setup-restore";
+    button.type = "button";
+    button.className = "secondary";
+    button.textContent = "Khôi phục từ bản sao lưu";
+    setupWelcomeActions.append(button);
+  }
+
+  const backupCardNode = document.getElementById("backup");
+  const backupLead = backupCardNode?.querySelector<HTMLElement>(".lead");
+  if (backupCardNode && backupLead && !document.getElementById("restore-installed-start")) {
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    actions.id = "restore-entry-actions";
+    const button = document.createElement("button");
+    button.id = "restore-installed-start";
+    button.type = "button";
+    button.className = "secondary";
+    button.textContent = "Khôi phục từ bản sao lưu";
+    actions.append(button);
+    backupLead.insertAdjacentElement("afterend", actions);
+    const titleNode = document.getElementById("backup-title");
+    if (titleNode) titleNode.textContent = "Sao lưu và khôi phục";
+  }
+
+  if (document.getElementById("restore-screen")) return;
+  const main = element<HTMLElement>("main-content");
+  const screen = document.createElement("section");
+  screen.id = "restore-screen";
+  screen.className = "setup-screen";
+  screen.hidden = true;
+  screen.setAttribute("aria-labelledby", "restore-title");
+  screen.setAttribute("aria-busy", "false");
+  screen.innerHTML = `
+    <div class="card backup-card" id="restore-card">
+      <div class="section-heading compact-heading">
+        <div><span class="section-label">KHÔI PHỤC</span><h2 id="restore-title" tabindex="-1">Khôi phục cửa hàng</h2></div>
+        <span id="restore-state" class="state-badge">Sẵn sàng</span>
+      </div>
+
+      <div data-restore-view="password">
+        <p class="lead">Chọn một bản sao lưu CoffeePOS và kiểm tra tính toàn vẹn, phiên bản và khả năng tương thích trước khi thay đổi cửa hàng.</p>
+        <form id="restore-password-form" class="backup-password-form" novalidate>
+          <div class="field-group">
+            <label for="restore-password">Mật khẩu bản sao lưu</label>
+            <input id="restore-password" type="password" maxlength="128" autocomplete="current-password" required />
+          </div>
+          <p class="hint">Cửa sổ Open của Windows sẽ chọn file. Đường dẫn file và dữ liệu giải mã không được đưa vào giao diện.</p>
+          <p id="restore-password-error" class="field-error" role="alert" hidden></p>
+          <div class="actions split-actions">
+            <button id="restore-password-cancel" class="secondary" type="button">Quay lại</button>
+            <button id="restore-inspect" type="submit">Chọn và kiểm tra bản sao lưu</button>
+          </div>
+        </form>
+      </div>
+
+      <div data-restore-view="review" hidden>
+        <p class="lead">Bản sao lưu đã vượt qua bước kiểm tra read-only. Xác nhận thông tin an toàn bên dưới trước khi khôi phục.</p>
+        <dl class="review-list">
+          <dt>Cửa hàng</dt><dd id="restore-review-store">—</dd>
+          <dt>Tạo lúc</dt><dd id="restore-review-created">—</dd>
+          <dt>WordPress</dt><dd id="restore-review-wordpress">—</dd>
+          <dt>WooCommerce</dt><dd id="restore-review-woocommerce">—</dd>
+          <dt>CoffeePOS</dt><dd id="restore-review-coffeepos">—</dd>
+          <dt>Uploads</dt><dd id="restore-review-uploads">—</dd>
+          <dt>Tương thích</dt><dd id="restore-review-compatibility">—</dd>
+        </dl>
+        <div id="restore-unmanaged-warning" class="backup-result backup-result-error" hidden>
+          <strong>Có mã site không được quản lý</strong>
+          <p>Bản sao lưu có dấu hiệu plugin, theme hoặc mã site tùy chỉnh không thuộc gói managed. CoffeePOS chỉ dựng lại mã managed tương thích; hãy kiểm tra chức năng tùy chỉnh sau khi khôi phục.</p>
+        </div>
+        <p id="restore-review-impact" class="hint"></p>
+        <p id="restore-review-error" class="error" role="alert" hidden></p>
+        <div class="actions split-actions">
+          <button id="restore-review-cancel" class="secondary" type="button">Hủy</button>
+          <button id="restore-apply" type="button">Khôi phục</button>
+        </div>
+      </div>
+
+      <div data-restore-view="progress" hidden>
+        <div class="backup-progress-copy">
+          <strong>Đang khôi phục…</strong>
+          <p id="restore-progress-stage" role="status" aria-live="polite">Đang chuẩn bị giao dịch khôi phục.</p>
+          <progress id="restore-progress" max="1">Đang xử lý</progress>
+          <p id="restore-progress-detail" class="hint">CoffeePOS đang giữ cửa hàng ở trạng thái an toàn trong khi kiểm tra và chuyển dữ liệu.</p>
+        </div>
+        <p id="restore-close-guidance" class="hint">Không tắt máy trong khi dữ liệu đang được chuyển.</p>
+        <div class="actions"><button id="restore-cancel" class="secondary" type="button">Hủy khôi phục</button></div>
+        <p id="restore-progress-status" class="hint" role="status" aria-live="polite"></p>
+      </div>
+
+      <div data-restore-view="success" hidden>
+        <div class="backup-result">
+          <strong>Khôi phục hoàn tất</strong>
+          <p>CoffeePOS đã kiểm tra dữ liệu và trạng thái cửa hàng sau khôi phục.</p>
+        </div>
+        <div class="actions"><button id="restore-open-home" type="button">Mở Tổng quan</button></div>
+      </div>
+
+      <div data-restore-view="failure" hidden>
+        <div class="backup-result backup-result-error" role="alert">
+          <strong id="restore-failure-title">Không thể khôi phục</strong>
+          <p id="restore-failure-message">CoffeePOS chưa thể hoàn tất thao tác khôi phục.</p>
+          <p id="restore-failure-recovery" class="hint"></p>
+        </div>
+        <div class="actions split-actions">
+          <button id="restore-failure-back" class="secondary" type="button">Quay lại</button>
+          <button id="restore-retry" type="button">Thử lại</button>
+        </div>
+      </div>
+
+      <div data-restore-view="recovery" hidden>
+        <div class="backup-result backup-result-error" role="alert">
+          <strong>Khôi phục cần xử lý</strong>
+          <p>CoffeePOS đang giữ trạng thái cửa hàng và dữ liệu phục hồi để tránh tiếp tục vận hành trên trạng thái chưa được xác minh.</p>
+        </div>
+        <details class="technical-details">
+          <summary>Xem chi tiết kỹ thuật</summary>
+          <p id="restore-recovery-details" class="hint"></p>
+        </details>
+        <div class="actions"><button id="restore-recovery-refresh" type="button">Kiểm tra lại trạng thái</button></div>
+      </div>
+    </div>`;
+  main.append(screen);
+}
+
+installRestoreUi();
 
 const bootstrapPanel = element("bootstrap");
 const title = element("status-title");
@@ -336,6 +510,42 @@ const backupSuccessStatus = element("backup-success-status");
 const backupFailureMessage = element("backup-failure-message");
 const backupFailureRecovery = element("backup-failure-recovery");
 const backupRetry = element<HTMLButtonElement>("backup-retry");
+const setupRestore = element<HTMLButtonElement>("setup-restore");
+const restoreInstalledStart = element<HTMLButtonElement>("restore-installed-start");
+const restoreScreen = element<HTMLElement>("restore-screen");
+const restoreCard = element<HTMLElement>("restore-card");
+const restoreViews = Array.from(document.querySelectorAll<HTMLElement>("[data-restore-view]"));
+const restoreState = element("restore-state");
+const restorePasswordForm = element<HTMLFormElement>("restore-password-form");
+const restorePassword = element<HTMLInputElement>("restore-password");
+const restorePasswordError = element("restore-password-error");
+const restorePasswordCancel = element<HTMLButtonElement>("restore-password-cancel");
+const restoreInspect = element<HTMLButtonElement>("restore-inspect");
+const restoreReviewStore = element("restore-review-store");
+const restoreReviewCreated = element("restore-review-created");
+const restoreReviewWordPress = element("restore-review-wordpress");
+const restoreReviewWooCommerce = element("restore-review-woocommerce");
+const restoreReviewCoffeePos = element("restore-review-coffeepos");
+const restoreReviewUploads = element("restore-review-uploads");
+const restoreReviewCompatibility = element("restore-review-compatibility");
+const restoreUnmanagedWarning = element("restore-unmanaged-warning");
+const restoreReviewImpact = element("restore-review-impact");
+const restoreReviewError = element("restore-review-error");
+const restoreReviewCancel = element<HTMLButtonElement>("restore-review-cancel");
+const restoreApply = element<HTMLButtonElement>("restore-apply");
+const restoreProgressStage = element("restore-progress-stage");
+const restoreProgressDetail = element("restore-progress-detail");
+const restoreCloseGuidance = element("restore-close-guidance");
+const restoreCancel = element<HTMLButtonElement>("restore-cancel");
+const restoreProgressStatus = element("restore-progress-status");
+const restoreOpenHome = element<HTMLButtonElement>("restore-open-home");
+const restoreFailureTitle = element("restore-failure-title");
+const restoreFailureMessage = element("restore-failure-message");
+const restoreFailureRecovery = element("restore-failure-recovery");
+const restoreFailureBack = element<HTMLButtonElement>("restore-failure-back");
+const restoreRetry = element<HTMLButtonElement>("restore-retry");
+const restoreRecoveryDetails = element("restore-recovery-details");
+const restoreRecoveryRefresh = element<HTMLButtonElement>("restore-recovery-refresh");
 
 let provisioningBusy = false;
 let runtimeBusy = false;
@@ -376,10 +586,18 @@ let currentBackupView: BackupView = "landing";
 let backupOperation: "create" | "cancel" | "open_folder" | null = null;
 let backupPollTimer: number | null = null;
 let backupStatusRefreshBusy = false;
+let currentRestoreInspection: RestoreInspection | null = null;
+let currentRestoreStatus: RestoreStatus | null = null;
+let currentRestoreView: RestoreView = "password";
+let restoreEntrySource: RestoreEntrySource = "installed";
+let restoreOperation: "inspect" | "apply" | "cancel" | null = null;
+let restorePollTimer: number | null = null;
+let restoreStatusRefreshBusy = false;
 
 const LOG_PAGE_MAX_LINES = 200;
 const LOG_VIEW_MAX_LINES = 1000;
 const BACKUP_POLL_INTERVAL_MS = 750;
+const RESTORE_POLL_INTERVAL_MS = 750;
 
 function getLogCatalog(): Promise<LogCatalog> {
   return invoke<LogCatalog>("get_log_catalog");
@@ -408,6 +626,172 @@ function nativeErrorText(error: unknown): string {
   }
 }
 
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function firstString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function firstFiniteNumber(...values: unknown[]): number | null {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function restoreErrorInfo(error: unknown): { message: string; recovery: string } {
+  const value = recordValue(error);
+  return {
+    message: value && typeof value.message === "string"
+      ? value.message
+      : "CoffeePOS không thể hoàn tất thao tác khôi phục.",
+    recovery: value && typeof value.recovery === "string"
+      ? value.recovery
+      : "Kiểm tra bản sao lưu và thử lại. Chi tiết đường dẫn file được giữ ở native layer.",
+  };
+}
+
+function restoreCandidateId(inspection = currentRestoreInspection): string {
+  if (!inspection) return "";
+  return firstString(inspection.candidate_id, inspection.restore_candidate_id);
+}
+
+function restoreInspectionWarnings(inspection: RestoreInspection): string[] {
+  const backup = recordValue(inspection.backup);
+  const manifest = recordValue(inspection.manifest);
+  const values = [backup?.warnings, inspection.warnings, manifest?.warnings];
+  for (const value of values) {
+    if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+  }
+  return [];
+}
+
+function restoreCompatibility(inspection: RestoreInspection): { compatible: boolean; label: string } {
+  const backup = recordValue(inspection.backup);
+  if (backup && typeof backup.can_restore === "boolean") {
+    const compatibility = recordValue(backup.compatibility);
+    const status = firstString(compatibility?.status);
+    const label = firstString(compatibility?.message, status)
+      || (backup.can_restore
+        ? "Tương thích với phiên bản CoffeePOS Desktop hiện tại."
+        : "Bản sao lưu không tương thích với phiên bản hiện tại.");
+    return { compatible: backup.can_restore, label };
+  }
+  if (typeof inspection.compatible === "boolean") {
+    return {
+      compatible: inspection.compatible,
+      label: inspection.compatible ? "Tương thích với phiên bản CoffeePOS Desktop hiện tại." : "Bản sao lưu không tương thích với phiên bản hiện tại.",
+    };
+  }
+  if (typeof inspection.compatibility === "boolean") {
+    return {
+      compatible: inspection.compatibility,
+      label: inspection.compatibility ? "Tương thích với phiên bản CoffeePOS Desktop hiện tại." : "Bản sao lưu không tương thích với phiên bản hiện tại.",
+    };
+  }
+  if (typeof inspection.compatibility === "string") {
+    const value = inspection.compatibility.trim();
+    const compatible = !/blocked|incompatible|unsupported|reject/i.test(value);
+    return { compatible, label: value || (compatible ? "Tương thích." : "Không tương thích.") };
+  }
+  const compatibility = recordValue(inspection.compatibility);
+  if (compatibility) {
+    const compatibleValue = compatibility.compatible;
+    const status = firstString(compatibility.status);
+    const compatible = typeof compatibleValue === "boolean"
+      ? compatibleValue
+      : !/blocked|incompatible|unsupported|reject/i.test(status);
+    const label = firstString(compatibility.message, compatibility.reason, status)
+      || (compatible ? "Tương thích với phiên bản CoffeePOS Desktop hiện tại." : "Bản sao lưu không tương thích với phiên bản hiện tại.");
+    return { compatible, label };
+  }
+  return {
+    compatible: false,
+    label: "Không thể xác nhận khả năng tương thích từ kết quả kiểm tra bản sao lưu.",
+  };
+}
+
+function restoreInspectionProjection(inspection: RestoreInspection): {
+  storeName: string;
+  createdAt: number | string | null;
+  wordpress: string;
+  woocommerce: string;
+  coffeepos: string;
+  uploadsBytes: number | null;
+} {
+  const backup = recordValue(inspection.backup);
+  const source = recordValue(backup?.source);
+  const manifest = recordValue(inspection.manifest);
+  const store = recordValue(manifest?.store);
+  const versions = recordValue(manifest?.versions);
+  const uploads = recordValue(manifest?.uploads);
+  return {
+    storeName: firstString(backup?.store_name, inspection.store_name, manifest?.store_name, store?.name) || "—",
+    createdAt: typeof backup?.created_at === "string" || typeof backup?.created_at === "number"
+      ? backup.created_at
+      : typeof inspection.created_at === "string" || typeof inspection.created_at === "number"
+        ? inspection.created_at
+        : firstFiniteNumber(manifest?.created_at),
+    wordpress: firstString(source?.wordpress_version, inspection.wordpress_version, manifest?.wordpress_version, versions?.wordpress) || "—",
+    woocommerce: firstString(source?.woocommerce_version, inspection.woocommerce_version, manifest?.woocommerce_version, versions?.woocommerce) || "—",
+    coffeepos: firstString(source?.coffeepos_version, inspection.coffeepos_version, manifest?.coffeepos_version, versions?.coffeepos) || "—",
+    uploadsBytes: firstFiniteNumber(backup?.uploads_bytes, inspection.uploads_bytes, manifest?.uploads_bytes, uploads?.total_bytes, uploads?.bytes),
+  };
+}
+
+function restoreTerminalKind(status = currentRestoreStatus): "success" | "cancelled" | "rolled_back" | "failed" | "recovery" | null {
+  if (!status) return null;
+  const stage = status.stage ?? "";
+  if (status.needs_recovery || status.recovery_required || ["blocked", "needs_recovery", "recovery_required", "rollback_failed"].includes(stage)) return "recovery";
+  if (stage === "committed" || stage === "cleanup") return "success";
+  if (stage === "rolled_back") return "rolled_back";
+  if (stage === "aborted") return status.failed ? "failed" : "cancelled";
+  if ([
+    "planned",
+    "validated",
+    "runtime_stopped",
+    "recovery_backup_ready",
+    "staging_prepared",
+    "database_imported",
+    "uploads_restored",
+    "target_secrets_bound",
+    "staging_verified",
+    "cutover_started",
+    "active_swapped",
+    "active_verified",
+    "abort_started",
+    "rollback_started",
+  ].includes(stage)) return null;
+  if (status.succeeded) return "success";
+  if (status.rolled_back) return "rolled_back";
+  if (status.cancelled) return "cancelled";
+  if (status.failed || stage === "failed") return "failed";
+  return null;
+}
+
+function restoreIsActive(status = currentRestoreStatus): boolean {
+  return !!status?.operation_id && restoreTerminalKind(status) === null;
+}
+
+function restoreNeedsRecovery(status = currentRestoreStatus): boolean {
+  return restoreTerminalKind(status) === "recovery";
+}
+
+function restoreSystemBusy(): boolean {
+  return restoreOperation === "inspect"
+    || restoreOperation === "apply"
+    || restoreOperation === "cancel"
+    || restoreIsActive()
+    || restoreNeedsRecovery();
+}
+
 function backupErrorInfo(error: unknown): BackupErrorInfo | null {
   if (!error || typeof error !== "object") return null;
   const value = error as Record<string, unknown>;
@@ -426,13 +810,24 @@ function backupIsActive(status = currentBackupStatus): boolean {
 }
 
 function backupSystemBusy(): boolean {
-  return backupOperation === "create" || backupOperation === "cancel" || backupIsActive();
+  return backupOperation === "create" || backupOperation === "cancel" || backupIsActive() || restoreSystemBusy();
 }
 
-function formatBackupTimestamp(value: number | null | undefined): string {
-  if (!value || !Number.isFinite(value)) return "—";
-  const milliseconds = value < 10_000_000_000 ? value * 1000 : value;
-  const date = new Date(milliseconds);
+function backupCancellationAvailable(status = currentBackupStatus): boolean {
+  return (
+    backupIsActive(status) &&
+    !!status &&
+    ["selecting_destination", "preflight", "quiesce", "database", "uploads", "archive"].includes(status.stage)
+  );
+}
+
+function formatBackupTimestamp(value: number | string | null | undefined): string {
+  if (value === null || value === undefined || value === "") return "—";
+  const date = typeof value === "string"
+    ? new Date(value)
+    : Number.isFinite(value)
+      ? new Date(value < 10_000_000_000 ? value * 1000 : value)
+      : new Date(Number.NaN);
   if (Number.isNaN(date.getTime())) return "—";
   return new Intl.DateTimeFormat("vi-VN", {
     dateStyle: "short",
@@ -489,21 +884,23 @@ function clearBackupPasswordFields(): void {
 function setBackupControls(): void {
   const active = backupIsActive();
   const mutating = backupOperation === "create" || backupOperation === "cancel";
+  const restoring = restoreSystemBusy();
   const eligible = currentProvisioning?.state === "ready" && !repairRouteRequired;
-  backupCard.setAttribute("aria-busy", active || mutating ? "true" : "false");
+  backupCard.setAttribute("aria-busy", active || mutating || restoring ? "true" : "false");
   backupCreate.disabled = !eligible || backupSystemBusy();
-  backupPassword.disabled = mutating || active;
-  backupPasswordConfirm.disabled = mutating || active;
-  backupPasswordCancel.disabled = mutating || active;
-  backupChooseDestination.disabled = !eligible || mutating || active;
-  backupCancel.disabled = !active || backupOperation === "cancel";
-  backupOpenFolder.disabled = backupOperation === "open_folder" || !currentBackupStatus?.succeeded || !currentBackupStatus.operation_id;
+  backupPassword.disabled = mutating || active || restoring;
+  backupPasswordConfirm.disabled = mutating || active || restoring;
+  backupPasswordCancel.disabled = mutating || active || restoring;
+  backupChooseDestination.disabled = !eligible || mutating || active || restoring;
+  backupCancel.disabled = !backupCancellationAvailable() || backupOperation === "cancel" || restoring;
+  backupOpenFolder.disabled = restoring || backupOperation === "open_folder" || !currentBackupStatus?.succeeded || !currentBackupStatus.operation_id;
   backupCreateAnother.disabled = backupSystemBusy();
   backupRetry.disabled = backupSystemBusy() || !eligible;
 }
 
 function syncOperationControls(): void {
   setBackupControls();
+  setRestoreControls();
   setRuntimeControls(currentRuntime);
   setHealthControls();
   setRepairControls();
@@ -625,7 +1022,7 @@ async function refreshBackupStatus(moveFocus = false): Promise<BackupStatus | nu
     if (moveFocus) element<HTMLElement>("backup-title").focus();
     return status;
   } catch (error) {
-    if (backupSystemBusy()) {
+    if (backupOperation === "create" || backupOperation === "cancel" || backupIsActive()) {
       setTextIfChanged(backupProgressStatus, "Không thể cập nhật tiến độ tạm thời. CoffeePOS vẫn giữ thao tác sao lưu hiện tại.");
       ensureBackupPolling();
       return currentBackupStatus;
@@ -742,6 +1139,453 @@ function showBackupPasswordStep(): void {
   setTextIfChanged(backupState, "Sẵn sàng");
   selectBackupView("password", true);
   setBackupControls();
+}
+
+function restoreStageLabel(stage: string): string {
+  const labels: Record<string, string> = {
+    planned: "Đã lập kế hoạch khôi phục",
+    validated: "Đã kiểm tra bản sao lưu",
+    runtime_stopped: "Đã tạm dừng cửa hàng",
+    recovery_backup_ready: "Đã tạo bản sao an toàn của trạng thái hiện tại",
+    staging_prepared: "Đang chuẩn bị dữ liệu khôi phục",
+    database_imported: "Đã khôi phục cơ sở dữ liệu vào staging",
+    uploads_restored: "Đã khôi phục uploads vào staging",
+    target_secrets_bound: "Đã tạo credential cho Windows profile này",
+    staging_verified: "Đã kiểm tra staging",
+    cutover_started: "Đang chuyển cửa hàng đã kiểm tra sang trạng thái active",
+    active_swapped: "Đang kiểm tra cửa hàng sau khi chuyển dữ liệu",
+    active_verified: "Cửa hàng mới đã vượt qua kiểm tra cuối",
+    committed: "Đã commit khôi phục",
+    cleanup: "Đang dọn dữ liệu tạm an toàn",
+    abort_started: "Đang hủy khôi phục và khôi phục trạng thái trước",
+    rollback_started: "Đang hoàn tác về cửa hàng trước khi khôi phục",
+    rolled_back: "Đã hoàn tác về trạng thái trước",
+    aborted: "Đã hủy khôi phục",
+  };
+  return labels[stage] ?? "CoffeePOS đang xử lý giao dịch khôi phục";
+}
+
+function restoreCancellationAvailable(status = currentRestoreStatus): boolean {
+  if (!restoreIsActive(status) || !status) return false;
+  return !["active_verified", "committed", "cleanup", "abort_started", "rollback_started"].includes(status.stage);
+}
+
+function restoreCutoverStarted(status = currentRestoreStatus): boolean {
+  if (!status) return false;
+  return [
+    "cutover_started",
+    "active_swapped",
+    "active_verified",
+    "rollback_started",
+  ].includes(status.stage);
+}
+
+function clearRestorePassword(): void {
+  restorePassword.value = "";
+  restorePassword.removeAttribute("aria-invalid");
+  restorePasswordError.textContent = "";
+  restorePasswordError.hidden = true;
+}
+
+function selectRestoreView(view: RestoreView, moveFocus = false): void {
+  currentRestoreView = view;
+  for (const panel of restoreViews) panel.hidden = panel.dataset.restoreView !== view;
+  if (!moveFocus) return;
+  if (view === "password") restorePassword.focus();
+  else element<HTMLElement>("restore-title").focus();
+}
+
+function showRestoreScreen(view: RestoreView, moveFocus = false): void {
+  bootstrapPanel.hidden = true;
+  setup.hidden = true;
+  installedShell.hidden = true;
+  restoreScreen.hidden = false;
+  selectRestoreView(view, moveFocus);
+}
+
+function hideRestoreScreen(): void {
+  restoreScreen.hidden = true;
+  restoreScreen.setAttribute("aria-busy", "false");
+}
+
+function setRestoreControls(): void {
+  const active = restoreIsActive();
+  const mutating = restoreOperation === "apply" || restoreOperation === "cancel";
+  const inspecting = restoreOperation === "inspect";
+  const compatibility = currentRestoreInspection ? restoreCompatibility(currentRestoreInspection) : null;
+  const installedEligible = currentProvisioning?.state === "ready" && !repairRouteRequired;
+  const freshEligible = currentProvisioning?.state === "not_installed";
+  const otherMaintenance = backupOperation === "create" || backupOperation === "cancel" || backupIsActive();
+
+  restoreCard.setAttribute("aria-busy", active || mutating || inspecting ? "true" : "false");
+  restoreScreen.setAttribute("aria-busy", active || mutating ? "true" : "false");
+  setupRestore.disabled = !freshEligible || otherMaintenance || restoreSystemBusy();
+  restoreInstalledStart.disabled = !installedEligible || otherMaintenance || restoreSystemBusy();
+  restorePassword.disabled = active || mutating || inspecting;
+  restoreInspect.disabled = active || mutating || inspecting || otherMaintenance;
+  restorePasswordCancel.disabled = active || mutating || inspecting;
+  restoreReviewCancel.disabled = active || mutating;
+  restoreApply.disabled = active
+    || mutating
+    || !restoreCandidateId()
+    || compatibility?.compatible === false
+    || otherMaintenance;
+  restoreCancel.disabled = !restoreCancellationAvailable() || restoreOperation === "cancel";
+  restoreFailureBack.disabled = active || mutating;
+  restoreRetry.disabled = active || mutating || otherMaintenance;
+  restoreRecoveryRefresh.disabled = restoreStatusRefreshBusy;
+}
+
+function renderRestoreInspection(inspection: RestoreInspection): void {
+  const backup = recordValue(inspection.backup);
+  const projection = restoreInspectionProjection(inspection);
+  const compatibility = restoreCompatibility(inspection);
+  const warnings = restoreInspectionWarnings(inspection);
+  const candidateId = restoreCandidateId(inspection);
+  currentRestoreInspection = {
+    candidate_id: candidateId,
+    backup_id: firstString(backup?.backup_id, inspection.backup_id),
+    store_name: projection.storeName === "—" ? "" : projection.storeName,
+    created_at: projection.createdAt,
+    wordpress_version: projection.wordpress === "—" ? "" : projection.wordpress,
+    woocommerce_version: projection.woocommerce === "—" ? "" : projection.woocommerce,
+    coffeepos_version: projection.coffeepos === "—" ? "" : projection.coffeepos,
+    uploads_bytes: projection.uploadsBytes ?? undefined,
+    compatible: compatibility.compatible,
+    compatibility: compatibility.label,
+    warnings,
+  };
+  const unmanaged = warnings.some((warning) => /unmanaged|custom_(?:plugin|theme|code)|extensions_excluded/i.test(warning));
+
+  setTextIfChanged(restoreReviewStore, projection.storeName);
+  setTextIfChanged(restoreReviewCreated, projection.createdAt ? formatBackupTimestamp(projection.createdAt) : "—");
+  setTextIfChanged(restoreReviewWordPress, projection.wordpress);
+  setTextIfChanged(restoreReviewWooCommerce, projection.woocommerce);
+  setTextIfChanged(restoreReviewCoffeePos, projection.coffeepos);
+  setTextIfChanged(restoreReviewUploads, projection.uploadsBytes === null ? "—" : formatBackupBytes(projection.uploadsBytes));
+  setTextIfChanged(restoreReviewCompatibility, compatibility.label);
+  restoreUnmanagedWarning.hidden = !unmanaged;
+  restoreReviewError.hidden = compatibility.compatible;
+  setTextIfChanged(
+    restoreReviewError,
+    compatibility.compatible ? "" : "Bản sao lưu này chưa thể được áp dụng trên phiên bản CoffeePOS Desktop hiện tại.",
+  );
+  setTextIfChanged(
+    restoreReviewImpact,
+    restoreEntrySource === "fresh"
+      ? "Khôi phục sẽ tạo cửa hàng trên Windows profile này từ bản sao lưu đã kiểm tra."
+      : "Khôi phục sẽ thay dữ liệu cửa hàng hiện tại. CoffeePOS sẽ tạo một bản sao an toàn của trạng thái hiện tại trước khi thay.",
+  );
+  setTextIfChanged(restoreState, compatibility.compatible ? "Đã kiểm tra" : "Không tương thích");
+  showRestoreScreen("review", true);
+  setRestoreControls();
+}
+
+function renderRestoreProgress(status: RestoreStatus): void {
+  setTextIfChanged(restoreState, "Đang khôi phục");
+  setTextIfChanged(restoreProgressStage, restoreStageLabel(status.stage));
+  const afterCutover = restoreCutoverStarted(status);
+  const canCancel = restoreCancellationAvailable(status);
+  setTextIfChanged(
+    restoreProgressDetail,
+    afterCutover
+      ? "Dữ liệu đã bước vào giai đoạn chuyển active. Nếu dừng lúc này, CoffeePOS phải hoàn tất rollback có kiểm tra thay vì bỏ dở giao dịch."
+      : "CoffeePOS đang giữ thao tác này trong admission gate để backup, repair, provisioning và runtime action khác không chạy đồng thời.",
+  );
+  setTextIfChanged(
+    restoreCloseGuidance,
+    afterCutover
+      ? "Không tắt máy trong khi dữ liệu đang được chuyển hoặc hoàn tác. Đóng cửa sổ sẽ đi qua native lifecycle guard."
+      : "Không tắt máy trong khi dữ liệu đang được chuẩn bị. Bạn có thể dùng Hủy khi nút còn khả dụng.",
+  );
+  setTextIfChanged(restoreCancel, afterCutover ? "Dừng và hoàn tác" : "Hủy khôi phục");
+  restoreCancel.hidden = !canCancel && !restoreOperation;
+  showRestoreScreen("progress");
+}
+
+function restoreStatusError(status: RestoreStatus): { message: string; recovery: string } {
+  const error = status.last_error;
+  if (!error) {
+    return {
+      message: "CoffeePOS chưa thể hoàn tất thao tác khôi phục.",
+      recovery: "Kiểm tra trạng thái hiện tại rồi thử lại khi hệ thống cho phép.",
+    };
+  }
+  return restoreErrorInfo(error);
+}
+
+function renderRestoreStatus(status: RestoreStatus): void {
+  currentRestoreStatus = status;
+  if (status.original_state === "no_previous_store") restoreEntrySource = "fresh";
+  else if (status.original_state === "existing_store") restoreEntrySource = "installed";
+
+  const terminal = restoreTerminalKind(status);
+  if (terminal === "recovery") {
+    const error = restoreStatusError(status);
+    setTextIfChanged(restoreState, "Cần xử lý");
+    setTextIfChanged(
+      restoreRecoveryDetails,
+      [error.message, error.recovery].filter(Boolean).join(" ") || "Native restore recovery đang giữ admission gate để bảo vệ dữ liệu cửa hàng.",
+    );
+    showRestoreScreen("recovery");
+  } else if (terminal === "success") {
+    setTextIfChanged(restoreState, "Hoàn tất");
+    setTextIfChanged(restoreProgressStatus, "");
+    clearRestorePassword();
+    showRestoreScreen("success");
+  } else if (terminal === "rolled_back") {
+    const error = restoreStatusError(status);
+    setTextIfChanged(restoreState, "Đã hoàn tác");
+    setTextIfChanged(restoreFailureTitle, "Không thể khôi phục");
+    setTextIfChanged(
+      restoreFailureMessage,
+      restoreEntrySource === "fresh"
+        ? "CoffeePOS đã đưa profile về trạng thái chưa cài đặt sau khi khôi phục không hoàn tất."
+        : "CoffeePOS đã đưa cửa hàng về trạng thái trước khi khôi phục.",
+    );
+    setTextIfChanged(restoreFailureRecovery, [error.message, error.recovery].filter(Boolean).join(" "));
+    clearRestorePassword();
+    showRestoreScreen("failure");
+  } else if (terminal === "cancelled") {
+    setTextIfChanged(restoreState, "Đã hủy");
+    setTextIfChanged(restoreFailureTitle, "Đã hủy khôi phục");
+    setTextIfChanged(
+      restoreFailureMessage,
+      restoreEntrySource === "fresh"
+        ? "CoffeePOS đã dọn dữ liệu tạm và giữ profile ở trạng thái chưa cài đặt."
+        : "CoffeePOS đã dọn dữ liệu tạm và xác minh lại trạng thái cửa hàng trước đó.",
+    );
+    setTextIfChanged(restoreFailureRecovery, "");
+    clearRestorePassword();
+    showRestoreScreen("failure");
+  } else if (terminal === "failed") {
+    const error = restoreStatusError(status);
+    setTextIfChanged(restoreState, "Có lỗi");
+    setTextIfChanged(restoreFailureTitle, "Không thể khôi phục");
+    setTextIfChanged(restoreFailureMessage, error.message);
+    setTextIfChanged(restoreFailureRecovery, error.recovery);
+    clearRestorePassword();
+    showRestoreScreen("failure");
+  } else if (restoreIsActive(status)) {
+    renderRestoreProgress(status);
+  }
+
+  setRestoreControls();
+  setBackupControls();
+  setRuntimeControls(currentRuntime);
+  setHealthControls();
+  setRepairControls();
+  renderHome();
+}
+
+function showRestoreFailure(error: unknown): void {
+  const safe = restoreErrorInfo(error);
+  setTextIfChanged(restoreState, "Có lỗi");
+  setTextIfChanged(restoreFailureTitle, "Không thể khôi phục");
+  setTextIfChanged(restoreFailureMessage, safe.message);
+  setTextIfChanged(restoreFailureRecovery, safe.recovery);
+  clearRestorePassword();
+  showRestoreScreen("failure", true);
+  setRestoreControls();
+}
+
+function stopRestorePolling(): void {
+  if (restorePollTimer === null) return;
+  window.clearInterval(restorePollTimer);
+  restorePollTimer = null;
+}
+
+function ensureRestorePolling(): void {
+  if (restorePollTimer !== null) return;
+  restorePollTimer = window.setInterval(() => {
+    void refreshRestoreStatus();
+  }, RESTORE_POLL_INTERVAL_MS);
+}
+
+async function refreshRestoreStatus(moveFocus = false): Promise<RestoreStatus | null> {
+  if (!isTauri()) return null;
+  if (restoreStatusRefreshBusy) return currentRestoreStatus;
+  restoreStatusRefreshBusy = true;
+  const wasActive = restoreIsActive();
+  try {
+    const status = await invoke<RestoreStatus>("get_restore_status");
+    renderRestoreStatus(status);
+    if (restoreIsActive(status) || restoreOperation === "apply" || restoreOperation === "cancel") ensureRestorePolling();
+    else stopRestorePolling();
+    if (wasActive && !restoreIsActive(status) && !restoreNeedsRecovery(status) && restoreOperation === null) {
+      void refreshProvisioning().then((loaded) => {
+        if (loaded && currentProvisioning?.state === "ready") void refreshRuntime();
+      });
+    }
+    if (moveFocus && !restoreScreen.hidden) element<HTMLElement>("restore-title").focus();
+    return status;
+  } catch (error) {
+    if (restoreIsActive() || restoreOperation === "apply" || restoreOperation === "cancel") {
+      setTextIfChanged(restoreProgressStatus, "Không thể cập nhật tiến độ tạm thời. Native restore transaction vẫn đang giữ trạng thái hiện tại.");
+      ensureRestorePolling();
+      return currentRestoreStatus;
+    }
+    stopRestorePolling();
+    if (!restoreScreen.hidden) showRestoreFailure(error);
+    return null;
+  } finally {
+    restoreStatusRefreshBusy = false;
+    setRestoreControls();
+  }
+}
+
+function restoreEntryAllowed(source: RestoreEntrySource): boolean {
+  if (source === "fresh") return currentProvisioning?.state === "not_installed";
+  return currentProvisioning?.state === "ready" && !repairRouteRequired;
+}
+
+function beginRestore(source: RestoreEntrySource): void {
+  const backupBusy = backupOperation === "create" || backupOperation === "cancel" || backupIsActive();
+  if (backupBusy || restoreSystemBusy() || !restoreEntryAllowed(source)) return;
+  restoreEntrySource = source;
+  currentRestoreInspection = null;
+  currentRestoreStatus = null;
+  clearRestorePassword();
+  restoreReviewError.hidden = true;
+  setTextIfChanged(restoreState, "Sẵn sàng");
+  showRestoreScreen("password", true);
+  setRestoreControls();
+  setBackupControls();
+}
+
+async function inspectRestoreBackup(): Promise<void> {
+  if (!isTauri() || restoreOperation || restoreIsActive()) return;
+  const password = restorePassword.value;
+  restorePasswordError.hidden = true;
+  restorePassword.removeAttribute("aria-invalid");
+  if (password.length === 0) {
+    restorePassword.setAttribute("aria-invalid", "true");
+    setTextIfChanged(restorePasswordError, "Nhập mật khẩu của bản sao lưu.");
+    restorePasswordError.hidden = false;
+    restorePassword.focus();
+    return;
+  }
+
+  restoreOperation = "inspect";
+  currentRestoreInspection = null;
+  setTextIfChanged(restoreState, "Đang kiểm tra");
+  setTextIfChanged(restorePasswordError, "");
+  setRestoreControls();
+  setBackupControls();
+  try {
+    const inspection = await invoke<RestoreInspection | null>("inspect_restore_backup", { backupPassword: password });
+    if (!inspection || !restoreCandidateId(inspection)) {
+      clearRestorePassword();
+      setTextIfChanged(restoreState, "Sẵn sàng");
+      return;
+    }
+    renderRestoreInspection(inspection);
+  } catch (error) {
+    const safe = restoreErrorInfo(error);
+    clearRestorePassword();
+    setTextIfChanged(restoreState, "Không thể kiểm tra");
+    setTextIfChanged(restorePasswordError, [safe.message, safe.recovery].filter(Boolean).join(" "));
+    restorePasswordError.hidden = false;
+    showRestoreScreen("password");
+  } finally {
+    restoreOperation = null;
+    setRestoreControls();
+    setBackupControls();
+  }
+}
+
+async function applyRestore(): Promise<void> {
+  const candidateId = restoreCandidateId();
+  const compatibility = currentRestoreInspection ? restoreCompatibility(currentRestoreInspection) : null;
+  if (!isTauri() || !candidateId || compatibility?.compatible === false || restoreOperation || restoreIsActive()) return;
+  let password = restorePassword.value;
+  if (password.length === 0) {
+    currentRestoreInspection = null;
+    setTextIfChanged(restorePasswordError, "Nhập lại mật khẩu để kiểm tra bản sao lưu trước khi khôi phục.");
+    restorePasswordError.hidden = false;
+    showRestoreScreen("password", true);
+    return;
+  }
+
+  restoreOperation = "apply";
+  currentRestoreStatus = {
+    operation_id: null,
+    stage: "planned",
+    original_state: restoreEntrySource === "fresh" ? "no_previous_store" : "existing_store",
+  };
+  setTextIfChanged(restoreProgressStatus, "");
+  renderRestoreProgress(currentRestoreStatus);
+  setRestoreControls();
+  setBackupControls();
+  ensureRestorePolling();
+  const applyPromise = invoke<RestoreResult>("apply_restore", {
+    candidateId,
+    backupPassword: password,
+  });
+  clearRestorePassword();
+  password = "";
+  try {
+    await applyPromise;
+    await refreshRestoreStatus();
+  } catch (error) {
+    const status = await refreshRestoreStatus();
+    if (!restoreIsActive(status) && !restoreNeedsRecovery(status) && restoreTerminalKind(status) === null) {
+      showRestoreFailure(error);
+    }
+  } finally {
+    restoreOperation = null;
+    const status = await refreshRestoreStatus();
+    if (!restoreIsActive(status)) stopRestorePolling();
+    setRestoreControls();
+    setBackupControls();
+  }
+}
+
+async function cancelRestore(): Promise<void> {
+  const operationId = currentRestoreStatus?.operation_id;
+  if (!isTauri() || !operationId || !restoreCancellationAvailable() || restoreOperation) return;
+  const afterCutover = restoreCutoverStarted();
+  restoreOperation = "cancel";
+  setTextIfChanged(
+    restoreProgressStatus,
+    afterCutover
+      ? "Đã yêu cầu dừng. CoffeePOS đang hoàn tác và xác minh trạng thái trước khi khôi phục…"
+      : "Đã yêu cầu hủy. CoffeePOS đang dọn staging và xác minh trạng thái trước khi khôi phục…",
+  );
+  setRestoreControls();
+  try {
+    await invoke<unknown>("cancel_restore", { operationId });
+    ensureRestorePolling();
+  } catch (error) {
+    const safe = restoreErrorInfo(error);
+    setTextIfChanged(restoreProgressStatus, [safe.message, safe.recovery].filter(Boolean).join(" "));
+  } finally {
+    restoreOperation = null;
+    await refreshRestoreStatus();
+    setRestoreControls();
+  }
+}
+
+async function leaveRestoreFlow(openHome = false): Promise<void> {
+  if (restoreIsActive() || restoreNeedsRecovery() || restoreOperation) return;
+  clearRestorePassword();
+  currentRestoreInspection = null;
+  hideRestoreScreen();
+  const loaded = await refreshProvisioning();
+  if (!loaded || !currentProvisioning) {
+    if (restoreEntrySource === "fresh") setup.hidden = false;
+    return;
+  }
+  if (currentProvisioning.state === "not_installed") await refreshSetupInfo();
+  applyInstallationLayout(currentProvisioning);
+  if (currentProvisioning.state === "ready") {
+    await refreshRuntime();
+    if (openHome) selectInstalledView("home", true);
+    else if (restoreEntrySource === "installed") {
+      selectInstalledView("diagnostics", false);
+      selectSystemSection("backup", true, true);
+    }
+  }
 }
 
 function structuredErrorText(error: RuntimeErrorInfo): string {
@@ -1465,14 +2309,14 @@ function applySetupInfo(info: SetupInfo): void {
   passwordHint.textContent = info.password_configured
     ? "Mật khẩu đã được lưu bảo mật. Để trống hai ô mật khẩu để giữ nguyên, hoặc nhập mật khẩu mới trước khi bắt đầu cài đặt."
     : "Tối thiểu 12 ký tự. Mật khẩu không được lưu trong draft hoặc URL.";
-  name.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy;
-  adminUsername.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy;
-  adminEmail.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy;
-  adminPassword.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy;
-  adminPasswordConfirm.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy;
-  save.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy;
+  name.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
+  adminUsername.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
+  adminEmail.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
+  adminPassword.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
+  adminPasswordConfirm.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
+  save.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
   provisionWordPress.disabled =
-    !info.editable || !info.password_configured || setupProfileBusy || provisioningBusy || runtimeBusy;
+    !info.editable || !info.password_configured || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
   element("review-store-name").textContent = info.store_name;
   element("review-admin-username").textContent = info.admin_username;
   element("review-admin-email").textContent = info.admin_email;
@@ -1614,6 +2458,12 @@ function applyInstallationLayout(info: ProvisioningInfo): void {
   const enteringSetup = !useInstalledShell && setup.hidden === true;
   bootstrapPanel.hidden = true;
 
+  if (!restoreScreen.hidden) {
+    setup.hidden = true;
+    installedShell.hidden = true;
+    return;
+  }
+
   if (useInstalledShell) {
     if (repairMode) {
       completionPending = false;
@@ -1662,7 +2512,20 @@ function renderHome(): void {
     setHomeAction(null);
     return;
   }
-  if (backupSystemBusy()) {
+  if (restoreSystemBusy()) {
+    setTextIfChanged(homeState, restoreNeedsRecovery() ? "Cần xử lý" : "Đang khôi phục");
+    setTextIfChanged(homeStatus, restoreNeedsRecovery() ? "Khôi phục cần được kiểm tra" : "CoffeePOS đang khôi phục cửa hàng");
+    setTextIfChanged(
+      homeDetail,
+      restoreNeedsRecovery()
+        ? "CoffeePOS đang giữ admission gate để bảo vệ dữ liệu phục hồi. Mở luồng khôi phục để xem trạng thái."
+        : "POS và các thao tác thay đổi hệ thống tạm khóa trong khi restore transaction đang hoạt động.",
+    );
+    setTextIfChanged(homeDiagnostics, "Mở khôi phục");
+    setHomeAction(null);
+    return;
+  }
+  if (backupOperation === "create" || backupOperation === "cancel" || backupIsActive()) {
     setTextIfChanged(homeState, "Đang sao lưu");
     setTextIfChanged(homeStatus, "CoffeePOS đang sao lưu cửa hàng");
     setTextIfChanged(homeDetail, "POS tạm dừng trong khi CoffeePOS tạo snapshot nhất quán. Mở Sao lưu và khôi phục để xem tiến độ.");
@@ -1922,7 +2785,7 @@ function renderProvisioning(info: ProvisioningInfo, commandError?: string): void
   } else if (info.state === "not_installed") {
     provisioningStatus.textContent = "Cửa hàng chưa được thiết lập trên máy này.";
     setupRetry.hidden = true;
-    provisionWordPress.disabled = setupProfileBusy || provisioningBusy || runtimeBusy || !currentSetupInfo?.password_configured;
+    provisionWordPress.disabled = setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy() || !currentSetupInfo?.password_configured;
   } else if (info.state === "ready") {
     provisioningStatus.textContent = "CoffeePOS đã được cài đặt và activation baseline đã hoàn tất.";
     setupRetry.hidden = true;
@@ -1961,6 +2824,7 @@ async function renderProvisioningWithRepairRouting(
   renderProvisioning(info, commandError);
   setRepairControls();
   setBackupControls();
+  setRestoreControls();
 }
 
 async function refreshProvisioning(commandError?: string): Promise<boolean> {
@@ -2042,7 +2906,7 @@ async function provision(): Promise<void> {
 }
 
 async function copyAdminPassword(status: HTMLElement, button: HTMLButtonElement): Promise<void> {
-  if (provisioningBusy || runtimeBusy || repairOperation) return;
+  if (provisioningBusy || runtimeBusy || repairOperation || backupSystemBusy()) return;
   button.disabled = true;
   setTextIfChanged(status, "Đang sao chép…");
   try {
@@ -2194,9 +3058,13 @@ async function bootstrap(): Promise<void> {
       return;
     }
 
-    // Reconnect to an active native backup before provisioning/runtime reads. The backup worker
-    // intentionally owns those lifecycle locks for the full maintenance window, while status and
-    // cancellation stay lock-independent so a WebView reload can resume progress immediately.
+    // Restore recovery must be read before provisioning/runtime work so a WebView reload cannot
+    // race daily startup while a restore journal still owns the external admission gate.
+    await refreshRestoreStatus();
+    if (restoreIsActive() || restoreNeedsRecovery()) return;
+
+    // Reconnect to an active native backup before provisioning/runtime reads. Backup status and
+    // cancellation remain lock-independent so a WebView reload can resume progress immediately.
     await refreshBackupStatus();
     const provisioningLoaded = await refreshProvisioning();
     if (!provisioningLoaded) return;
@@ -2226,6 +3094,7 @@ setupRetry.addEventListener("click", () => {
 });
 provisionWordPress.addEventListener("click", () => void provision());
 setupBegin.addEventListener("click", () => selectSetupStep("details", true));
+setupRestore.addEventListener("click", () => beginRestore("fresh"));
 setupBack.addEventListener("click", () => selectSetupStep("welcome", true));
 setupEdit.addEventListener("click", () => selectSetupStep("details", true));
 completeContinue.addEventListener("click", () => {
@@ -2296,11 +3165,24 @@ backupPasswordForm.addEventListener("submit", (event) => {
 });
 backupCancel.addEventListener("click", () => void cancelBackup());
 backupOpenFolder.addEventListener("click", () => void openBackupFolder());
+restoreInstalledStart.addEventListener("click", () => beginRestore("installed"));
+restorePasswordForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void inspectRestoreBackup();
+});
+restorePasswordCancel.addEventListener("click", () => void leaveRestoreFlow(false));
+restoreReviewCancel.addEventListener("click", () => void leaveRestoreFlow(false));
+restoreApply.addEventListener("click", () => void applyRestore());
+restoreCancel.addEventListener("click", () => void cancelRestore());
+restoreOpenHome.addEventListener("click", () => void leaveRestoreFlow(true));
+restoreFailureBack.addEventListener("click", () => void leaveRestoreFlow(false));
+restoreRetry.addEventListener("click", () => beginRestore(restoreEntrySource));
+restoreRecoveryRefresh.addEventListener("click", () => void refreshRestoreStatus(true));
 openWordPress.addEventListener("click", () => void openManagedWordPress());
 
 setupForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (setupProfileBusy || provisioningBusy || runtimeBusy || currentProvisioning?.state !== "not_installed") return;
+  if (setupProfileBusy || provisioningBusy || runtimeBusy || backupSystemBusy() || currentProvisioning?.state !== "not_installed") return;
   if (!validateSetupForm()) return;
   setupProfileBusy = true;
   save.disabled = true;

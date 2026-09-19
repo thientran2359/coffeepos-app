@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -83,7 +83,8 @@ pub struct BackupSourceVersions {
     pub app_config_schema: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BackupDestinationIdentity {
     volume_serial_number: u32,
     file_index: u64,
@@ -328,6 +329,17 @@ pub struct BackupValidation {
     pub valid: bool,
     pub entries_validated: u64,
     pub inspection: BackupInspection,
+}
+
+#[derive(Debug)]
+pub(crate) struct RestorePayload {
+    pub(crate) store_name: String,
+    pub(crate) administrator_username: String,
+    pub(crate) administrator_email: String,
+    pub(crate) administrator_password: Zeroizing<String>,
+    pub(crate) database_dump: PathBuf,
+    pub(crate) upload_files: u64,
+    pub(crate) upload_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1411,8 +1423,383 @@ pub fn validate_backup(
     validate_backup_internal(path, backup_password, target, "validate")
 }
 
+pub(crate) fn extract_restore_payload(
+    path: &Path,
+    backup_password: &str,
+    target: &BackupCompatibilityTarget,
+    expected_encrypted_sha256: &str,
+    destination_root: &Path,
+    cancelled: &AtomicBool,
+) -> Result<RestorePayload, BackupErrorInfo> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(backup_error(
+            "restore_extract",
+            "cancelled",
+            "Restore was cancelled before backup extraction started.",
+            "Choose the backup again when you are ready to retry restore.",
+        ));
+    }
+    let mut file = open_backup_read_stable(path, "restore_extract")?;
+    let validation = validate_backup_file(&mut file, backup_password, target, "restore_extract")?;
+    verify_bound_restore_source(&mut file, expected_encrypted_sha256)?;
+    if !validation.inspection.can_restore {
+        return Err(backup_error(
+            "restore_extract",
+            "incompatible_backup",
+            "This backup does not match the supported CoffeePOS restore baseline.",
+            validation.inspection.compatibility.message.clone(),
+        ));
+    }
+    prepare_restore_destination(destination_root)?;
+    file.seek(SeekFrom::Start(0)).map_err(|_| {
+        backup_error(
+            "restore_extract",
+            "backup_file_unavailable",
+            "CoffeePOS cannot rewind the validated backup handle for restore extraction.",
+            "Choose the backup again and retry restore.",
+        )
+    })?;
+    let decryptor = age::Decryptor::new(BufReader::new(&mut file)).map_err(|_| {
+        backup_error(
+            "restore_extract",
+            "corrupt_encrypted_container",
+            "The selected file is not a valid encrypted CoffeePOS backup container.",
+            "Choose an intact CoffeePOS backup and retry.",
+        )
+    })?;
+    let passphrase = SecretString::from(backup_password.to_owned());
+    let identity = age::scrypt::Identity::new(passphrase);
+    let decrypted = decryptor
+        .decrypt(std::iter::once(&identity as &dyn age::Identity))
+        .map_err(|_| {
+            backup_error(
+                "restore_extract",
+                "authentication_failed",
+                "The backup password is incorrect or the encrypted backup changed.",
+                "Re-inspect the selected backup with its original password before retrying restore.",
+            )
+        })?;
+    let mut reader = CountingReader::new(decrypted);
+    let mut store_config: Option<PortableStoreConfigV1> = None;
+    let mut administrator_secret: Option<PortableAdministratorSecretV1> = None;
+    let mut database_dump = None;
+    let mut upload_files = 0_u64;
+    let mut upload_bytes = 0_u64;
+
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(backup_error(
+                "restore_extract",
+                "cancelled",
+                "Restore was cancelled while decrypting the backup into private staging.",
+                "CoffeePOS will discard the owned restore staging before another restore starts.",
+            ));
+        }
+        let next = zip::read::read_zipfile_from_stream(&mut reader).map_err(|_| {
+            backup_error(
+                "restore_extract",
+                "invalid_zip",
+                "CoffeePOS could not read the validated backup again during restore extraction.",
+                "The backup may have changed after inspection. Re-select and inspect it before retrying.",
+            )
+        })?;
+        let Some(mut entry) = next else {
+            break;
+        };
+        let raw_name = std::str::from_utf8(entry.name_raw()).map_err(|_| {
+            backup_error(
+                "restore_extract",
+                "unsafe_archive_path",
+                "The backup contains a non-UTF-8 archive path.",
+                "Use an intact backup created by a compatible CoffeePOS version.",
+            )
+        })?;
+        let archive_path = validate_archive_path(raw_name, "restore_extract")?;
+        match archive_path.as_str() {
+            "manifest.json" | INVENTORY_ENTRY => {
+                io::copy(&mut entry, &mut io::sink()).map_err(|_| restore_extract_read_error())?;
+            }
+            DATABASE_ENTRY => {
+                let output = destination_root.join("database/store.sql");
+                write_restore_entry(&mut entry, destination_root, &output, cancelled)?;
+                database_dump = Some(output);
+            }
+            STORE_CONFIG_ENTRY => {
+                let bytes = read_control_json(
+                    &mut entry,
+                    MAX_PORTABLE_CONFIG_JSON_BYTES,
+                    "restore_extract",
+                    "portable store configuration",
+                )?;
+                let parsed = parse_store_config(&bytes, "restore_extract")?;
+                validate_store_config(&parsed, "restore_extract")?;
+                store_config = Some(parsed);
+            }
+            ADMINISTRATOR_SECRET_ENTRY => {
+                let bytes = read_control_json(
+                    &mut entry,
+                    MAX_PORTABLE_CONFIG_JSON_BYTES,
+                    "restore_extract",
+                    "portable administrator credential",
+                )?;
+                let parsed = parse_administrator_secret(&bytes, "restore_extract")?;
+                if parsed.password.is_empty() {
+                    return Err(backup_error(
+                        "restore_extract",
+                        "invalid_administrator_secret",
+                        "The encrypted administrator credential is empty.",
+                        "Create a new backup after repairing the source administrator credential.",
+                    ));
+                }
+                administrator_secret = Some(parsed);
+            }
+            _ if archive_path.starts_with(UPLOADS_ROOT) => {
+                let relative = archive_path
+                    .strip_prefix(UPLOADS_ROOT)
+                    .ok_or_else(restore_extract_path_error)?;
+                let output = safe_restore_upload_path(destination_root, relative)?;
+                let size = entry.size();
+                write_restore_entry(&mut entry, destination_root, &output, cancelled)?;
+                upload_files = upload_files.saturating_add(1);
+                upload_bytes = upload_bytes.checked_add(size).ok_or_else(|| {
+                    size_limit_error("restore_extract", "Restore upload size counter overflowed.")
+                })?;
+            }
+            _ => {
+                return Err(backup_error(
+                    "restore_extract",
+                    "unexpected_restore_entry",
+                    "The backup contains a payload entry that restore does not own.",
+                    "Use a canonical CoffeePOS backup and retry restore.",
+                ));
+            }
+        }
+    }
+
+    let store_config =
+        store_config.ok_or_else(|| missing_entry_error("restore_extract", STORE_CONFIG_ENTRY))?;
+    let administrator_secret = administrator_secret
+        .ok_or_else(|| missing_entry_error("restore_extract", ADMINISTRATOR_SECRET_ENTRY))?;
+    if administrator_secret.username != store_config.administrator.username {
+        return Err(backup_error(
+            "restore_extract",
+            "administrator_identity_mismatch",
+            "The restored administrator credential does not match the portable store identity.",
+            "Use a new backup created from a healthy source store.",
+        ));
+    }
+    let database_dump =
+        database_dump.ok_or_else(|| missing_entry_error("restore_extract", DATABASE_ENTRY))?;
+    drop(reader);
+    verify_bound_restore_source(&mut file, expected_encrypted_sha256)?;
+    Ok(RestorePayload {
+        store_name: store_config.store_name,
+        administrator_username: store_config.administrator.username,
+        administrator_email: store_config.administrator.email,
+        administrator_password: administrator_secret.password,
+        database_dump,
+        upload_files,
+        upload_bytes,
+    })
+}
+
+fn verify_bound_restore_source(
+    file: &mut File,
+    expected_encrypted_sha256: &str,
+) -> Result<(), BackupErrorInfo> {
+    if expected_encrypted_sha256.len() != 64
+        || !expected_encrypted_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(backup_error(
+            "restore_extract",
+            "invalid_candidate_binding",
+            "CoffeePOS restore candidate binding is invalid.",
+            "Choose and inspect the backup again before applying restore.",
+        ));
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| restore_extract_read_error())?;
+    let mut sha = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| restore_extract_read_error())?;
+        if read == 0 {
+            break;
+        }
+        sha.update(&buffer[..read]);
+    }
+    let actual = hex_lower(&sha.finalize());
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| restore_extract_read_error())?;
+    if actual != expected_encrypted_sha256 {
+        return Err(backup_error(
+            "restore_extract",
+            "stale_candidate",
+            "The selected backup changed after it was inspected.",
+            "Choose and inspect the backup again before applying restore.",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_restore_destination(destination_root: &Path) -> Result<(), BackupErrorInfo> {
+    if !destination_root.is_absolute() {
+        return Err(restore_extract_path_error());
+    }
+    let metadata =
+        fs::symlink_metadata(destination_root).map_err(|_| restore_extract_path_error())?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+    {
+        return Err(restore_extract_path_error());
+    }
+    for relative in ["database", "uploads"] {
+        let directory = destination_root.join(relative);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata)
+                if metadata.file_type().is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && !metadata_is_reparse_point(&metadata) => {}
+            Ok(_) => return Err(restore_extract_path_error()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&directory).map_err(|_| restore_extract_path_error())?;
+            }
+            Err(_) => return Err(restore_extract_path_error()),
+        }
+    }
+    Ok(())
+}
+
+fn safe_restore_upload_path(
+    destination_root: &Path,
+    relative: &str,
+) -> Result<PathBuf, BackupErrorInfo> {
+    if relative.is_empty() {
+        return Err(restore_extract_path_error());
+    }
+    let mut output = destination_root.join("uploads");
+    let parts = relative.split('/').collect::<Vec<_>>();
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() || *part == "." || *part == ".." {
+            return Err(restore_extract_path_error());
+        }
+        output.push(part);
+        if index + 1 < parts.len() {
+            match fs::symlink_metadata(&output) {
+                Ok(metadata)
+                    if metadata.file_type().is_dir()
+                        && !metadata.file_type().is_symlink()
+                        && !metadata_is_reparse_point(&metadata) => {}
+                Ok(_) => return Err(restore_extract_path_error()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir(&output).map_err(|_| restore_extract_path_error())?;
+                }
+                Err(_) => return Err(restore_extract_path_error()),
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn write_restore_entry(
+    reader: &mut impl Read,
+    destination_root: &Path,
+    output: &Path,
+    cancelled: &AtomicBool,
+) -> Result<(), BackupErrorInfo> {
+    if !output.starts_with(destination_root) {
+        return Err(restore_extract_path_error());
+    }
+    let parent = output.parent().ok_or_else(restore_extract_path_error)?;
+    let metadata = fs::symlink_metadata(parent).map_err(|_| restore_extract_path_error())?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+    {
+        return Err(restore_extract_path_error());
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .map_err(|_| {
+            backup_error(
+                "restore_extract",
+                "restore_staging_write_failed",
+                "CoffeePOS cannot create a private restore staging file.",
+                "Check CoffeePOS data-volume permissions and free space, then retry restore.",
+            )
+        })?;
+    let mut buffer = Zeroizing::new([0_u8; 64 * 1024]);
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(backup_error(
+                "restore_extract",
+                "cancelled",
+                "Restore was cancelled while writing private staging.",
+                "CoffeePOS will discard owned restore staging before another restore starts.",
+            ));
+        }
+        let read = reader
+            .read(&mut buffer[..])
+            .map_err(|_| restore_extract_read_error())?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read]).map_err(|_| {
+            backup_error(
+                "restore_extract",
+                "restore_staging_write_failed",
+                "CoffeePOS cannot write private restore staging.",
+                "Check CoffeePOS data-volume free space and permissions, then retry restore.",
+            )
+        })?;
+    }
+    file.sync_all().map_err(|_| {
+        backup_error(
+            "restore_extract",
+            "restore_staging_flush_failed",
+            "CoffeePOS cannot flush private restore staging to disk.",
+            "Check CoffeePOS data-volume health and retry restore.",
+        )
+    })
+}
+
+fn restore_extract_read_error() -> BackupErrorInfo {
+    backup_error(
+        "restore_extract",
+        "restore_extract_read_failed",
+        "CoffeePOS could not read the encrypted backup while building private restore staging.",
+        "The backup may have changed or become unreadable. Re-select and inspect it before retrying.",
+    )
+}
+
+fn restore_extract_path_error() -> BackupErrorInfo {
+    backup_error(
+        "restore_extract",
+        "unsafe_restore_staging",
+        "CoffeePOS refused an unsafe restore staging path.",
+        "Preserve unknown filesystem entries and retry with a normal local CoffeePOS data directory.",
+    )
+}
+
 fn validate_backup_internal(
     path: &Path,
+    backup_password: &str,
+    target: &BackupCompatibilityTarget,
+    action: &str,
+) -> Result<BackupValidation, BackupErrorInfo> {
+    let mut file = open_backup_read_stable(path, action)?;
+    validate_backup_file(&mut file, backup_password, target, action)
+}
+
+fn validate_backup_file(
+    file: &mut File,
     backup_password: &str,
     target: &BackupCompatibilityTarget,
     action: &str,
@@ -1425,11 +1812,11 @@ fn validate_backup_internal(
             "Enter the password used when this backup was created and retry.",
         ));
     }
-    let file = File::open(path).map_err(|_| {
+    file.seek(SeekFrom::Start(0)).map_err(|_| {
         backup_error(
             action,
             "backup_file_unavailable",
-            "CoffeePOS cannot open the selected backup file.",
+            "CoffeePOS cannot rewind the selected backup file.",
             "Choose an existing readable .coffeepos-backup file and retry.",
         )
     })?;
@@ -1479,6 +1866,32 @@ fn validate_backup_internal(
             "Use an intact backup file or verify the backup password.",
         )),
     }
+}
+
+#[cfg(windows)]
+fn open_backup_read_stable(path: &Path, action: &str) -> Result<File, BackupErrorInfo> {
+    // The restore extractor keeps this exact native file handle alive across validation, seek and
+    // extraction. A path replacement therefore cannot swap in a second archive between passes.
+    File::open(path).map_err(|_| {
+        backup_error(
+            action,
+            "backup_file_unavailable",
+            "CoffeePOS cannot open the selected backup file.",
+            "Choose an existing readable .coffeepos-backup file and retry.",
+        )
+    })
+}
+
+#[cfg(not(windows))]
+fn open_backup_read_stable(path: &Path, action: &str) -> Result<File, BackupErrorInfo> {
+    File::open(path).map_err(|_| {
+        backup_error(
+            action,
+            "backup_file_unavailable",
+            "CoffeePOS cannot open the selected backup file.",
+            "Choose an existing readable .coffeepos-backup file and retry.",
+        )
+    })
 }
 
 fn validate_decrypted_zip<R: Read>(
@@ -3423,6 +3836,45 @@ mod tests {
             inspection.compatibility.status,
             BackupCompatibilityStatus::Compatible
         );
+    }
+
+    #[test]
+    fn restore_extraction_is_bound_to_the_inspected_ciphertext() {
+        let encrypted = write_fixture(source_versions(), &valid_entries());
+        let source = tempfile::NamedTempFile::new().unwrap();
+        fs::write(source.path(), &encrypted).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let stale = extract_restore_payload(
+            source.path(),
+            PASSWORD,
+            &target(),
+            &"0".repeat(64),
+            staging.path(),
+            &cancelled,
+        )
+        .unwrap_err();
+        assert_eq!(stale.code, "stale_candidate");
+
+        let staging = tempfile::tempdir().unwrap();
+        let expected = hex_lower(&Sha256::digest(&encrypted));
+        let payload = extract_restore_payload(
+            source.path(),
+            PASSWORD,
+            &target(),
+            &expected,
+            staging.path(),
+            &cancelled,
+        )
+        .unwrap();
+        assert_eq!(payload.store_name, "Coffee & Co Café");
+        assert_eq!(payload.administrator_username, "owner");
+        assert_eq!(payload.administrator_email, "owner@example.com");
+        assert_eq!(payload.administrator_password.as_str(), ADMIN_CANARY);
+        assert!(payload.database_dump.is_file());
+        assert_eq!(payload.upload_files, 1);
+        assert_eq!(payload.upload_bytes, 14);
     }
 
     #[test]

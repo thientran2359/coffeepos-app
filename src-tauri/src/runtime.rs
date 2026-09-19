@@ -726,6 +726,21 @@ impl RuntimeManager {
         &mut self,
         lease: &DatabaseMaintenanceLease,
     ) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        self.finish_database_backup_maintenance_with_policy(lease, true)
+    }
+
+    pub(crate) fn finish_database_backup_maintenance_stopped(
+        &mut self,
+        lease: &DatabaseMaintenanceLease,
+    ) -> Result<RuntimeInfo, RuntimeErrorInfo> {
+        self.finish_database_backup_maintenance_with_policy(lease, false)
+    }
+
+    fn finish_database_backup_maintenance_with_policy(
+        &mut self,
+        lease: &DatabaseMaintenanceLease,
+        restore_previous_running_state: bool,
+    ) -> Result<RuntimeInfo, RuntimeErrorInfo> {
         if !self.backup_recovery_children.is_empty() {
             return Err(error_info(
                 "backup_database",
@@ -761,7 +776,7 @@ impl RuntimeManager {
             RuntimeState::NotInstalled
         };
         self.log_event("database backup maintenance stopped");
-        let restored = if lease.runtime_was_running {
+        let restored = if restore_previous_running_state && lease.runtime_was_running {
             self.start()
         } else {
             Ok(self.info())

@@ -13,6 +13,8 @@ mod logs;
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod provisioning;
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
+mod restore;
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod runtime;
 mod secret;
 
@@ -34,7 +36,8 @@ use runtime::{HealthDiagnosticsInfo, RuntimeInfo, RuntimeManager, RuntimeState};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, State};
@@ -52,8 +55,61 @@ struct ShellState {
     shutdown_in_progress: AtomicBool,
     support_export_in_progress: AtomicBool,
     backup: Mutex<BackupOperationState>,
+    restore_candidates: Mutex<restore::RestoreCandidateRegistry>,
+    restore_admission: Mutex<restore::RestoreAdmissionGate>,
+    restore_operation: Mutex<RestoreOperationState>,
+    restore_requested: AtomicBool,
     #[cfg(debug_assertions)]
     provisioning: Mutex<()>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RestoreStatus {
+    operation_id: Option<String>,
+    stage: String,
+    started_at: Option<u64>,
+    finished_at: Option<u64>,
+    succeeded: bool,
+    failed: bool,
+    cancelled: bool,
+    rolled_back: bool,
+    needs_recovery: bool,
+    recovery_required: bool,
+    original_state: Option<restore::RestoreOriginalState>,
+    warnings: Vec<String>,
+    last_error: Option<restore::RestoreErrorInfo>,
+}
+
+impl Default for RestoreStatus {
+    fn default() -> Self {
+        Self {
+            operation_id: None,
+            stage: "idle".into(),
+            started_at: None,
+            finished_at: None,
+            succeeded: false,
+            failed: false,
+            cancelled: false,
+            rolled_back: false,
+            needs_recovery: false,
+            recovery_required: false,
+            original_state: None,
+            warnings: Vec::new(),
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RestoreOperationState {
+    status: RestoreStatus,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RestoreResult {
+    operation_id: String,
+    status: String,
 }
 
 #[derive(Serialize)]
@@ -348,6 +404,7 @@ where
 {
     {
         let state = app.state::<ShellState>();
+        ensure_restore_allows_managed_operation(&state, lifecycle_operation)?;
         if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
             return Err(format!(
                 "Runtime lifecycle is busy while trying to {lifecycle_operation}. Wait for the current operation to finish, then retry."
@@ -430,6 +487,17 @@ fn show_main_window(app: &tauri::AppHandle) {
 fn request_full_exit(app: tauri::AppHandle) {
     let state = app.state::<ShellState>();
     if state.exit_authorized.load(Ordering::Acquire) {
+        return;
+    }
+    if restore_gate_blocks(&state).unwrap_or(true)
+        || state.restore_requested.load(Ordering::Acquire)
+    {
+        show_main_window(&app);
+        show_shutdown_notice(
+            "CoffeePOS đang khôi phục dữ liệu",
+            "CoffeePOS đang khôi phục hoặc đối soát một giao dịch khôi phục. Hãy để ứng dụng mở cho đến khi trạng thái khôi phục kết thúc an toàn.",
+            false,
+        );
         return;
     }
     if state.shutdown_in_progress.swap(true, Ordering::AcqRel) {
@@ -569,6 +637,1462 @@ fn backup_command_error(
     }
 }
 
+fn restore_command_error(
+    action: &str,
+    code: &str,
+    message: impl Into<String>,
+    recovery: impl Into<String>,
+) -> restore::RestoreErrorInfo {
+    restore::RestoreErrorInfo {
+        component: "restore".into(),
+        action: action.into(),
+        code: code.into(),
+        message: message.into(),
+        recovery: recovery.into(),
+    }
+}
+
+fn restore_error_from_backup(action: &str, error: BackupErrorInfo) -> restore::RestoreErrorInfo {
+    restore::RestoreErrorInfo {
+        component: "restore".into(),
+        action: action.into(),
+        code: error.code,
+        message: error.message,
+        recovery: error.recovery,
+    }
+}
+
+fn restore_error_from_runtime(
+    action: &str,
+    error: runtime::RuntimeErrorInfo,
+) -> restore::RestoreErrorInfo {
+    restore::RestoreErrorInfo {
+        component: "restore".into(),
+        action: action.into(),
+        code: "runtime_failed".into(),
+        message: error.message,
+        recovery: error.recovery,
+    }
+}
+
+fn restore_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default()
+}
+
+fn restore_stage_name(stage: restore::RestoreStage) -> &'static str {
+    use restore::RestoreStage::*;
+    match stage {
+        Planned => "planned",
+        Validated => "validated",
+        RuntimeStopped => "runtime_stopped",
+        RecoveryBackupReady => "recovery_backup_ready",
+        StagingPrepared => "staging_prepared",
+        DatabaseImported => "database_imported",
+        UploadsRestored => "uploads_restored",
+        TargetSecretsBound => "target_secrets_bound",
+        StagingVerified => "staging_verified",
+        CutoverStarted => "cutover_started",
+        ActiveSwapped => "active_swapped",
+        ActiveVerified => "active_verified",
+        Committed => "committed",
+        Cleanup => "cleanup",
+        AbortStarted => "abort_started",
+        Aborted => "aborted",
+        RollbackStarted => "rollback_started",
+        RolledBack => "rolled_back",
+    }
+}
+
+fn restore_status_from_journal(
+    journal: &restore::RestoreJournal,
+    last_error: Option<restore::RestoreErrorInfo>,
+) -> RestoreStatus {
+    let stage = restore_stage_name(journal.stage).to_string();
+    let last_error =
+        last_error.or_else(|| {
+            journal.safe_error.as_ref().map(|error| {
+                restore::RestoreErrorInfo {
+            component: "restore".into(),
+            action: "recover".into(),
+            code: error.code.clone(),
+            message: error.message.clone(),
+            recovery:
+                "Keep restore admission fenced until CoffeePOS completes durable reconciliation."
+                    .into(),
+        }
+            })
+        });
+    let has_durable_error = journal.safe_error.is_some() || last_error.is_some();
+    RestoreStatus {
+        operation_id: Some(journal.transaction_id.clone()),
+        stage,
+        started_at: Some(journal.created_at_unix_seconds),
+        finished_at: journal
+            .stage
+            .terminal()
+            .then_some(journal.updated_at_unix_seconds),
+        succeeded: matches!(
+            journal.stage,
+            restore::RestoreStage::Committed | restore::RestoreStage::Cleanup
+        ),
+        failed: has_durable_error
+            && !matches!(
+                journal.stage,
+                restore::RestoreStage::Committed | restore::RestoreStage::Cleanup
+            ),
+        cancelled: journal.stage == restore::RestoreStage::Aborted && !has_durable_error,
+        rolled_back: journal.stage == restore::RestoreStage::RolledBack,
+        needs_recovery: false,
+        recovery_required: false,
+        original_state: Some(journal.original_state.clone()),
+        warnings: Vec::new(),
+        last_error,
+    }
+}
+
+fn update_restore_status_from_journal(state: &ShellState, journal: &restore::RestoreJournal) {
+    if let Ok(mut operation) = state.restore_operation.lock() {
+        let last_error = operation.status.last_error.clone();
+        let warnings = operation.status.warnings.clone();
+        operation.status = restore_status_from_journal(journal, last_error);
+        operation.status.warnings = warnings;
+    }
+}
+
+fn restore_gate_blocks(state: &ShellState) -> Result<bool, String> {
+    state
+        .restore_admission
+        .lock()
+        .map(|gate| gate.blocks_managed_operations())
+        .map_err(|_| {
+            "Restore admission state unavailable. Restart CoffeePOS Desktop and keep the runtime stopped."
+                .to_string()
+        })
+}
+
+fn ensure_restore_allows_managed_operation(
+    state: &ShellState,
+    operation: &str,
+) -> Result<(), String> {
+    if restore_gate_blocks(state)? || state.restore_requested.load(Ordering::Acquire) {
+        return Err(format!(
+            "Restore is active or requires recovery while trying to {operation}. Finish restore recovery before starting another managed operation."
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn restore_target_context(
+    data_root: &Path,
+) -> Result<(PathBuf, PathBuf, BackupCompatibilityTarget), restore::RestoreErrorInfo> {
+    let (project_root, manifest) = development_runtime_paths().map_err(|error| {
+        restore_command_error(
+            "resolve target",
+            "target_compatibility_unavailable",
+            error,
+            "Restage the pinned CoffeePOS runtime and retry restore.",
+        )
+    })?;
+    let target = backup_format::load_development_compatibility_target(
+        &project_root,
+        &manifest,
+        data_root,
+        "restore",
+    )
+    .map_err(|error| restore_error_from_backup("resolve target", error))?;
+    Ok((project_root, manifest, target))
+}
+
+#[cfg(debug_assertions)]
+fn refresh_restore_store_state(
+    state: &ShellState,
+    data_root: &Path,
+) -> Result<(), restore::RestoreErrorInfo> {
+    let mut guard = state.store.lock().map_err(|_| {
+        restore_command_error(
+            "refresh store config",
+            "store_state_unavailable",
+            "CoffeePOS cannot refresh the active store configuration after restore cutover.",
+            "Keep restore admission blocked and retry recovery after restarting CoffeePOS Desktop.",
+        )
+    })?;
+    *guard = None;
+    *guard = Some(Store::open(data_root.to_path_buf()).map_err(|error| {
+        restore_command_error(
+            "refresh store config",
+            "store_config_unavailable",
+            error,
+            "Keep restore admission blocked and repair the active configuration before retrying recovery.",
+        )
+    })?);
+    Ok(())
+}
+
+fn restore_cancel_requested(cancelled: &AtomicBool) -> bool {
+    cancelled.load(Ordering::Acquire)
+}
+
+#[cfg(debug_assertions)]
+fn verify_restore_runtime_health(
+    data_root: &Path,
+    runtime: &mut RuntimeManager,
+) -> Result<RuntimeInfo, restore::RestoreErrorInfo> {
+    let runtime_info = runtime
+        .start_for_provisioning()
+        .map_err(|error| restore_error_from_runtime("verify restored runtime", error))?;
+    let http_port = runtime_info.http_port.ok_or_else(|| {
+        restore_command_error(
+            "verify restored runtime",
+            "restore_http_port_unavailable",
+            "The isolated restore runtime did not expose an HTTP port.",
+            "Keep restore fenced, stop the verification runtime, and retry recovery.",
+        )
+    })?;
+    let health = runtime::probe_coffeepos_health(data_root, http_port);
+    if health.state != runtime::CoffeePosHealthState::Healthy {
+        let recovery = health
+            .error
+            .as_ref()
+            .map(|error| error.recovery.clone())
+            .unwrap_or_else(|| {
+                "Keep restore fenced and inspect the restored CoffeePOS health endpoint before retrying."
+                    .into()
+            });
+        return Err(restore_command_error(
+            "verify restored runtime",
+            "restored_health_failed",
+            "The restored CoffeePOS machine-health endpoint did not report healthy.",
+            recovery,
+        ));
+    }
+    Ok(runtime_info)
+}
+
+fn set_restore_recovery_required(
+    state: &ShellState,
+    journal: &restore::RestoreJournal,
+    error: restore::RestoreErrorInfo,
+) {
+    if let Ok(mut operation) = state.restore_operation.lock() {
+        operation.status = restore_status_from_journal(journal, Some(error));
+        operation.status.stage = "recovery_required".into();
+        operation.status.needs_recovery = true;
+        operation.status.recovery_required = true;
+        operation.status.failed = true;
+        operation.status.finished_at = None;
+        operation.cancelled = None;
+    }
+}
+
+fn release_reconciled_restore(
+    state: &ShellState,
+    data_root: &Path,
+    journal: &restore::RestoreJournal,
+) -> Result<(), restore::RestoreErrorInfo> {
+    restore::cleanup_terminal_restore_owned_roots(data_root, journal)?;
+    restore::retire_terminal_restore_journal(data_root, journal)?;
+    state
+        .restore_admission
+        .lock()
+        .map_err(|_| {
+            restore_command_error(
+                "release admission",
+                "restore_gate_unavailable",
+                "CoffeePOS cannot reopen managed-operation admission after restore reconciliation.",
+                "Keep the application open and retry restore recovery before using the store.",
+            )
+        })?
+        .release_reconciled(journal)?;
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn ensure_active_restore_runtime<'a>(
+    runtime_guard: &'a mut Option<RuntimeManager>,
+    project_root: &Path,
+    manifest: &Path,
+    data_root: &Path,
+) -> Result<&'a mut RuntimeManager, restore::RestoreErrorInfo> {
+    if runtime_guard.is_none() {
+        *runtime_guard = Some(
+            RuntimeManager::from_development(project_root, manifest, data_root.to_path_buf())
+                .map_err(|error| restore_error_from_runtime("initialize restore runtime", error))?,
+        );
+    }
+    runtime_guard.as_mut().ok_or_else(|| {
+        restore_command_error(
+            "initialize restore runtime",
+            "runtime_state_unavailable",
+            "CoffeePOS could not initialize the managed runtime for restore.",
+            "Keep restore fenced and retry after restarting CoffeePOS Desktop.",
+        )
+    })
+}
+
+#[cfg(debug_assertions)]
+fn verify_previous_store_after_restore(
+    data_root: &Path,
+    journal: &restore::RestoreJournal,
+    runtime: &mut RuntimeManager,
+) -> Result<(), restore::RestoreErrorInfo> {
+    if journal.original_state == restore::RestoreOriginalState::NoPreviousStore {
+        return Ok(());
+    }
+    let info = verify_restore_runtime_health(data_root, runtime)?;
+    if info.state != RuntimeState::Running {
+        return Err(restore_command_error(
+            "verify previous store",
+            "previous_store_not_running",
+            "CoffeePOS could not start the previous store for restore reconciliation.",
+            "Keep restore admission blocked and inspect runtime health before retrying recovery.",
+        ));
+    }
+    if !journal.runtime_was_running {
+        runtime.stop().map_err(|error| {
+            restore_error_from_runtime("stop previous-store verification", error)
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn finish_pre_cutover_abort(
+    state: &ShellState,
+    data_root: &Path,
+    journal: &mut restore::RestoreJournal,
+    runtime: &mut RuntimeManager,
+) -> Result<(), restore::RestoreErrorInfo> {
+    if journal.stage == restore::RestoreStage::Planned {
+        restore::advance_restore_journal(data_root, journal, restore::RestoreStage::Validated)?;
+    }
+    if journal.stage != restore::RestoreStage::AbortStarted
+        && journal.stage != restore::RestoreStage::Aborted
+    {
+        restore::begin_pre_cutover_abort(data_root, journal)?;
+        update_restore_status_from_journal(state, journal);
+    }
+    if journal.stage == restore::RestoreStage::AbortStarted {
+        restore::mark_restore_aborted(data_root, journal)?;
+    }
+    restore::cleanup_terminal_restore_owned_roots(data_root, journal)?;
+    verify_previous_store_after_restore(data_root, journal, runtime)?;
+    restore::retire_terminal_restore_journal(data_root, journal)?;
+    state
+        .restore_admission
+        .lock()
+        .map_err(|_| {
+            restore_command_error(
+                "release admission",
+                "restore_gate_unavailable",
+                "CoffeePOS cannot reopen admission after cancelling restore.",
+                "Keep the application open and retry restore recovery.",
+            )
+        })?
+        .release_reconciled(journal)?;
+    update_restore_status_from_journal(state, journal);
+    if let Ok(mut operation) = state.restore_operation.lock() {
+        operation.status.finished_at = Some(restore_now());
+        operation.cancelled = None;
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn finish_restore_rollback(
+    state: &ShellState,
+    data_root: &Path,
+    journal: &mut restore::RestoreJournal,
+    runtime: &mut RuntimeManager,
+) -> Result<(), restore::RestoreErrorInfo> {
+    restore::rollback_restore_cutover(data_root, journal)?;
+    update_restore_status_from_journal(state, journal);
+    refresh_restore_store_state(state, data_root)?;
+    verify_previous_store_after_restore(data_root, journal, runtime)?;
+    restore::mark_restore_rolled_back(data_root, journal)?;
+    restore::cleanup_terminal_restore_owned_roots(data_root, journal)?;
+    restore::retire_terminal_restore_journal(data_root, journal)?;
+    state
+        .restore_admission
+        .lock()
+        .map_err(|_| {
+            restore_command_error(
+                "release admission",
+                "restore_gate_unavailable",
+                "CoffeePOS cannot reopen admission after verified restore rollback.",
+                "Keep the application open and retry restore recovery.",
+            )
+        })?
+        .release_reconciled(journal)?;
+    update_restore_status_from_journal(state, journal);
+    if let Ok(mut operation) = state.restore_operation.lock() {
+        operation.status.rolled_back = true;
+        operation.status.finished_at = Some(restore_now());
+        operation.cancelled = None;
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn create_restore_recovery_snapshot(
+    data_root: &Path,
+    journal: &restore::RestoreJournal,
+    runtime: &mut RuntimeManager,
+    target: &BackupCompatibilityTarget,
+    admin_username: &str,
+    cancelled: &AtomicBool,
+) -> Result<(), restore::RestoreErrorInfo> {
+    let recovery_root = restore::recovery_backup_root(data_root, journal)?;
+    let destination_path = recovery_root.join("pre-restore.coffeepos-backup");
+    let selection =
+        backup_format::BackupDestinationSelection::capture(destination_path, "restore recovery")
+            .map_err(|error| restore_error_from_backup("prepare recovery backup", error))?;
+    let context = backup::BackupCreateContext {
+        data_root: data_root.to_path_buf(),
+        admin_username: admin_username.to_string(),
+        source: target.source.clone(),
+    };
+    let (destination, _, _, warnings) = backup::preflight_restore_recovery(&context, &selection)
+        .map_err(|error| restore_error_from_backup("prepare recovery backup", error))?;
+    let recovery_password = restore::prepare_recovery_snapshot_password(data_root, journal)?;
+    backup::run_backup_keep_runtime_stopped(
+        runtime,
+        backup::BackupRunRequest {
+            context: &context,
+            destination: &destination,
+            operation_id: &journal.transaction_id,
+            backup_password: recovery_password.as_str(),
+            cancelled,
+            warnings,
+        },
+        |_| {},
+    )
+    .map_err(|error| restore_error_from_backup("create recovery backup", error))?;
+    let validation =
+        backup_format::validate_backup(&destination.path, recovery_password.as_str(), target)
+            .map_err(|error| restore_error_from_backup("validate recovery backup", error))?;
+    if !validation.valid || !validation.inspection.can_restore {
+        return Err(restore_command_error(
+            "validate recovery backup",
+            "recovery_backup_validation_failed",
+            "CoffeePOS created a recovery snapshot but could not validate it for restore.",
+            "Keep restore fenced and preserve the recovery snapshot evidence before retrying.",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn prepare_restore_staging(
+    state: &ShellState,
+    data_root: &Path,
+    journal: &mut restore::RestoreJournal,
+    candidate: &restore::RestoreCandidate,
+    backup_password: &str,
+    target: &BackupCompatibilityTarget,
+    project_root: &Path,
+    manifest: &Path,
+    startup_view: StartupView,
+    cancelled: &AtomicBool,
+) -> Result<backup_format::RestorePayload, restore::RestoreErrorInfo> {
+    let staging_root = restore::staging_store_root(data_root, journal)?;
+    let mut payload = backup_format::extract_restore_payload(
+        candidate.source_path(),
+        backup_password,
+        target,
+        &candidate.source_fingerprint().encrypted_sha256,
+        &staging_root,
+        cancelled,
+    )
+    .map_err(|error| restore_error_from_backup("extract restore payload", error))?;
+
+    let staged_dump = staging_root.join("restore-store.sql");
+    std::fs::rename(&payload.database_dump, &staged_dump).map_err(|error| {
+        restore_command_error(
+            "prepare restored database",
+            "restore_dump_staging_failed",
+            format!("CoffeePOS could not isolate the restored database dump from the target datadir: {error}."),
+            "Keep restore fenced and rebuild the owned staging tree from the validated backup.",
+        )
+    })?;
+    payload.database_dump = staged_dump;
+
+    let mut staging_store = Store::open(staging_root.clone()).map_err(|error| {
+        restore_command_error(
+            "prepare target config",
+            "restore_target_config_failed",
+            error,
+            "Discard the owned restore staging tree and retry from the validated backup.",
+        )
+    })?;
+    staging_store
+        .save_setup_profile(
+            &payload.store_name,
+            &payload.administrator_username,
+            &payload.administrator_email,
+        )
+        .map_err(|error| {
+            restore_command_error(
+                "prepare target config",
+                "restore_target_config_failed",
+                error,
+                "The active store is unchanged. Correct the portable store profile before retrying restore.",
+            )
+        })?;
+    staging_store
+        .save_startup_view(startup_view)
+        .map_err(|error| {
+            restore_command_error(
+                "prepare target config",
+                "restore_target_config_failed",
+                error,
+                "The active store is unchanged. Retry restore after checking staging storage.",
+            )
+        })?;
+    drop(staging_store);
+
+    let resolved = runtime::resolve_development_manifest(project_root, manifest)
+        .map_err(|error| restore_error_from_runtime("resolve staging runtime", error))?;
+    let mut provisioner =
+        Provisioner::from_development(project_root, manifest, resolved, staging_root.clone())
+            .map_err(|error| restore_error_from_runtime("prepare restore staging", error))?;
+    provisioner
+        .configure_initial_admin(
+            &payload.administrator_username,
+            &payload.administrator_email,
+        )
+        .map_err(|error| restore_error_from_runtime("prepare restore staging", error))?;
+    provisioner
+        .prepare()
+        .map_err(|error| restore_error_from_runtime("prepare restore staging", error))?;
+    restore::advance_restore_journal(data_root, journal, restore::RestoreStage::StagingPrepared)?;
+    update_restore_status_from_journal(state, journal);
+
+    if restore_cancel_requested(cancelled) {
+        return Err(restore_command_error(
+            "restore",
+            "cancelled",
+            "Restore was cancelled before database import.",
+            "CoffeePOS will reconcile the owned staging tree before another restore starts.",
+        ));
+    }
+
+    provisioner
+        .import_restored_database(&payload.database_dump)
+        .map_err(|error| restore_error_from_runtime("import restored database", error))?;
+    restore::advance_restore_journal(data_root, journal, restore::RestoreStage::DatabaseImported)?;
+    update_restore_status_from_journal(state, journal);
+    std::fs::remove_file(&payload.database_dump).map_err(|error| {
+        restore_command_error(
+            "cleanup restored database dump",
+            "restore_dump_cleanup_failed",
+            format!("CoffeePOS imported the restored database but could not remove its staged logical dump: {error}."),
+            "Keep restore fenced and retry owned staging cleanup before cutover.",
+        )
+    })?;
+    restore::advance_restore_journal(data_root, journal, restore::RestoreStage::UploadsRestored)?;
+    update_restore_status_from_journal(state, journal);
+
+    if restore_cancel_requested(cancelled) {
+        return Err(restore_command_error(
+            "restore",
+            "cancelled",
+            "Restore was cancelled before isolated identity verification.",
+            "CoffeePOS will reconcile the owned staging tree before another restore starts.",
+        ));
+    }
+
+    let mut staging_runtime =
+        RuntimeManager::from_development(project_root, manifest, staging_root.clone())
+            .map_err(|error| restore_error_from_runtime("initialize staging runtime", error))?;
+    let staging_result = (|| {
+        let runtime_info = staging_runtime
+            .start_for_provisioning()
+            .map_err(|error| restore_error_from_runtime("start staging runtime", error))?;
+        provisioner
+            .verify_restored_wordpress_identity(
+                &runtime_info,
+                &payload.store_name,
+                &payload.administrator_username,
+                &payload.administrator_email,
+                payload.administrator_password.as_str(),
+            )
+            .map_err(|error| restore_error_from_runtime("verify restored administrator", error))?;
+        restore::protect_verified_administrator_password(
+            data_root,
+            journal,
+            payload.administrator_password.as_str(),
+        )?;
+        provisioner
+            .complete_restored_provisioning(&runtime_info, &payload.store_name)
+            .map_err(|error| restore_error_from_runtime("complete restored provisioning", error))?;
+        restore::advance_restore_journal(
+            data_root,
+            journal,
+            restore::RestoreStage::TargetSecretsBound,
+        )?;
+        update_restore_status_from_journal(state, journal);
+
+        let inspected = provisioner.inspect();
+        if inspected.state != ProvisioningState::Ready {
+            return Err(restore_command_error(
+                "verify restore staging",
+                "staging_provisioning_not_ready",
+                "The isolated restored store did not reach the ready provisioning state.",
+                "Keep the active store unchanged and repair the owned restore staging tree before retrying.",
+            ));
+        }
+        let http_port = runtime_info.http_port.ok_or_else(|| {
+            restore_command_error(
+                "verify restore staging",
+                "restore_http_port_unavailable",
+                "The isolated restored store did not expose an HTTP port.",
+                "Keep the active store unchanged and retry staging verification.",
+            )
+        })?;
+        let health = runtime::probe_coffeepos_health(&staging_root, http_port);
+        if health.state != runtime::CoffeePosHealthState::Healthy {
+            return Err(restore_command_error(
+                "verify restore staging",
+                "staging_health_failed",
+                "The isolated restored CoffeePOS store did not pass machine-health verification.",
+                health.error.map(|error| error.recovery).unwrap_or_else(|| {
+                    "Inspect the staged store health before retrying restore.".into()
+                }),
+            ));
+        }
+        Ok(())
+    })();
+    let stop_result = staging_runtime.stop();
+    if let Err(stop_error) = stop_result {
+        return Err(restore_command_error(
+            "stop staging runtime",
+            "staging_cleanup_unconfirmed",
+            stop_error.message,
+            "Keep restore admission blocked until all staging processes are confirmed stopped. Do not remove the staging tree manually.",
+        ));
+    }
+    staging_result?;
+    restore::advance_restore_journal(data_root, journal, restore::RestoreStage::StagingVerified)?;
+    update_restore_status_from_journal(state, journal);
+    Ok(payload)
+}
+
+fn remember_restore_error(state: &ShellState, error: &restore::RestoreErrorInfo) {
+    if let Ok(mut operation) = state.restore_operation.lock() {
+        operation.status.last_error = Some(error.clone());
+        operation.status.failed = true;
+    }
+}
+
+fn publish_restore_recovery_failure(state: &ShellState, error: &restore::RestoreErrorInfo) {
+    let _ = state.restore_admission.lock().map(|mut gate| {
+        if !gate.blocks_managed_operations() {
+            let _ = gate.acquire("unresolved_restore_recovery");
+        }
+    });
+    if let Ok(mut operation) = state.restore_operation.lock() {
+        operation.status.stage = "recovery_required".into();
+        operation.status.failed = true;
+        operation.status.needs_recovery = true;
+        operation.status.recovery_required = true;
+        operation.status.last_error = Some(error.clone());
+        operation.status.finished_at = None;
+        operation.cancelled = None;
+    }
+}
+
+#[cfg(debug_assertions)]
+fn run_restore_apply_worker(
+    app: &tauri::AppHandle,
+    candidate: restore::RestoreCandidate,
+    backup_password: &str,
+    cancelled: Arc<AtomicBool>,
+) -> Result<RestoreResult, restore::RestoreErrorInfo> {
+    let state = app.state::<ShellState>();
+    let _lifecycle_guard =
+        try_lifecycle(&state, "apply a restore transaction").map_err(|error| {
+            restore_command_error(
+                "admission",
+                "lifecycle_busy",
+                error,
+                "Wait for the current managed operation to finish, then retry restore.",
+            )
+        })?;
+    if state
+        .backup
+        .lock()
+        .map_err(|_| {
+            restore_command_error(
+                "admission",
+                "backup_state_unavailable",
+                "CoffeePOS cannot inspect backup admission before restore.",
+                "Restart CoffeePOS Desktop before retrying restore.",
+            )
+        })?
+        .active()
+    {
+        return Err(restore_command_error(
+            "admission",
+            "backup_in_progress",
+            "A portable backup is already active.",
+            "Wait for backup cleanup to finish before applying restore.",
+        ));
+    }
+
+    let data_root = application_data_root(app).map_err(|error| {
+        restore_command_error(
+            "prepare",
+            "data_root_unavailable",
+            error,
+            "Repair the CoffeePOS application-data path before retrying restore.",
+        )
+    })?;
+    let (project_root, manifest, target) = restore_target_context(&data_root)?;
+
+    // Revalidate the exact native-owned source candidate before any runtime or store mutation.
+    restore::revalidate_restore_candidate(&candidate, backup_password, &target)?;
+    with_store(app, &state, |_| Ok(())).map_err(|error| {
+        restore_command_error(
+            "prepare",
+            "store_config_unavailable",
+            error,
+            "Repair the CoffeePOS store configuration before applying restore.",
+        )
+    })?;
+    let provisioning_before = inspect_provisioning(app, &state).map_err(|error| {
+        restore_command_error(
+            "prepare",
+            "provisioning_state_unavailable",
+            error,
+            "Repair provisioning state before applying restore.",
+        )
+    })?;
+    let original_state = restore::RestoreOriginalState::from_provisioning(&provisioning_before)?;
+    let _provisioning_guard =
+        try_provisioning(&state, "apply a restore transaction").map_err(|error| {
+            restore_command_error(
+                "admission",
+                "provisioning_busy",
+                error,
+                "Wait for provisioning or repair to finish before retrying restore.",
+            )
+        })?;
+    let startup_view = state
+        .store
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|store| store.config.startup_view.clone())
+        })
+        .unwrap_or_default();
+
+    let mut runtime_guard = state.runtime.lock().map_err(|_| {
+        restore_command_error(
+            "prepare",
+            "runtime_state_unavailable",
+            "CoffeePOS cannot access the managed runtime for restore.",
+            "Restart CoffeePOS Desktop before retrying restore.",
+        )
+    })?;
+    let runtime =
+        ensure_active_restore_runtime(&mut runtime_guard, &project_root, &manifest, &data_root)?;
+    let runtime_was_running = runtime.refresh().state == RuntimeState::Running;
+
+    let mut journal =
+        restore::RestoreJournal::new(&candidate, original_state, runtime_was_running, Vec::new())?;
+    restore::persist_restore_journal(&data_root, &journal)?;
+    restore::advance_restore_journal(&data_root, &mut journal, restore::RestoreStage::Validated)?;
+    state
+        .restore_admission
+        .lock()
+        .map_err(|_| {
+            restore_command_error(
+                "admission",
+                "restore_gate_unavailable",
+                "CoffeePOS cannot acquire restore admission.",
+                "Keep the application open and retry restore recovery.",
+            )
+        })?
+        .acquire(&journal.transaction_id)?;
+    {
+        let mut operation = state.restore_operation.lock().map_err(|_| {
+            restore_command_error(
+                "status",
+                "restore_state_unavailable",
+                "CoffeePOS cannot publish restore progress.",
+                "Keep the application open and retry restore recovery.",
+            )
+        })?;
+        operation.status = restore_status_from_journal(&journal, None);
+        operation.status.warnings = candidate.inspection().warnings.clone();
+        operation.cancelled = Some(cancelled.clone());
+    }
+    if let Ok(mut registry) = state.restore_candidates.lock() {
+        registry.clear();
+    }
+    restore::prepare_restore_owned_roots(&data_root, &journal)?;
+
+    if restore_cancel_requested(cancelled.as_ref()) {
+        finish_pre_cutover_abort(&state, &data_root, &mut journal, runtime)?;
+        return Ok(RestoreResult {
+            operation_id: journal.transaction_id,
+            status: "cancelled".into(),
+        });
+    }
+
+    if let Err(error) = runtime.stop() {
+        let error = restore_error_from_runtime("stop active runtime", error);
+        remember_restore_error(&state, &error);
+        let _ =
+            restore::record_restore_error(&data_root, &mut journal, &error.code, &error.message);
+        match finish_pre_cutover_abort(&state, &data_root, &mut journal, runtime) {
+            Ok(()) => return Err(error),
+            Err(recovery_error) => {
+                set_restore_recovery_required(&state, &journal, recovery_error.clone());
+                return Err(recovery_error);
+            }
+        }
+    }
+    restore::advance_restore_journal(
+        &data_root,
+        &mut journal,
+        restore::RestoreStage::RuntimeStopped,
+    )?;
+    update_restore_status_from_journal(&state, &journal);
+
+    if journal.original_state == restore::RestoreOriginalState::ExistingStore {
+        let admin_username = provisioning_before
+            .admin_username
+            .as_deref()
+            .ok_or_else(|| {
+                restore_command_error(
+                    "prepare recovery backup",
+                    "administrator_identity_unavailable",
+                    "The installed store does not expose its managed administrator identity.",
+                    "Repair provisioning metadata before retrying restore.",
+                )
+            })?;
+        if let Err(error) = create_restore_recovery_snapshot(
+            &data_root,
+            &journal,
+            runtime,
+            &target,
+            admin_username,
+            cancelled.as_ref(),
+        ) {
+            if error.code == "cancelled" && !runtime.backup_maintenance_active() {
+                finish_pre_cutover_abort(&state, &data_root, &mut journal, runtime)?;
+                return Ok(RestoreResult {
+                    operation_id: journal.transaction_id,
+                    status: "cancelled".into(),
+                });
+            }
+            remember_restore_error(&state, &error);
+            let _ = restore::record_restore_error(
+                &data_root,
+                &mut journal,
+                &error.code,
+                &error.message,
+            );
+            if runtime.backup_maintenance_active() {
+                set_restore_recovery_required(&state, &journal, error.clone());
+                return Err(error);
+            }
+            match finish_pre_cutover_abort(&state, &data_root, &mut journal, runtime) {
+                Ok(()) => return Err(error),
+                Err(recovery_error) => {
+                    set_restore_recovery_required(&state, &journal, recovery_error.clone());
+                    return Err(recovery_error);
+                }
+            }
+        }
+        restore::advance_restore_journal(
+            &data_root,
+            &mut journal,
+            restore::RestoreStage::RecoveryBackupReady,
+        )?;
+        update_restore_status_from_journal(&state, &journal);
+    }
+
+    if restore_cancel_requested(cancelled.as_ref()) {
+        finish_pre_cutover_abort(&state, &data_root, &mut journal, runtime)?;
+        return Ok(RestoreResult {
+            operation_id: journal.transaction_id,
+            status: "cancelled".into(),
+        });
+    }
+
+    let payload = match prepare_restore_staging(
+        &state,
+        &data_root,
+        &mut journal,
+        &candidate,
+        backup_password,
+        &target,
+        &project_root,
+        &manifest,
+        startup_view,
+        cancelled.as_ref(),
+    ) {
+        Ok(payload) => payload,
+        Err(error) => {
+            if error.code == "cancelled" {
+                finish_pre_cutover_abort(&state, &data_root, &mut journal, runtime)?;
+                return Ok(RestoreResult {
+                    operation_id: journal.transaction_id,
+                    status: "cancelled".into(),
+                });
+            }
+            remember_restore_error(&state, &error);
+            let _ = restore::record_restore_error(
+                &data_root,
+                &mut journal,
+                &error.code,
+                &error.message,
+            );
+            if error.code == "staging_cleanup_unconfirmed" {
+                set_restore_recovery_required(&state, &journal, error.clone());
+                return Err(error);
+            }
+            match finish_pre_cutover_abort(&state, &data_root, &mut journal, runtime) {
+                Ok(()) => return Err(error),
+                Err(recovery_error) => {
+                    set_restore_recovery_required(&state, &journal, recovery_error.clone());
+                    return Err(recovery_error);
+                }
+            }
+        }
+    };
+
+    if restore_cancel_requested(cancelled.as_ref()) {
+        finish_pre_cutover_abort(&state, &data_root, &mut journal, runtime)?;
+        return Ok(RestoreResult {
+            operation_id: journal.transaction_id,
+            status: "cancelled".into(),
+        });
+    }
+
+    let cutover_result = (|| {
+        restore::begin_restore_cutover(&data_root, &mut journal)?;
+        update_restore_status_from_journal(&state, &journal);
+        for component in [
+            restore::RestoreComponent::Site,
+            restore::RestoreComponent::Database,
+            restore::RestoreComponent::Uploads,
+        ] {
+            restore::cutover_component(&data_root, &mut journal, component)?;
+        }
+        restore::apply_target_config(&data_root, &mut journal)?;
+        restore::mark_active_swapped(&data_root, &mut journal)?;
+        update_restore_status_from_journal(&state, &journal);
+        refresh_restore_store_state(&state, &data_root)?;
+        Ok::<(), restore::RestoreErrorInfo>(())
+    })();
+    if let Err(error) = cutover_result {
+        remember_restore_error(&state, &error);
+        let _ =
+            restore::record_restore_error(&data_root, &mut journal, &error.code, &error.message);
+        set_restore_recovery_required(&state, &journal, error.clone());
+        return Err(error);
+    }
+
+    if restore_cancel_requested(cancelled.as_ref()) {
+        finish_restore_rollback(&state, &data_root, &mut journal, runtime)?;
+        return Ok(RestoreResult {
+            operation_id: journal.transaction_id,
+            status: "rolled_back".into(),
+        });
+    }
+
+    let active_verification = (|| {
+        let runtime_info = runtime
+            .start_for_provisioning()
+            .map_err(|error| restore_error_from_runtime("start active verification", error))?;
+        let (resolved, runtime_root) = runtime.provisioning_context();
+        let provisioner =
+            Provisioner::from_development(&project_root, &manifest, resolved, runtime_root)
+                .map_err(|error| restore_error_from_runtime("verify active restore", error))?;
+        provisioner
+            .verify_restored_wordpress_identity(
+                &runtime_info,
+                &payload.store_name,
+                &payload.administrator_username,
+                &payload.administrator_email,
+                payload.administrator_password.as_str(),
+            )
+            .map_err(|error| restore_error_from_runtime("verify active administrator", error))?;
+        let http_port = runtime_info.http_port.ok_or_else(|| {
+            restore_command_error(
+                "verify active restore",
+                "restore_http_port_unavailable",
+                "The active restored store did not expose an HTTP port for final verification.",
+                "Keep restore fenced and roll back to the previous store.",
+            )
+        })?;
+        let health = runtime::probe_coffeepos_health(&data_root, http_port);
+        if health.state != runtime::CoffeePosHealthState::Healthy {
+            return Err(restore_command_error(
+                "verify active restore",
+                "active_health_failed",
+                "The active restored CoffeePOS store did not pass final machine-health verification.",
+                health
+                    .error
+                    .map(|value| value.recovery)
+                    .unwrap_or_else(|| "Keep restore fenced and roll back the transaction.".into()),
+            ));
+        }
+        Ok::<(), restore::RestoreErrorInfo>(())
+    })();
+    let active_stop = runtime.stop();
+    if let Err(stop_error) = active_stop {
+        let error = restore_error_from_runtime("stop active verification", stop_error);
+        remember_restore_error(&state, &error);
+        let _ =
+            restore::record_restore_error(&data_root, &mut journal, &error.code, &error.message);
+        set_restore_recovery_required(&state, &journal, error.clone());
+        return Err(error);
+    }
+    if restore_cancel_requested(cancelled.as_ref()) {
+        finish_restore_rollback(&state, &data_root, &mut journal, runtime)?;
+        return Ok(RestoreResult {
+            operation_id: journal.transaction_id,
+            status: "rolled_back".into(),
+        });
+    }
+    if let Err(error) = active_verification {
+        remember_restore_error(&state, &error);
+        let _ =
+            restore::record_restore_error(&data_root, &mut journal, &error.code, &error.message);
+        match finish_restore_rollback(&state, &data_root, &mut journal, runtime) {
+            Ok(()) => return Err(error),
+            Err(recovery_error) => {
+                set_restore_recovery_required(&state, &journal, recovery_error.clone());
+                return Err(recovery_error);
+            }
+        }
+    }
+
+    restore::mark_restore_active_verified(&data_root, &mut journal)?;
+    update_restore_status_from_journal(&state, &journal);
+    restore::commit_verified_restore(&data_root, &mut journal)?;
+    update_restore_status_from_journal(&state, &journal);
+    release_reconciled_restore(&state, &data_root, &journal)?;
+
+    if runtime_was_running {
+        if let Err(error) = runtime.start() {
+            if let Ok(mut operation) = state.restore_operation.lock() {
+                operation
+                    .status
+                    .warnings
+                    .push(format!("runtime_resume_failed: {}", error.message));
+            }
+        }
+    }
+    if let Ok(mut operation) = state.restore_operation.lock() {
+        operation.status = restore_status_from_journal(&journal, None);
+        operation.status.finished_at = Some(restore_now());
+        operation.cancelled = None;
+    }
+    Ok(RestoreResult {
+        operation_id: journal.transaction_id,
+        status: "succeeded".into(),
+    })
+}
+
+fn recover_restore_admission(
+    app: &tauri::AppHandle,
+    state: &ShellState,
+) -> Result<Option<restore::RestoreJournal>, restore::RestoreErrorInfo> {
+    let data_root = application_data_root(app).map_err(|error| {
+        restore_command_error(
+            "bootstrap recovery",
+            "data_root_unavailable",
+            error,
+            "Repair the CoffeePOS application-data path before starting managed operations.",
+        )
+    })?;
+    let journal = match restore::load_restore_journal(&data_root) {
+        Ok(journal) => journal,
+        Err(error) => {
+            publish_restore_recovery_failure(state, &error);
+            return Err(error);
+        }
+    };
+    if let Some(journal) = journal.as_ref() {
+        state
+            .restore_admission
+            .lock()
+            .map_err(|_| {
+                restore_command_error(
+                    "bootstrap recovery",
+                    "restore_gate_unavailable",
+                    "CoffeePOS cannot restore the durable restore admission gate.",
+                    "Keep the application open and retry recovery before using the store.",
+                )
+            })?
+            .recover_from_journal(journal);
+        if let Ok(mut operation) = state.restore_operation.lock() {
+            let last_error = operation.status.last_error.clone();
+            operation.status = restore_status_from_journal(journal, last_error);
+            operation.status.needs_recovery = true;
+            operation.status.recovery_required = true;
+        }
+    }
+    Ok(journal)
+}
+
+#[cfg(debug_assertions)]
+fn verify_recovered_active_target(
+    state: &ShellState,
+    data_root: &Path,
+    project_root: &Path,
+    manifest: &Path,
+    runtime: &mut RuntimeManager,
+) -> Result<(), restore::RestoreErrorInfo> {
+    let (store_name, admin_username, admin_email) = {
+        let mut guard = state.store.lock().map_err(|_| {
+            restore_command_error(
+                "verify recovered target",
+                "store_state_unavailable",
+                "CoffeePOS cannot access the active store configuration during restore recovery.",
+                "Keep restore fenced and retry recovery after restarting CoffeePOS Desktop.",
+            )
+        })?;
+        if guard.is_none() {
+            *guard = Some(Store::open(data_root.to_path_buf()).map_err(|error| {
+                restore_command_error(
+                    "verify recovered target",
+                    "active_store_config_unavailable",
+                    error,
+                    "Keep restore fenced and repair the active restored configuration before retrying recovery.",
+                )
+            })?);
+        }
+        let store = guard.as_ref().ok_or_else(|| {
+            restore_command_error(
+                "verify recovered target",
+                "active_store_config_unavailable",
+                "CoffeePOS cannot access the active restored configuration.",
+                "Keep restore fenced and retry recovery after restarting CoffeePOS Desktop.",
+            )
+        })?;
+        (
+            store.config.store_name.clone(),
+            store.config.setup_admin_username.clone().ok_or_else(|| {
+                restore_command_error(
+                    "verify recovered target",
+                    "administrator_identity_unavailable",
+                    "The active restored configuration is missing its administrator username.",
+                    "Keep restore fenced and restore the transaction configuration evidence.",
+                )
+            })?,
+            store.config.setup_admin_email.clone().ok_or_else(|| {
+                restore_command_error(
+                    "verify recovered target",
+                    "administrator_identity_unavailable",
+                    "The active restored configuration is missing its administrator email.",
+                    "Keep restore fenced and restore the transaction configuration evidence.",
+                )
+            })?,
+        )
+    };
+    let admin_password = secret::load(&data_root.join(WORDPRESS_ADMIN_SECRET)).map_err(|error| {
+        restore_command_error(
+            "verify recovered target",
+            "administrator_secret_unavailable",
+            error,
+            "Keep restore fenced and preserve rollback evidence; do not reset the administrator password.",
+        )
+    })?;
+    let runtime_info = runtime.start_for_provisioning().map_err(|error| {
+        restore_error_from_runtime("start recovered target verification", error)
+    })?;
+    let (resolved, runtime_root) = runtime.provisioning_context();
+    let provisioner = Provisioner::from_development(project_root, manifest, resolved, runtime_root)
+        .map_err(|error| restore_error_from_runtime("verify recovered target", error))?;
+    let verification = provisioner
+        .verify_restored_wordpress_identity(
+            &runtime_info,
+            &store_name,
+            &admin_username,
+            &admin_email,
+            &admin_password,
+        )
+        .map_err(|error| restore_error_from_runtime("verify recovered target", error))
+        .and_then(|_| {
+            let http_port = runtime_info.http_port.ok_or_else(|| {
+                restore_command_error(
+                    "verify recovered target",
+                    "restore_http_port_unavailable",
+                    "The recovered target did not expose an HTTP port.",
+                    "Keep restore fenced and roll back if target verification cannot be completed.",
+                )
+            })?;
+            let health = runtime::probe_coffeepos_health(data_root, http_port);
+            if health.state != runtime::CoffeePosHealthState::Healthy {
+                return Err(restore_command_error(
+                    "verify recovered target",
+                    "active_health_failed",
+                    "The recovered active target did not pass CoffeePOS machine-health verification.",
+                    health
+                        .error
+                        .map(|value| value.recovery)
+                        .unwrap_or_else(|| "Keep restore fenced and roll back the transaction.".into()),
+                ));
+            }
+            Ok(())
+        });
+    let stop_result = runtime.stop();
+    if let Err(error) = stop_result {
+        return Err(restore_error_from_runtime(
+            "stop recovered target verification",
+            error,
+        ));
+    }
+    verification
+}
+
+#[cfg(debug_assertions)]
+fn recover_restore_transaction(
+    app: &tauri::AppHandle,
+    state: &ShellState,
+) -> Result<(), restore::RestoreErrorInfo> {
+    let Some(mut journal) = recover_restore_admission(app, state)? else {
+        return Ok(());
+    };
+    if state.restore_requested.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let _lifecycle_guard =
+        try_lifecycle(state, "recover restore transaction").map_err(|error| {
+            restore_command_error(
+                "recover",
+                "lifecycle_busy",
+                error,
+                "Wait for the current lifecycle action to finish, then retry restore recovery.",
+            )
+        })?;
+    let _provisioning_guard =
+        try_provisioning(state, "recover restore transaction").map_err(|error| {
+            restore_command_error(
+                "recover",
+                "provisioning_busy",
+                error,
+                "Wait for the current provisioning action to finish, then retry restore recovery.",
+            )
+        })?;
+    let data_root = application_data_root(app).map_err(|error| {
+        restore_command_error(
+            "recover",
+            "data_root_unavailable",
+            error,
+            "Repair the CoffeePOS application-data path before retrying restore recovery.",
+        )
+    })?;
+    let (project_root, manifest, _) = restore_target_context(&data_root)?;
+    let mut runtime_guard = state.runtime.lock().map_err(|_| {
+        restore_command_error(
+            "recover",
+            "runtime_state_unavailable",
+            "CoffeePOS cannot access runtime state for restore recovery.",
+            "Restart CoffeePOS Desktop and retry restore recovery.",
+        )
+    })?;
+    let runtime =
+        ensure_active_restore_runtime(&mut runtime_guard, &project_root, &manifest, &data_root)?;
+    if runtime.requires_exit_confirmation() {
+        if let Err(error) = runtime.stop() {
+            let error = restore_error_from_runtime("stop runtime for restore recovery", error);
+            set_restore_recovery_required(state, &journal, error.clone());
+            return Err(error);
+        }
+    }
+    // Restore owns recovery ordering. Reconcile an interrupted internal snapshot before touching
+    // the transaction-owned recovery root.
+    if let Err(error) = backup::recover_interrupted_backup(&data_root) {
+        let error = restore_error_from_backup("recover restore snapshot", error);
+        set_restore_recovery_required(state, &journal, error.clone());
+        return Err(error);
+    }
+    let evidence = restore::inspect_restore_recovery_evidence(
+        &data_root,
+        &journal,
+        !runtime.requires_exit_confirmation(),
+    );
+    let classification = restore::classify_restore_recovery(&journal, &evidence);
+    use restore::RestoreRecoveryAction;
+    let recovery_result = match classification.action {
+        RestoreRecoveryAction::CleanupPreMutation
+        | RestoreRecoveryAction::ResumeOrAbortPreCutover
+        | RestoreRecoveryAction::CompleteAbort => {
+            finish_pre_cutover_abort(state, &data_root, &mut journal, runtime)
+        }
+        RestoreRecoveryAction::CompleteCutoverOrRollback => {
+            let complete_cutover = (|| {
+                for component in [
+                    restore::RestoreComponent::Site,
+                    restore::RestoreComponent::Database,
+                    restore::RestoreComponent::Uploads,
+                ] {
+                    restore::cutover_component(&data_root, &mut journal, component)?;
+                }
+                restore::apply_target_config(&data_root, &mut journal)?;
+                restore::mark_active_swapped(&data_root, &mut journal)?;
+                refresh_restore_store_state(state, &data_root)?;
+                Ok::<(), restore::RestoreErrorInfo>(())
+            })();
+            complete_cutover.and_then(|_| {
+                finish_restore_rollback(state, &data_root, &mut journal, runtime)
+            })
+        }
+        RestoreRecoveryAction::VerifyActiveOrRollback => {
+            refresh_restore_store_state(state, &data_root)?;
+            match verify_recovered_active_target(
+                state,
+                &data_root,
+                &project_root,
+                &manifest,
+                runtime,
+            ) {
+                Ok(()) => {
+                    restore::mark_restore_active_verified(&data_root, &mut journal)?;
+                    restore::commit_verified_restore(&data_root, &mut journal)?;
+                    update_restore_status_from_journal(state, &journal);
+                    release_reconciled_restore(state, &data_root, &journal)
+                }
+                Err(verify_error) => {
+                    remember_restore_error(state, &verify_error);
+                    finish_restore_rollback(state, &data_root, &mut journal, runtime)
+                }
+            }
+        }
+        RestoreRecoveryAction::CommitVerifiedActive => {
+            restore::commit_verified_restore(&data_root, &mut journal)?;
+            update_restore_status_from_journal(state, &journal);
+            release_reconciled_restore(state, &data_root, &journal)
+        }
+        RestoreRecoveryAction::CompleteRollback => {
+            finish_restore_rollback(state, &data_root, &mut journal, runtime)
+        }
+        RestoreRecoveryAction::ReconcileRolledBack
+        | RestoreRecoveryAction::ReconcileAborted => {
+            restore::reconcile_terminal_component_markers(&data_root, &mut journal)?;
+            restore::cleanup_terminal_restore_owned_roots(&data_root, &journal)?;
+            verify_previous_store_after_restore(&data_root, &journal, runtime)?;
+            restore::retire_terminal_restore_journal(&data_root, &journal)?;
+            state
+                .restore_admission
+                .lock()
+                .map_err(|_| {
+                    restore_command_error(
+                        "recover",
+                        "restore_gate_unavailable",
+                        "CoffeePOS cannot release restore admission after terminal reconciliation.",
+                        "Keep the application open and retry restore recovery.",
+                    )
+                })?
+                .release_reconciled(&journal)?;
+            update_restore_status_from_journal(state, &journal);
+            Ok(())
+        }
+        RestoreRecoveryAction::ReconcileCommitted => {
+            restore::reconcile_terminal_component_markers(&data_root, &mut journal)?;
+            release_reconciled_restore(state, &data_root, &journal)
+        }
+        RestoreRecoveryAction::Blocked => Err(restore_command_error(
+            "recover",
+            &classification.reason_code,
+            "CoffeePOS cannot safely choose an automatic restore recovery action from the durable evidence.",
+            "Keep restore admission blocked and preserve config/restore.json plus transaction-owned evidence for explicit recovery.",
+        )),
+    };
+    if let Err(error) = recovery_result {
+        remember_restore_error(state, &error);
+        let _ =
+            restore::record_restore_error(&data_root, &mut journal, &error.code, &error.message);
+        set_restore_recovery_required(state, &journal, error.clone());
+        return Err(error);
+    }
+    if journal.runtime_was_running
+        && matches!(
+            journal.stage,
+            restore::RestoreStage::Committed
+                | restore::RestoreStage::Aborted
+                | restore::RestoreStage::RolledBack
+        )
+        && runtime.refresh().state != RuntimeState::Running
+    {
+        if let Err(error) = runtime.start() {
+            if let Ok(mut operation) = state.restore_operation.lock() {
+                operation
+                    .status
+                    .warnings
+                    .push(format!("runtime_resume_failed: {}", error.message));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_restore_status(
+    app: tauri::AppHandle,
+) -> Result<RestoreStatus, restore::RestoreErrorInfo> {
+    #[cfg(debug_assertions)]
+    {
+        if !app
+            .state::<ShellState>()
+            .restore_requested
+            .load(Ordering::Acquire)
+        {
+            let worker_app = app.clone();
+            let recovery = tauri::async_runtime::spawn_blocking(move || {
+                let state = worker_app.state::<ShellState>();
+                recover_restore_transaction(&worker_app, &state)
+            })
+            .await;
+            match recovery {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    publish_restore_recovery_failure(&app.state::<ShellState>(), &error);
+                }
+                Err(_) => {
+                    let error = restore_command_error(
+                        "status",
+                        "restore_recovery_worker_failed",
+                        "CoffeePOS restore recovery worker stopped unexpectedly.",
+                        "Keep the application open and retry restore status.",
+                    );
+                    publish_restore_recovery_failure(&app.state::<ShellState>(), &error);
+                }
+            }
+        }
+        app.state::<ShellState>()
+            .restore_operation
+            .lock()
+            .map(|operation| operation.status.clone())
+            .map_err(|_| {
+                restore_command_error(
+                    "status",
+                    "restore_state_unavailable",
+                    "CoffeePOS cannot read restore status.",
+                    "Restart CoffeePOS Desktop and retry restore recovery.",
+                )
+            })
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = app;
+        Ok(RestoreStatus::default())
+    }
+}
+
 async fn run_backup_dialog_operation<T: Send + 'static>(
     app: tauri::AppHandle,
     action: &'static str,
@@ -634,6 +2158,297 @@ async fn run_backup_dialog_operation<T: Send + 'static>(
             "Use the qualified Windows development build until runtime packaging is completed.",
         ))
     }
+}
+
+#[tauri::command]
+async fn inspect_restore_backup(
+    app: tauri::AppHandle,
+    backup_password: String,
+) -> Result<Option<restore::RestoreInspection>, restore::RestoreErrorInfo> {
+    #[cfg(debug_assertions)]
+    {
+        let password = zeroize::Zeroizing::new(backup_password);
+        {
+            let state = app.state::<ShellState>();
+            if restore_gate_blocks(&state).map_err(|message| {
+                restore_command_error(
+                    "inspect",
+                    "restore_gate_unavailable",
+                    message,
+                    "Restart CoffeePOS Desktop and retry restore recovery.",
+                )
+            })? || state.restore_requested.load(Ordering::Acquire)
+            {
+                return Err(restore_command_error(
+                    "inspect",
+                    "restore_already_active",
+                    "A restore transaction is already active or requires recovery.",
+                    "Finish the current restore recovery before inspecting another backup.",
+                ));
+            }
+        }
+        let worker_app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let selected = backup_format::choose_backup_file("restore inspect")
+                .map_err(|error| restore_error_from_backup("inspect", error))?;
+            let Some(path) = selected else {
+                return Ok(None);
+            };
+            let state = worker_app.state::<ShellState>();
+            let data_root = application_data_root(&worker_app).map_err(|error| {
+                restore_command_error(
+                    "inspect",
+                    "data_root_unavailable",
+                    error,
+                    "Repair the CoffeePOS application-data path and retry restore inspection.",
+                )
+            })?;
+            let (_, _, target) = restore_target_context(&data_root)?;
+            let candidate = restore::inspect_restore_candidate(&path, password.as_str(), &target)?;
+            let mut registry = state.restore_candidates.lock().map_err(|_| {
+                restore_command_error(
+                    "inspect",
+                    "restore_candidate_state_unavailable",
+                    "CoffeePOS cannot retain the validated restore candidate.",
+                    "Restart CoffeePOS Desktop and inspect the backup again.",
+                )
+            })?;
+            registry.clear();
+            Ok(Some(registry.insert(candidate)))
+        })
+        .await
+        .map_err(|_| {
+            restore_command_error(
+                "inspect",
+                "restore_worker_failed",
+                "CoffeePOS could not complete restore inspection.",
+                "Retry inspection or restart CoffeePOS Desktop.",
+            )
+        })?
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = app;
+        let _ = backup_password;
+        Err(restore_command_error(
+            "inspect",
+            "runtime_artifacts_unavailable",
+            "Restore inspection is not available until managed runtime artifacts are packaged for this build.",
+            "Use the qualified Windows development build until runtime packaging is completed.",
+        ))
+    }
+}
+
+#[tauri::command]
+async fn apply_restore(
+    app: tauri::AppHandle,
+    candidate_id: String,
+    backup_password: String,
+) -> Result<RestoreResult, restore::RestoreErrorInfo> {
+    #[cfg(debug_assertions)]
+    {
+        let candidate = {
+            let state = app.state::<ShellState>();
+            if restore_gate_blocks(&state).map_err(|message| {
+                restore_command_error(
+                    "apply",
+                    "restore_gate_unavailable",
+                    message,
+                    "Restart CoffeePOS Desktop and recover the existing restore transaction.",
+                )
+            })? {
+                return Err(restore_command_error(
+                    "apply",
+                    "restore_already_active",
+                    "A restore transaction is already active or requires recovery.",
+                    "Finish restore recovery before applying another backup.",
+                ));
+            }
+            let candidate = state
+                .restore_candidates
+                .lock()
+                .map_err(|_| {
+                    restore_command_error(
+                        "apply",
+                        "restore_candidate_state_unavailable",
+                        "CoffeePOS cannot access the validated restore candidate.",
+                        "Restart CoffeePOS Desktop and inspect the backup again.",
+                    )
+                })?
+                .get(&candidate_id)
+                .cloned();
+            let candidate = candidate.ok_or_else(|| {
+                restore_command_error(
+                    "apply",
+                    "stale_restore_candidate",
+                    "The selected restore candidate is no longer available.",
+                    "Choose and inspect the backup again before applying restore.",
+                )
+            })?;
+            if state
+                .restore_requested
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(restore_command_error(
+                    "apply",
+                    "restore_already_active",
+                    "Another restore request is already starting.",
+                    "Wait for the current restore request to publish its status.",
+                ));
+            }
+            if state
+                .lifecycle_requested
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                state.restore_requested.store(false, Ordering::Release);
+                return Err(restore_command_error(
+                    "apply",
+                    "lifecycle_busy",
+                    "CoffeePOS is already completing another managed lifecycle operation.",
+                    "Wait for that operation to finish before applying restore.",
+                ));
+            }
+            if restore_gate_blocks(&state).unwrap_or(true) {
+                state.lifecycle_requested.store(false, Ordering::Release);
+                state.restore_requested.store(false, Ordering::Release);
+                return Err(restore_command_error(
+                    "apply",
+                    "restore_already_active",
+                    "A durable restore transaction became active before this request could start.",
+                    "Refresh restore status and finish recovery before applying another backup.",
+                ));
+            }
+            candidate
+        };
+        let password = zeroize::Zeroizing::new(backup_password);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let state = app.state::<ShellState>();
+            if let Ok(mut operation) = state.restore_operation.lock() {
+                operation.status = RestoreStatus {
+                    stage: "planned".into(),
+                    started_at: Some(restore_now()),
+                    ..RestoreStatus::default()
+                };
+                operation.cancelled = Some(cancelled.clone());
+            };
+        }
+        let worker_app = app.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            run_restore_apply_worker(
+                &worker_app,
+                candidate,
+                password.as_str(),
+                cancelled,
+            )
+        })
+        .await
+        .map_err(|_| {
+            restore_command_error(
+                "apply",
+                "restore_worker_failed",
+                "CoffeePOS restore worker stopped unexpectedly.",
+                "Keep the application open and use restore recovery before another managed operation.",
+            )
+        });
+        let state = app.state::<ShellState>();
+        state.restore_requested.store(false, Ordering::Release);
+        state.lifecycle_requested.store(false, Ordering::Release);
+        match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                let gate_blocked = restore_gate_blocks(&state).unwrap_or(true);
+                if !gate_blocked {
+                    if let Ok(mut operation) = state.restore_operation.lock() {
+                        if operation.status.stage == "planned"
+                            || operation.status.operation_id.is_none()
+                        {
+                            operation.status.stage = "failed".into();
+                            operation.status.failed = true;
+                            operation.status.finished_at = Some(restore_now());
+                            operation.status.last_error = Some(error.clone());
+                            operation.cancelled = None;
+                        }
+                    }
+                }
+                Err(error)
+            }
+            Err(error) => {
+                if let Ok(mut operation) = state.restore_operation.lock() {
+                    operation.status.stage = "recovery_required".into();
+                    operation.status.failed = true;
+                    operation.status.needs_recovery = true;
+                    operation.status.recovery_required = true;
+                    operation.status.last_error = Some(error.clone());
+                }
+                Err(error)
+            }
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = app;
+        let _ = candidate_id;
+        let _ = backup_password;
+        Err(restore_command_error(
+            "apply",
+            "runtime_artifacts_unavailable",
+            "Restore is not available until managed runtime artifacts are packaged for this build.",
+            "Use the qualified Windows development build until runtime packaging is completed.",
+        ))
+    }
+}
+
+#[tauri::command]
+fn cancel_restore(
+    state: State<'_, ShellState>,
+    operation_id: String,
+) -> Result<(), restore::RestoreErrorInfo> {
+    let operation = state.restore_operation.lock().map_err(|_| {
+        restore_command_error(
+            "cancel",
+            "restore_state_unavailable",
+            "CoffeePOS cannot access the active restore cancellation token.",
+            "Keep the application open and retry restore status before cancelling again.",
+        )
+    })?;
+    if operation.status.operation_id.as_deref() != Some(operation_id.as_str()) {
+        return Err(restore_command_error(
+            "cancel",
+            "restore_operation_mismatch",
+            "The restore operation changed before the cancellation request was applied.",
+            "Refresh restore status before requesting cancellation again.",
+        ));
+    }
+    if matches!(
+        operation.status.stage.as_str(),
+        "active_verified"
+            | "committed"
+            | "cleanup"
+            | "abort_started"
+            | "rollback_started"
+            | "aborted"
+            | "rolled_back"
+    ) {
+        return Err(restore_command_error(
+            "cancel",
+            "restore_cancellation_closed",
+            "Restore can no longer accept a new cancellation request at its current stage.",
+            "Allow the current reconciliation step to finish and refresh restore status.",
+        ));
+    }
+    let cancelled = operation.cancelled.as_ref().ok_or_else(|| {
+        restore_command_error(
+            "cancel",
+            "restore_cancellation_unavailable",
+            "The restore cancellation token is no longer active.",
+            "Refresh restore status before requesting cancellation again.",
+        )
+    })?;
+    cancelled.store(true, Ordering::Release);
+    Ok(())
 }
 
 #[tauri::command]
@@ -745,6 +2560,14 @@ async fn create_backup(
     {
         let backup_password = zeroize::Zeroizing::new(backup_password);
         let state = app.state::<ShellState>();
+        ensure_restore_allows_managed_operation(&state, "create a backup").map_err(|message| {
+            backup_command_error(
+                "preflight",
+                "restore_in_progress",
+                &message,
+                "Finish restore recovery before creating another backup.",
+            )
+        })?;
         let shell = with_store(&app, &state, |_| Ok(())).map_err(|_| {
             backup_command_error(
                 "preflight",
@@ -1179,6 +3002,20 @@ fn get_shell_info(
     app: tauri::AppHandle,
     state: State<'_, ShellState>,
 ) -> Result<ShellInfo, String> {
+    #[cfg(debug_assertions)]
+    {
+        if !state.restore_requested.load(Ordering::Acquire) {
+            match recover_restore_admission(&app, &state) {
+                Ok(Some(_)) => {
+                    if let Err(error) = recover_restore_transaction(&app, &state) {
+                        publish_restore_recovery_failure(&state, &error);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => publish_restore_recovery_failure(&state, &error),
+            }
+        }
+    }
     let backup_active = state
         .backup
         .lock()
@@ -1187,7 +3024,8 @@ fn get_shell_info(
     // An active backup owns the runtime mutex for its full maintenance window. WebView reloads
     // still need shell metadata so they can reconnect to get_backup_status/cancel_backup instead
     // of blocking behind that mutex until the backup is already over.
-    let fresh_runtime = if backup_active {
+    let restore_blocked = restore_gate_blocks(&state)?;
+    let fresh_runtime = if backup_active || restore_blocked {
         false
     } else {
         state
@@ -1196,7 +3034,7 @@ fn get_shell_info(
             .map_err(|_| "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string())?
             .is_none()
     };
-    if fresh_runtime && !backup_active {
+    if fresh_runtime && !backup_active && !restore_blocked {
         let root = application_data_root(&app)?;
         backup::recover_interrupted_backup(&root)
             .map_err(|error| format!("{} {}", error.message, error.recovery))?;
@@ -1210,6 +3048,7 @@ fn save_app_settings(
     state: State<'_, ShellState>,
     startup_view: StartupView,
 ) -> Result<ShellInfo, String> {
+    ensure_restore_allows_managed_operation(&state, "save application settings")?;
     let _lifecycle_guard = try_lifecycle(&state, "save application settings")?;
     with_store(&app, &state, |store| store.save_startup_view(startup_view))
 }
@@ -1270,6 +3109,7 @@ fn save_setup_profile(
 ) -> Result<SetupInfo, String> {
     #[cfg(debug_assertions)]
     {
+        ensure_restore_allows_managed_operation(&state, "save the initial store profile")?;
         let _lifecycle_guard = try_lifecycle(&state, "save the initial store profile")?;
         let provisioning = inspect_provisioning(&app, &state)?;
         if provisioning.state != ProvisioningState::NotInstalled {
@@ -1370,6 +3210,7 @@ fn copy_text_to_clipboard(_text: &str) -> Result<(), String> {
 fn copy_admin_password(app: tauri::AppHandle, state: State<'_, ShellState>) -> Result<(), String> {
     #[cfg(debug_assertions)]
     {
+        ensure_restore_allows_managed_operation(&state, "copy the administrator password")?;
         let provisioning = inspect_provisioning(&app, &state)?;
         if provisioning.admin_username.is_none() {
             return Err(
@@ -1469,6 +3310,7 @@ async fn get_repair_plan(app: tauri::AppHandle) -> Result<RepairPlan, String> {
     {
         tauri::async_runtime::spawn_blocking(move || {
             let state = app.state::<ShellState>();
+            ensure_restore_allows_managed_operation(&state, "inspect the repair plan")?;
             let _lifecycle_guard = try_lifecycle(&state, "inspect the repair plan")?;
             let _provisioning_guard = try_provisioning(&state, "inspect the repair plan")?;
             let root = data_root(&app, &state)?;
@@ -1519,6 +3361,7 @@ async fn apply_repair(
     {
         {
             let state = app.state::<ShellState>();
+            ensure_restore_allows_managed_operation(&state, "apply the repair plan")?;
             if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
                 return Err(
                     "Runtime lifecycle is busy. Wait for the current operation to finish, then retry repair."
@@ -1950,6 +3793,7 @@ async fn apply_repair(
 async fn refresh_runtime_maintenance(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<ShellState>();
+        ensure_restore_allows_managed_operation(&state, "run background maintenance")?;
         if state.shutdown_in_progress.load(Ordering::Acquire)
             || state.lifecycle_requested.load(Ordering::Acquire)
         {
@@ -2050,6 +3894,7 @@ fn get_provisioning_info(
 fn open_wordpress(app: tauri::AppHandle, state: State<'_, ShellState>) -> Result<String, String> {
     #[cfg(debug_assertions)]
     {
+        ensure_restore_allows_managed_operation(&state, "open WordPress")?;
         let _lifecycle_guard = try_lifecycle(&state, "open WordPress")?;
         let provisioning = inspect_provisioning(&app, &state)?;
         if provisioning.state != ProvisioningState::Ready {
@@ -2077,6 +3922,7 @@ fn open_wordpress(app: tauri::AppHandle, state: State<'_, ShellState>) -> Result
 fn open_pos(app: tauri::AppHandle, state: State<'_, ShellState>) -> Result<String, String> {
     #[cfg(debug_assertions)]
     {
+        ensure_restore_allows_managed_operation(&state, "open the POS")?;
         let _lifecycle_guard = try_lifecycle(&state, "open the POS")?;
         let provisioning = inspect_provisioning(&app, &state)?;
         if provisioning.state != ProvisioningState::Ready {
@@ -2107,6 +3953,7 @@ fn provision_wordpress(
 ) -> Result<ProvisioningInfo, String> {
     #[cfg(debug_assertions)]
     {
+        ensure_restore_allows_managed_operation(&state, "provision WordPress")?;
         let _lifecycle_guard = try_lifecycle(&state, "provision WordPress")?;
         let root = data_root(&app, &state)?;
         let (store_name, admin_username, admin_email, setup_profile_configured) = {
@@ -2214,6 +4061,13 @@ fn main() {
     tauri::Builder::default()
         .manage(ShellState::default())
         .setup(|app| {
+            #[cfg(debug_assertions)]
+            {
+                let state = app.state::<ShellState>();
+                if let Err(error) = recover_restore_admission(app.handle(), &state) {
+                    publish_restore_recovery_failure(&state, &error);
+                }
+            }
             let open_item =
                 MenuItem::with_id(app, TRAY_OPEN_ID, "Mở CoffeePOS", true, None::<&str>)?;
             let exit_item =
@@ -2272,6 +4126,10 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            get_restore_status,
+            inspect_restore_backup,
+            apply_restore,
+            cancel_restore,
             get_backup_status,
             create_backup,
             cancel_backup,

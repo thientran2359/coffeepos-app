@@ -2156,6 +2156,282 @@ impl Provisioner {
         })
     }
 
+    pub(crate) fn import_restored_database(
+        &self,
+        dump_path: &Path,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let metadata = fs::symlink_metadata(dump_path).map_err(|error| {
+            provisioning_error(
+                "import restored database",
+                format!("Cannot inspect the staged logical dump: {error}."),
+                "Re-extract the validated backup into owned restore staging and retry.",
+            )
+        })?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata_is_reparse_point(&metadata)
+        {
+            return Err(provisioning_error(
+                "import restored database",
+                "The staged logical dump is not a regular local file.",
+                "Discard owned restore staging and re-extract the validated backup before retrying.",
+            ));
+        }
+        let wordpress_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+            .map_err(|error| {
+                provisioning_error(
+                    "import restored database",
+                    error,
+                    "Restore staging must retain the target-generated WordPress database credential before importing the backup.",
+                )
+            })?;
+        let runtime_password = secret::load(&self.data_root.join(DATABASE_RUNTIME_SECRET))
+            .map_err(|error| {
+                provisioning_error(
+                    "import restored database",
+                    error,
+                    "Restore staging must retain the target-generated runtime database credential before importing the backup.",
+                )
+            })?;
+        let port = choose_loopback_port(&[])?;
+        let endpoint = DatabaseEndpoint::Tcp(port);
+        let mut database = self.spawn_database(&endpoint)?;
+        let import_result = (|| -> Result<(), RuntimeErrorInfo> {
+            self.wait_for_database_user(
+                &mut database,
+                &endpoint,
+                DATABASE_WORDPRESS_USER,
+                &wordpress_password,
+                Some(DATABASE_NAME),
+            )?;
+            let input = fs::File::open(dump_path).map_err(|error| {
+                provisioning_error(
+                    "import restored database",
+                    format!("Cannot open the staged logical dump: {error}."),
+                    "Re-extract the validated backup into owned restore staging and retry.",
+                )
+            })?;
+            let mut command = self.database_client_command(
+                &endpoint,
+                DATABASE_WORDPRESS_USER,
+                &wordpress_password,
+            );
+            command
+                .arg(format!("--database={DATABASE_NAME}"))
+                .stdin(Stdio::from(input))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .current_dir(&self.runtime.mariadb_base_dir);
+            configure_child_command(&mut command);
+            let status = run_command_bounded(
+                command,
+                Duration::from_secs(180),
+                "restore",
+                "import restored database",
+                &self.containment,
+            )?;
+            if !status.success() {
+                return Err(provisioning_error(
+                    "import restored database",
+                    format!("The pinned MariaDB client rejected the staged logical dump (status {status})."),
+                    "The active store is unchanged. Discard restore staging, re-inspect the backup, and retry.",
+                ));
+            }
+            Ok(())
+        })();
+
+        let shutdown_result = self.run_database_sql(
+            &endpoint,
+            DATABASE_RUNTIME_USER,
+            &runtime_password,
+            "SHUTDOWN;\n",
+        );
+        if shutdown_result.is_err() {
+            let _ = database.kill();
+        }
+        let wait_result = wait_for_child_exit(&mut database, Duration::from_secs(15));
+        match (import_result, shutdown_result, wait_result) {
+            (Ok(()), Ok(()), Ok(_)) => Ok(()),
+            (Err(error), _, _) => Err(error),
+            (Ok(()), Err(error), _) => Err(provisioning_error(
+                "stop restored database staging",
+                error.message,
+                "Keep the restore admission gate active and retry staging cleanup before another managed operation.",
+            )),
+            (Ok(()), Ok(()), Err(error)) => Err(provisioning_error(
+                "stop restored database staging",
+                error.message,
+                "Keep the restore admission gate active until the staging MariaDB process is confirmed stopped.",
+            )),
+        }
+    }
+
+    pub(crate) fn verify_restored_wordpress_identity(
+        &self,
+        runtime_info: &RuntimeInfo,
+        store_name: &str,
+        administrator_username: &str,
+        administrator_email: &str,
+        administrator_password: &str,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let database_port = runtime_info.database_port.ok_or_else(|| {
+            provisioning_error(
+                "verify restored administrator",
+                "MariaDB port is unavailable while verifying the restored WordPress identity.",
+                "Keep restore staging isolated, restart its verification runtime, and retry.",
+            )
+        })?;
+        let http_port = runtime_info.http_port.ok_or_else(|| {
+            provisioning_error(
+                "verify restored administrator",
+                "HTTP port is unavailable while verifying the restored WordPress identity.",
+                "Keep restore staging isolated, restart its verification runtime, and retry.",
+            )
+        })?;
+        let database_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+            .map_err(|error| {
+                provisioning_error(
+                    "verify restored administrator",
+                    error,
+                    "Restore staging must keep the target-generated WordPress database credential intact.",
+                )
+            })?;
+        let script = self.write_restore_identity_verification_script()?;
+        let mut command = Command::new(&self.runtime.php_executable);
+        command
+            .arg("-c")
+            .arg(&self.runtime.php_ini)
+            .arg(&script)
+            .env_remove("PHPRC")
+            .env("PHP_INI_SCAN_DIR", "")
+            .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
+            .env("COFFEEPOS_DB_PASSWORD", database_password)
+            .env(
+                "COFFEEPOS_SITE_URL",
+                format!("http://{LOOPBACK}:{http_port}"),
+            )
+            .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
+            .env("COFFEEPOS_SITE_ROOT", self.data_root.join("site"))
+            .env("COFFEEPOS_RESTORE_STORE_NAME", store_name)
+            .env("COFFEEPOS_RESTORE_ADMIN_USER", administrator_username)
+            .env("COFFEEPOS_RESTORE_ADMIN_EMAIL", administrator_email)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .current_dir(self.data_root.join("site"));
+        configure_child_command(&mut command);
+        let mut child = command.spawn().map_err(|error| {
+            let _ = fs::remove_file(&script);
+            provisioning_error(
+                "verify restored administrator",
+                format!("Cannot start pinned PHP for restored-identity verification: {error}."),
+                "Verify the pinned PHP runtime and retry restore while staging remains isolated.",
+            )
+        })?;
+        if let Err(error) = self.containment.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&script);
+            return Err(error);
+        }
+        let stdin_result = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "PHP stdin unavailable"))
+            .and_then(|mut stdin| stdin.write_all(administrator_password.as_bytes()));
+        if let Err(error) = stdin_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&script);
+            return Err(provisioning_error(
+                "verify restored administrator",
+                format!("Cannot pass the restored administrator password to pinned PHP over stdin: {error}."),
+                "Retry restore. The administrator password is never placed in process arguments or logs.",
+            ));
+        }
+        let status = wait_for_child_exit(&mut child, Duration::from_secs(30));
+        let _ = fs::remove_file(&script);
+        let status = status?;
+        if !status.success() {
+            return Err(provisioning_error(
+                "verify restored administrator",
+                format!("Restored WordPress identity verification exited with status {status}."),
+                "The active store is unchanged. Verify that the backup contains the matching administrator credential and retry.",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_restored_provisioning(
+        &self,
+        runtime_info: &RuntimeInfo,
+        store_name: &str,
+    ) -> Result<ProvisioningInfo, RuntimeErrorInfo> {
+        let journal = self.load_journal()?.ok_or_else(|| {
+            provisioning_error(
+                "adopt restored WordPress",
+                "Restore staging is missing its provisioning ownership journal.",
+                "Discard owned restore staging and rebuild it from the validated backup.",
+            )
+        })?;
+        if journal.stage < ProvisioningStage::SiteReady {
+            return Err(provisioning_error(
+                "adopt restored WordPress",
+                "Restore staging has not completed the target WordPress/core and database preparation boundary.",
+                "Rebuild restore staging before importing or activating the restored store.",
+            ));
+        }
+        if journal.stage < ProvisioningStage::WordPressInstalled {
+            self.persist_stage(ProvisioningStage::WordPressInstalled)?;
+        }
+        ensure_woocommerce_plugin(&self.data_root, &self.woocommerce)?;
+        if self
+            .load_journal()?
+            .is_some_and(|value| value.stage < ProvisioningStage::WooCommerceProvisioned)
+        {
+            self.persist_stage(ProvisioningStage::WooCommerceProvisioned)?;
+        }
+        self.activate_woocommerce(runtime_info)?;
+        if self
+            .load_journal()?
+            .is_some_and(|value| value.stage < ProvisioningStage::WooCommerceActivated)
+        {
+            self.persist_stage(ProvisioningStage::WooCommerceActivated)?;
+        }
+        ensure_coffeepos_plugin(&self.data_root, &self.coffeepos, &self.woocommerce)?;
+        if self
+            .load_journal()?
+            .is_some_and(|value| value.stage < ProvisioningStage::CoffeePosProvisioned)
+        {
+            self.persist_stage(ProvisioningStage::CoffeePosProvisioned)?;
+        }
+        self.activate_coffeepos(runtime_info, store_name)?;
+        if self
+            .load_journal()?
+            .is_some_and(|value| value.stage < ProvisioningStage::CoffeePosActivated)
+        {
+            self.persist_stage(ProvisioningStage::CoffeePosActivated)?;
+        }
+        self.bootstrap_machine_health_for_restore(runtime_info)?;
+        if self
+            .load_journal()?
+            .is_some_and(|value| value.stage < ProvisioningStage::MachineHealthBootstrapped)
+        {
+            self.persist_stage(ProvisioningStage::MachineHealthBootstrapped)?;
+        }
+        Ok(ProvisioningInfo {
+            state: ProvisioningState::Ready,
+            wordpress_version: self.wordpress.version.clone(),
+            woocommerce_version: self.woocommerce.version.clone(),
+            woocommerce_active: true,
+            coffeepos_version: self.coffeepos.version.clone(),
+            coffeepos_active: true,
+            admin_username: Some(self.admin_username.clone()),
+            can_retry: false,
+            last_error: None,
+        })
+    }
+
     pub fn install_wordpress(
         &mut self,
         store_name: &str,
@@ -2783,6 +3059,151 @@ impl Provisioner {
                 "verify CoffeePOS machine health",
                 details,
                 "Keep the protected token and installed store, correct the endpoint/auth/bootstrap issue, then retry provisioning.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn bootstrap_machine_health_for_restore(
+        &self,
+        runtime_info: &RuntimeInfo,
+    ) -> Result<(), RuntimeErrorInfo> {
+        let http_port = runtime_info.http_port.ok_or_else(|| {
+            provisioning_error(
+                "bind restored CoffeePOS machine health",
+                "HTTP port is unavailable while binding the target machine credential.",
+                "Keep restore staging isolated, restart its verification runtime, and retry.",
+            )
+        })?;
+        let database_port = runtime_info.database_port.ok_or_else(|| {
+            provisioning_error(
+                "bind restored CoffeePOS machine health",
+                "MariaDB port is unavailable while binding the target machine credential.",
+                "Keep restore staging isolated, restart its verification runtime, and retry.",
+            )
+        })?;
+        let database_password = secret::load(&self.data_root.join(DATABASE_WORDPRESS_SECRET))
+            .map_err(|error| {
+                provisioning_error(
+                    "bind restored CoffeePOS machine health",
+                    error,
+                    "Restore staging must keep the target-generated WordPress database credential intact.",
+                )
+            })?;
+        let token_path = self.data_root.join(MACHINE_TOKEN_SECRET);
+        let pending_token_path = self.data_root.join(MACHINE_TOKEN_PENDING_SECRET);
+        if token_path.exists() || pending_token_path.exists() {
+            return Err(provisioning_error(
+                "bind restored CoffeePOS machine health",
+                "Restore staging already contains a machine credential before target binding starts.",
+                "Keep restore staging isolated and recover or rebuild the transaction-owned staging store before retrying.",
+            ));
+        }
+        let token = secret::create_machine_token(&pending_token_path).map_err(|error| {
+            provisioning_error(
+                "bind restored CoffeePOS machine health",
+                error,
+                "Check protected target storage and operating-system random generation, then retry restore.",
+            )
+        })?;
+        let script = self.write_restore_machine_health_script()?;
+        let mut command = Command::new(&self.runtime.php_executable);
+        command
+            .arg("-c")
+            .arg(&self.runtime.php_ini)
+            .arg(&script)
+            .env_remove("PHPRC")
+            .env("PHP_INI_SCAN_DIR", "")
+            .env("COFFEEPOS_DB_HOST", format!("{LOOPBACK}:{database_port}"))
+            .env("COFFEEPOS_DB_PASSWORD", database_password)
+            .env(
+                "COFFEEPOS_SITE_URL",
+                format!("http://{LOOPBACK}:{http_port}"),
+            )
+            .env("COFFEEPOS_UPLOAD_ROOT", self.data_root.join("uploads"))
+            .env("COFFEEPOS_SITE_ROOT", self.data_root.join("site"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .current_dir(self.data_root.join("site"));
+        configure_child_command(&mut command);
+        let mut child = command.spawn().map_err(|error| {
+            let _ = fs::remove_file(&script);
+            provisioning_error(
+                "bind restored CoffeePOS machine health",
+                format!("Cannot start pinned PHP for target machine-token binding: {error}."),
+                "Verify the pinned PHP runtime and retry restore while staging remains isolated.",
+            )
+        })?;
+        if let Err(error) = self.containment.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&script);
+            return Err(error);
+        }
+        let stdin_result = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "PHP stdin unavailable"))
+            .and_then(|mut stdin| stdin.write_all(token.as_bytes()));
+        if let Err(error) = stdin_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&script);
+            return Err(provisioning_error(
+                "bind restored CoffeePOS machine health",
+                format!("Cannot pass the target machine credential to pinned PHP over stdin: {error}."),
+                "Retry restore. The target credential remains protected and is never placed in process arguments or logs.",
+            ));
+        }
+        let status = wait_for_child_exit(&mut child, Duration::from_secs(30));
+        let _ = fs::remove_file(&script);
+        let status = status?;
+        if !status.success() {
+            return Err(provisioning_error(
+                "bind restored CoffeePOS machine health",
+                format!("Target machine-token binding exited with status {status}."),
+                "The active store is unchanged. Keep restore staging isolated and retry or abort the restore transaction.",
+            ));
+        }
+        let pending_health = probe_coffeepos_health_with_token(http_port, &token);
+        if !matches!(
+            pending_health.state,
+            CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+        ) {
+            let details = pending_health
+                .error
+                .map(|error| format!("{} {}", error.message, error.recovery))
+                .unwrap_or_else(|| "CoffeePOS machine-health probe is unavailable.".into());
+            return Err(provisioning_error(
+                "verify restored CoffeePOS machine health",
+                details,
+                "Keep restore staging isolated and repair its target-local credential binding before cutover.",
+            ));
+        }
+        secret::store_machine_token(&token_path, &token).map_err(|error| {
+            provisioning_error(
+                "promote restored CoffeePOS machine health",
+                error,
+                "The restored staging endpoint accepts the pending target credential. Preserve pending protected state and retry promotion before cutover.",
+            )
+        })?;
+        fs::remove_file(&pending_token_path).map_err(|error| {
+            provisioning_error(
+                "promote restored CoffeePOS machine health",
+                format!("The target machine credential was promoted but its pending file cannot be removed: {error}."),
+                "Keep restore fenced and retry credential cleanup before staging verification completes.",
+            )
+        })?;
+        let promoted_health = probe_coffeepos_health(&self.data_root, http_port);
+        if !matches!(
+            promoted_health.state,
+            CoffeePosHealthState::Healthy | CoffeePosHealthState::Degraded
+        ) {
+            return Err(provisioning_error(
+                "verify promoted CoffeePOS machine health",
+                "The promoted target machine credential did not authenticate after staging promotion.",
+                "Keep restore staging isolated and preserve its protected credential evidence before retrying recovery.",
             ));
         }
         Ok(())
@@ -3821,6 +4242,38 @@ require_once ABSPATH . 'wp-settings.php';\n",
         Ok(path)
     }
 
+    fn write_restore_identity_verification_script(&self) -> Result<PathBuf, RuntimeErrorInfo> {
+        let config = self.data_root.join("config");
+        let mut temporary = NamedTempFile::new_in(&config).map_err(|error| {
+            provisioning_error(
+                "prepare restored identity verification",
+                format!("Cannot create temporary restore verification script: {error}."),
+                "Check restore-staging permissions and free disk space, then retry.",
+            )
+        })?;
+        temporary
+            .write_all(WORDPRESS_RESTORE_IDENTITY_VERIFY.as_bytes())
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|error| {
+                provisioning_error(
+                    "prepare restored identity verification",
+                    format!("Cannot write temporary restore verification script: {error}."),
+                    "Check restore-staging storage health and retry.",
+                )
+            })?;
+        let (_file, path) = temporary.keep().map_err(|error| {
+            provisioning_error(
+                "prepare restored identity verification",
+                format!(
+                    "Cannot retain temporary restore verification script: {}.",
+                    error.error
+                ),
+                "Check restore-staging permissions and retry.",
+            )
+        })?;
+        Ok(path)
+    }
+
     fn write_woocommerce_activation_script(&self) -> Result<PathBuf, RuntimeErrorInfo> {
         let config = self.data_root.join("config");
         let mut temporary = NamedTempFile::new_in(&config).map_err(|error| {
@@ -3946,6 +4399,38 @@ require_once ABSPATH . 'wp-settings.php';\n",
                     error.error
                 ),
                 "Check application-data permissions and retry.",
+            )
+        })?;
+        Ok(path)
+    }
+
+    fn write_restore_machine_health_script(&self) -> Result<PathBuf, RuntimeErrorInfo> {
+        let config = self.data_root.join("config");
+        let mut temporary = NamedTempFile::new_in(&config).map_err(|error| {
+            provisioning_error(
+                "prepare restored CoffeePOS machine health",
+                format!("Cannot create temporary restore machine-health script: {error}."),
+                "Check restore-staging permissions and free disk space, then retry.",
+            )
+        })?;
+        temporary
+            .write_all(COFFEEPOS_RESTORE_MACHINE_HEALTH_BOOTSTRAP.as_bytes())
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|error| {
+                provisioning_error(
+                    "prepare restored CoffeePOS machine health",
+                    format!("Cannot write temporary restore machine-health script: {error}."),
+                    "Check restore-staging storage health and retry.",
+                )
+            })?;
+        let (_file, path) = temporary.keep().map_err(|error| {
+            provisioning_error(
+                "prepare restored CoffeePOS machine health",
+                format!(
+                    "Cannot retain temporary restore machine-health script: {}.",
+                    error.error
+                ),
+                "Check restore-staging permissions and retry.",
             )
         })?;
         Ok(path)
@@ -6925,6 +7410,53 @@ if ($verifyInitialSetup) {
 exit(get_option('siteurl') ? 0 : 5);
 "#;
 
+const WORDPRESS_RESTORE_IDENTITY_VERIFY: &str = r#"<?php
+declare(strict_types=1);
+
+$siteRoot = getenv('COFFEEPOS_SITE_ROOT');
+$storeName = (string) getenv('COFFEEPOS_RESTORE_STORE_NAME');
+$adminUser = trim((string) getenv('COFFEEPOS_RESTORE_ADMIN_USER'));
+$adminEmail = trim((string) getenv('COFFEEPOS_RESTORE_ADMIN_EMAIL'));
+if (!$siteRoot || $storeName === '' || $adminUser === '' || $adminEmail === '') {
+    fwrite(STDERR, "CoffeePOS restore identity verification environment is incomplete.\n");
+    exit(2);
+}
+$password = (string) stream_get_contents(STDIN);
+if ($password === '') {
+    fwrite(STDERR, "CoffeePOS restored administrator credential is empty.\n");
+    exit(3);
+}
+
+require_once $siteRoot . '/wp-load.php';
+$user = get_user_by('login', $adminUser);
+if (!$user || !isset($user->ID) || (string) $user->user_login !== $adminUser) {
+    $password = '';
+    fwrite(STDERR, "CoffeePOS restored administrator identity does not exist.\n");
+    exit(4);
+}
+if (strcasecmp((string) $user->user_email, $adminEmail) !== 0 || !user_can($user, 'manage_options')) {
+    $password = '';
+    fwrite(STDERR, "CoffeePOS restored administrator metadata or authority does not match the backup.\n");
+    exit(5);
+}
+if (!wp_check_password($password, (string) $user->user_pass, (int) $user->ID)) {
+    $password = '';
+    fwrite(STDERR, "CoffeePOS restored administrator password does not match the restored WordPress hash.\n");
+    exit(6);
+}
+$password = '';
+$expectedBlogName = (string) sanitize_option('blogname', $storeName);
+if ((string) get_option('blogname', '') !== $expectedBlogName) {
+    fwrite(STDERR, "CoffeePOS restored WordPress store name does not match the backup.\n");
+    exit(7);
+}
+if ((string) get_option('coffeepos_store_name', '') !== $storeName) {
+    fwrite(STDERR, "CoffeePOS restored plugin store identity does not match the backup.\n");
+    exit(8);
+}
+exit(0);
+"#;
+
 const WOOCOMMERCE_ACTIVATION_BOOTSTRAP: &str = r#"<?php
 declare(strict_types=1);
 
@@ -7387,6 +7919,47 @@ if ($stored === '') {
 }
 $hash = '';
 fwrite(STDOUT, "CoffeePOS machine credential hash persisted.\n");
+exit(0);
+"#;
+
+const COFFEEPOS_RESTORE_MACHINE_HEALTH_BOOTSTRAP: &str = r#"<?php
+declare(strict_types=1);
+
+$siteRoot = getenv('COFFEEPOS_SITE_ROOT');
+if (!$siteRoot) {
+    fwrite(STDERR, "CoffeePOS restore machine-health environment is incomplete.\n");
+    exit(2);
+}
+$token = trim((string) stream_get_contents(STDIN));
+if (strlen($token) !== 64 || !preg_match('/^[0-9a-f]{64}$/', $token)) {
+    fwrite(STDERR, "CoffeePOS target machine credential format is invalid.\n");
+    exit(3);
+}
+require_once $siteRoot . '/wp-load.php';
+if (!defined('COFFEEPOS_VERSION') || !class_exists('\\CoffeePOS\\REST\\SystemStatusController')) {
+    $token = '';
+    fwrite(STDERR, "CoffeePOS machine-health controller is unavailable during restore.\n");
+    exit(4);
+}
+$hash = hash('sha256', $token);
+$token = '';
+$option = \CoffeePOS\REST\SystemStatusController::OPTION_MACHINE_TOKEN_HASH;
+$stored = strtolower(trim((string) get_option($option, '')));
+if (!hash_equals($stored, $hash) && !update_option($option, $hash, false)) {
+    $stored = strtolower(trim((string) get_option($option, '')));
+    if (!hash_equals($stored, $hash)) {
+        $hash = '';
+        fwrite(STDERR, "CoffeePOS target machine credential hash could not be bound to the restored store.\n");
+        exit(5);
+    }
+}
+$stored = strtolower(trim((string) get_option($option, '')));
+if (!hash_equals($stored, $hash)) {
+    $hash = '';
+    fwrite(STDERR, "CoffeePOS target machine credential verification failed after restore binding.\n");
+    exit(6);
+}
+$hash = '';
 exit(0);
 "#;
 

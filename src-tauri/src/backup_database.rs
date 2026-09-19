@@ -456,11 +456,29 @@ impl DatabaseBackupSession {
         mut self,
         runtime_manager: &mut RuntimeManager,
     ) -> Result<crate::runtime::RuntimeInfo, BackupDatabaseErrorInfo> {
+        self.cleanup_with_resume_policy(runtime_manager, true)
+    }
+
+    pub(crate) fn cleanup_without_resume(
+        mut self,
+        runtime_manager: &mut RuntimeManager,
+    ) -> Result<crate::runtime::RuntimeInfo, BackupDatabaseErrorInfo> {
+        self.cleanup_with_resume_policy(runtime_manager, false)
+    }
+
+    fn cleanup_with_resume_policy(
+        &mut self,
+        runtime_manager: &mut RuntimeManager,
+        restore_previous_running_state: bool,
+    ) -> Result<crate::runtime::RuntimeInfo, BackupDatabaseErrorInfo> {
         self.stage = BackupDatabaseStage::Cleanup;
         remove_owned_staging_dir(&self.data_root, &self.staging_dir)?;
-        let runtime_result = runtime_manager
-            .finish_database_backup_maintenance(&self.maintenance)
-            .map_err(|error| runtime_error("resume", "runtime_resume_failed", error));
+        let runtime_result = if restore_previous_running_state {
+            runtime_manager.finish_database_backup_maintenance(&self.maintenance)
+        } else {
+            runtime_manager.finish_database_backup_maintenance_stopped(&self.maintenance)
+        }
+        .map_err(|error| runtime_error("resume", "runtime_resume_failed", error));
         match runtime_result {
             Ok(info) => {
                 runtime_manager.clear_backup_recovery_context();
