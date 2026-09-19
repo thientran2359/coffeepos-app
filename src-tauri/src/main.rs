@@ -22,7 +22,7 @@ use backup::{BackupOperationState, BackupResult, BackupStatus};
 use backup_format::{
     BackupCompatibilityTarget, BackupErrorInfo, BackupInspection, BackupValidation,
 };
-use config::{AppConfig, StartupView, Store};
+use config::{AppConfig, AppLanguage, StartupView, Store};
 use logs::{LogCatalog, LogErrorInfo, LogPage, SupportBundleResult};
 #[cfg(debug_assertions)]
 use provisioning::Provisioner;
@@ -44,10 +44,74 @@ use tauri::{Manager, State};
 
 const TRAY_OPEN_ID: &str = "tray-open";
 const TRAY_EXIT_ID: &str = "tray-exit";
+const TRAY_MAIN_ID: &str = "coffeepos-main";
+
+struct NativeStrings {
+    tray_open: &'static str,
+    tray_quit: &'static str,
+    shutdown_confirm_title: &'static str,
+    shutdown_confirm_message: &'static str,
+    restore_busy_title: &'static str,
+    restore_busy_message: &'static str,
+    busy_title: &'static str,
+    busy_operation_message: &'static str,
+    busy_lifecycle_message: &'static str,
+    busy_runtime_message: &'static str,
+    unsafe_exit_title: &'static str,
+    lifecycle_unavailable_message: &'static str,
+    runtime_unavailable_message: &'static str,
+    stop_failed_title: &'static str,
+    stop_failed_prefix: &'static str,
+}
+
+const NATIVE_STRINGS_VI: NativeStrings = NativeStrings {
+    tray_open: "Mở CoffeePOS",
+    tray_quit: "Thoát hoàn toàn",
+    shutdown_confirm_title: "Dừng cửa hàng và thoát CoffeePOS?",
+    shutdown_confirm_message: "Dừng và thoát sẽ ngắt kết nối POS và các thiết bị đang dùng cửa hàng này. Thao tác này không chốt ca và không tự thay đổi trạng thái thanh toán.\n\nChọn Có để dừng cửa hàng và thoát, hoặc Không để ở lại.",
+    restore_busy_title: "CoffeePOS đang khôi phục dữ liệu",
+    restore_busy_message: "CoffeePOS đang khôi phục hoặc đối soát một giao dịch khôi phục. Hãy để ứng dụng mở cho đến khi trạng thái khôi phục kết thúc an toàn.",
+    busy_title: "CoffeePOS đang bận",
+    busy_operation_message: "CoffeePOS đang hoàn tất một thao tác hệ thống. Hãy thử thoát lại sau khi thao tác hiện tại kết thúc.",
+    busy_lifecycle_message: "CoffeePOS đang hoàn tất cài đặt hoặc thay đổi trạng thái hệ thống. Hãy chờ thao tác hiện tại kết thúc rồi thử thoát lại.",
+    busy_runtime_message: "CoffeePOS đang cập nhật trạng thái hệ thống. Hãy thử thoát lại sau khi thao tác hiện tại kết thúc.",
+    unsafe_exit_title: "Không thể thoát an toàn",
+    lifecycle_unavailable_message: "Trạng thái vòng đời runtime không còn khả dụng. Hãy giữ ứng dụng mở và kiểm tra Chẩn đoán trước khi thử lại.",
+    runtime_unavailable_message: "Không thể đọc trạng thái runtime để dừng cửa hàng an toàn. Hãy giữ ứng dụng mở và thử lại.",
+    stop_failed_title: "Chưa thể dừng cửa hàng",
+    stop_failed_prefix: "CoffeePOS chưa dừng hoàn toàn nên ứng dụng vẫn mở để tránh bỏ lại tiến trình.",
+};
+
+const NATIVE_STRINGS_EN: NativeStrings = NativeStrings {
+    tray_open: "Open CoffeePOS",
+    tray_quit: "Quit CoffeePOS",
+    shutdown_confirm_title: "Stop the store and quit CoffeePOS?",
+    shutdown_confirm_message: "Stopping and quitting will disconnect the POS and devices using this store. This does not close the current shift or change payment status automatically.\n\nChoose Yes to stop the store and quit, or No to stay.",
+    restore_busy_title: "CoffeePOS is restoring data",
+    restore_busy_message: "CoffeePOS is restoring or reconciling a restore transaction. Keep the application open until restore reaches a safe terminal state.",
+    busy_title: "CoffeePOS is busy",
+    busy_operation_message: "CoffeePOS is finishing a system operation. Try quitting again after the current operation finishes.",
+    busy_lifecycle_message: "CoffeePOS is finishing setup or a system state change. Wait for the current operation to finish, then try quitting again.",
+    busy_runtime_message: "CoffeePOS is updating system state. Try quitting again after the current operation finishes.",
+    unsafe_exit_title: "CoffeePOS cannot quit safely",
+    lifecycle_unavailable_message: "Runtime lifecycle state is unavailable. Keep the application open and check Diagnostics before trying again.",
+    runtime_unavailable_message: "CoffeePOS cannot read runtime state to stop the store safely. Keep the application open and try again.",
+    stop_failed_title: "The store could not be stopped",
+    stop_failed_prefix: "CoffeePOS has not stopped completely, so the application will stay open to avoid leaving managed processes behind.",
+};
+
+fn native_strings(language: AppLanguage) -> &'static NativeStrings {
+    match language {
+        AppLanguage::Vi => &NATIVE_STRINGS_VI,
+        AppLanguage::En => &NATIVE_STRINGS_EN,
+    }
+}
 
 #[derive(Default)]
 struct ShellState {
     store: Mutex<Option<Store>>,
+    effective_language: Mutex<AppLanguage>,
+    language_mutation: Mutex<()>,
     runtime: Mutex<Option<RuntimeManager>>,
     lifecycle: Mutex<()>,
     lifecycle_requested: AtomicBool,
@@ -225,6 +289,39 @@ fn with_store(
     })
 }
 
+fn effective_app_language(state: &ShellState) -> AppLanguage {
+    match state.effective_language.lock() {
+        Ok(language) => *language,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+fn set_effective_app_language(state: &ShellState, language: AppLanguage) {
+    match state.effective_language.lock() {
+        Ok(mut current) => *current = language,
+        Err(poisoned) => *poisoned.into_inner() = language,
+    }
+}
+
+fn native_tray_menu<R: tauri::Runtime, M: Manager<R>>(
+    manager: &M,
+    language: AppLanguage,
+) -> tauri::Result<Menu<R>> {
+    let strings = native_strings(language);
+    let open_item =
+        MenuItem::<R>::with_id(manager, TRAY_OPEN_ID, strings.tray_open, true, None::<&str>)?;
+    let exit_item =
+        MenuItem::<R>::with_id(manager, TRAY_EXIT_ID, strings.tray_quit, true, None::<&str>)?;
+    Menu::with_items(manager, &[&open_item, &exit_item])
+}
+
+fn refresh_native_tray(app: &tauri::AppHandle, language: AppLanguage) -> tauri::Result<()> {
+    let Some(tray) = app.tray_by_id(TRAY_MAIN_ID) else {
+        return Ok(());
+    };
+    tray.set_menu(Some(native_tray_menu(app, language)?))
+}
+
 #[cfg(debug_assertions)]
 fn data_root(app: &tauri::AppHandle, state: &ShellState) -> Result<PathBuf, String> {
     let mut guard = state
@@ -294,6 +391,98 @@ fn with_runtime<T>(
         .as_mut()
         .ok_or_else(|| "Runtime manager unavailable. Retry startup.".to_string())?;
     operation(manager).map_err(|error| error.to_string())
+}
+
+fn ipc_error_info(
+    code: &'static str,
+    component: &'static str,
+    operation: &'static str,
+    message: impl Into<String>,
+    recovery: &'static str,
+) -> runtime::RuntimeErrorInfo {
+    runtime::RuntimeErrorInfo {
+        component: component.into(),
+        operation: operation.into(),
+        code: code.into(),
+        message: message.into(),
+        recovery: recovery.into(),
+    }
+}
+
+fn runtime_ipc_error(
+    operation: &'static str,
+    message: impl Into<String>,
+) -> runtime::RuntimeErrorInfo {
+    ipc_error_info(
+        "runtime_error",
+        "runtime",
+        operation,
+        message,
+        "Retry the runtime action. If the problem continues, open System diagnostics before making further changes.",
+    )
+}
+
+fn provisioning_ipc_error(
+    operation: &'static str,
+    message: impl Into<String>,
+) -> runtime::RuntimeErrorInfo {
+    ipc_error_info(
+        "provisioning_error",
+        "provisioning",
+        operation,
+        message,
+        "Retry from the current provisioning checkpoint. If setup remains blocked, open System diagnostics or repair.",
+    )
+}
+
+fn repair_ipc_error(
+    operation: &'static str,
+    message: impl Into<String>,
+) -> runtime::RuntimeErrorInfo {
+    ipc_error_info(
+        "repair_error",
+        "repair",
+        operation,
+        message,
+        "Inspect the current repair plan and system diagnostics before retrying repair.",
+    )
+}
+
+fn with_runtime_structured<T>(
+    _app: &tauri::AppHandle,
+    state: &ShellState,
+    operation: impl FnOnce(&mut RuntimeManager) -> Result<T, runtime::RuntimeErrorInfo>,
+) -> Result<T, runtime::RuntimeErrorInfo> {
+    #[cfg(debug_assertions)]
+    let root = data_root(_app, state)
+        .map_err(|message| runtime_ipc_error("resolve data root", message))?;
+    let mut guard = state
+        .runtime
+        .lock()
+        .map_err(|_| runtime_ipc_error("access runtime state", "Runtime state is unavailable."))?;
+    if guard.is_none() {
+        #[cfg(debug_assertions)]
+        {
+            let (project_root, manifest) = development_runtime_paths()
+                .map_err(|message| runtime_ipc_error("resolve runtime manifest", message))?;
+            *guard = Some(RuntimeManager::from_development(
+                &project_root,
+                &manifest,
+                root,
+            )?);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            return Err(runtime_ipc_error(
+                "initialize runtime",
+                "Bundled runtime resources are not packaged yet.",
+            ));
+        }
+    }
+    let manager = guard.as_mut().ok_or_else(|| {
+        runtime_ipc_error("access runtime manager", "Runtime manager is unavailable.")
+    })?;
+    operation(manager)
 }
 
 #[cfg(debug_assertions)]
@@ -397,17 +586,19 @@ async fn run_runtime_blocking<T, F>(
     app: tauri::AppHandle,
     lifecycle_operation: &'static str,
     operation: F,
-) -> Result<T, String>
+) -> Result<T, runtime::RuntimeErrorInfo>
 where
     T: Send + 'static,
     F: FnOnce(&mut RuntimeManager) -> Result<T, runtime::RuntimeErrorInfo> + Send + 'static,
 {
     {
         let state = app.state::<ShellState>();
-        ensure_restore_allows_managed_operation(&state, lifecycle_operation)?;
+        ensure_restore_allows_managed_operation(&state, lifecycle_operation)
+            .map_err(|message| runtime_ipc_error(lifecycle_operation, message))?;
         if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
-            return Err(format!(
-                "Runtime lifecycle is busy while trying to {lifecycle_operation}. Wait for the current operation to finish, then retry."
+            return Err(runtime_ipc_error(
+                lifecycle_operation,
+                "Runtime lifecycle is busy with another operation.",
             ));
         }
     }
@@ -415,26 +606,37 @@ where
     let worker_app = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let state = worker_app.state::<ShellState>();
-        let _lifecycle_guard = try_lifecycle(&state, lifecycle_operation)?;
-        with_runtime(&worker_app, &state, operation)
+        let _lifecycle_guard = try_lifecycle(&state, lifecycle_operation)
+            .map_err(|message| runtime_ipc_error(lifecycle_operation, message))?;
+        with_runtime_structured(&worker_app, &state, operation)
     })
     .await;
     app.state::<ShellState>()
         .lifecycle_requested
         .store(false, Ordering::Release);
-    result.map_err(|error| format!("Runtime worker failed: {error}."))?
+    result.map_err(|error| {
+        runtime_ipc_error(
+            lifecycle_operation,
+            format!("Runtime worker failed: {error}."),
+        )
+    })?
 }
 
 async fn read_runtime_blocking(
     app: tauri::AppHandle,
     operation: fn(&mut RuntimeManager) -> RuntimeInfo,
-) -> Result<RuntimeInfo, String> {
+) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<ShellState>();
-        with_runtime(&app, &state, |runtime| Ok(operation(runtime)))
+        with_runtime_structured(&app, &state, |runtime| Ok(operation(runtime)))
     })
     .await
-    .map_err(|error| format!("Runtime status worker failed: {error}."))?
+    .map_err(|error| {
+        runtime_ipc_error(
+            "read runtime status",
+            format!("Runtime status worker failed: {error}."),
+        )
+    })?
 }
 
 #[cfg(windows)]
@@ -448,20 +650,21 @@ fn shutdown_message_box(text: &str, title: &str, flags: u32) -> i32 {
 }
 
 #[cfg(windows)]
-fn confirm_runtime_exit() -> bool {
+fn confirm_runtime_exit(language: AppLanguage) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO,
     };
 
+    let strings = native_strings(language);
     shutdown_message_box(
-        "Dừng và thoát sẽ ngắt kết nối POS và các thiết bị đang dùng cửa hàng này. Thao tác này không chốt ca và không tự thay đổi trạng thái thanh toán.\n\nChọn Có để dừng cửa hàng và thoát, hoặc Không để ở lại.",
-        "Dừng cửa hàng và thoát CoffeePOS?",
+        strings.shutdown_confirm_message,
+        strings.shutdown_confirm_title,
         MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
     ) == IDYES
 }
 
 #[cfg(not(windows))]
-fn confirm_runtime_exit() -> bool {
+fn confirm_runtime_exit(_language: AppLanguage) -> bool {
     false
 }
 
@@ -486,6 +689,8 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 fn request_full_exit(app: tauri::AppHandle) {
     let state = app.state::<ShellState>();
+    let language = effective_app_language(&state);
+    let strings = native_strings(language);
     if state.exit_authorized.load(Ordering::Acquire) {
         return;
     }
@@ -494,8 +699,8 @@ fn request_full_exit(app: tauri::AppHandle) {
     {
         show_main_window(&app);
         show_shutdown_notice(
-            "CoffeePOS đang khôi phục dữ liệu",
-            "CoffeePOS đang khôi phục hoặc đối soát một giao dịch khôi phục. Hãy để ứng dụng mở cho đến khi trạng thái khôi phục kết thúc an toàn.",
+            strings.restore_busy_title,
+            strings.restore_busy_message,
             false,
         );
         return;
@@ -506,11 +711,7 @@ fn request_full_exit(app: tauri::AppHandle) {
     if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
         state.shutdown_in_progress.store(false, Ordering::Release);
         show_main_window(&app);
-        show_shutdown_notice(
-            "CoffeePOS đang bận",
-            "CoffeePOS đang hoàn tất một thao tác hệ thống. Hãy thử thoát lại sau khi thao tác hiện tại kết thúc.",
-            false,
-        );
+        show_shutdown_notice(strings.busy_title, strings.busy_operation_message, false);
         return;
     }
 
@@ -520,11 +721,7 @@ fn request_full_exit(app: tauri::AppHandle) {
             state.lifecycle_requested.store(false, Ordering::Release);
             state.shutdown_in_progress.store(false, Ordering::Release);
             show_main_window(&app);
-            show_shutdown_notice(
-                "CoffeePOS đang bận",
-                "CoffeePOS đang hoàn tất cài đặt hoặc thay đổi trạng thái hệ thống. Hãy chờ thao tác hiện tại kết thúc rồi thử thoát lại.",
-                false,
-            );
+            show_shutdown_notice(strings.busy_title, strings.busy_lifecycle_message, false);
             return;
         }
         Err(TryLockError::Poisoned(_)) => {
@@ -532,8 +729,8 @@ fn request_full_exit(app: tauri::AppHandle) {
             state.shutdown_in_progress.store(false, Ordering::Release);
             show_main_window(&app);
             show_shutdown_notice(
-                "Không thể thoát an toàn",
-                "Trạng thái vòng đời runtime không còn khả dụng. Hãy giữ ứng dụng mở và kiểm tra Chẩn đoán trước khi thử lại.",
+                strings.unsafe_exit_title,
+                strings.lifecycle_unavailable_message,
                 true,
             );
             return;
@@ -546,11 +743,7 @@ fn request_full_exit(app: tauri::AppHandle) {
             state.lifecycle_requested.store(false, Ordering::Release);
             state.shutdown_in_progress.store(false, Ordering::Release);
             show_main_window(&app);
-            show_shutdown_notice(
-                "CoffeePOS đang bận",
-                "CoffeePOS đang cập nhật trạng thái hệ thống. Hãy thử thoát lại sau khi thao tác hiện tại kết thúc.",
-                false,
-            );
+            show_shutdown_notice(strings.busy_title, strings.busy_runtime_message, false);
             return;
         }
         Err(TryLockError::Poisoned(_)) => {
@@ -558,8 +751,8 @@ fn request_full_exit(app: tauri::AppHandle) {
             state.shutdown_in_progress.store(false, Ordering::Release);
             show_main_window(&app);
             show_shutdown_notice(
-                "Không thể thoát an toàn",
-                "Không thể đọc trạng thái runtime để dừng cửa hàng an toàn. Hãy giữ ứng dụng mở và thử lại.",
+                strings.unsafe_exit_title,
+                strings.runtime_unavailable_message,
                 true,
             );
             return;
@@ -567,7 +760,7 @@ fn request_full_exit(app: tauri::AppHandle) {
     };
 
     if let Some(runtime) = runtime_guard.as_ref() {
-        if runtime.requires_exit_confirmation() && !confirm_runtime_exit() {
+        if runtime.requires_exit_confirmation() && !confirm_runtime_exit(language) {
             drop(runtime_guard);
             drop(lifecycle_guard);
             state.lifecycle_requested.store(false, Ordering::Release);
@@ -580,18 +773,25 @@ fn request_full_exit(app: tauri::AppHandle) {
 
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<ShellState>();
+        let strings = native_strings(language);
         let result = (|| -> Result<(), String> {
-            let _lifecycle_guard = try_lifecycle(&state, "stop the runtime for exit")?;
+            let _lifecycle_guard = match state.lifecycle.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => {
+                    return Err(strings.busy_lifecycle_message.to_string())
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(strings.lifecycle_unavailable_message.to_string())
+                }
+            };
             let mut runtime_guard = state
                 .runtime
                 .lock()
-                .map_err(|_| "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string())?;
+                .map_err(|_| strings.runtime_unavailable_message.to_string())?;
             if let Some(runtime) = runtime_guard.as_mut() {
                 if let Err(error) = runtime.stop() {
                     if runtime.requires_exit_confirmation() {
-                        return Err(format!(
-                            "CoffeePOS chưa dừng hoàn toàn nên ứng dụng vẫn mở để tránh bỏ lại tiến trình.\n\n{error}"
-                        ));
+                        return Err(format!("{}\n\n{error}", strings.stop_failed_prefix));
                     }
                 }
             }
@@ -606,7 +806,7 @@ fn request_full_exit(app: tauri::AppHandle) {
                 state.lifecycle_requested.store(false, Ordering::Release);
                 state.shutdown_in_progress.store(false, Ordering::Release);
                 show_main_window(&app);
-                show_shutdown_notice("Chưa thể dừng cửa hàng", &message, true);
+                show_shutdown_notice(strings.stop_failed_title, &message, true);
             }
         }
     });
@@ -1096,6 +1296,7 @@ fn prepare_restore_staging(
     project_root: &Path,
     manifest: &Path,
     startup_view: StartupView,
+    app_language: Option<AppLanguage>,
     cancelled: &AtomicBool,
 ) -> Result<backup_format::RestorePayload, restore::RestoreErrorInfo> {
     let staging_root = restore::staging_store_root(data_root, journal)?;
@@ -1143,7 +1344,7 @@ fn prepare_restore_staging(
             )
         })?;
     staging_store
-        .save_startup_view(startup_view)
+        .save_desktop_preferences(startup_view, app_language)
         .map_err(|error| {
             restore_command_error(
                 "prepare target config",
@@ -1381,14 +1582,14 @@ fn run_restore_apply_worker(
                 "Wait for provisioning or repair to finish before retrying restore.",
             )
         })?;
-    let startup_view = state
+    let (startup_view, app_language) = state
         .store
         .lock()
         .ok()
         .and_then(|guard| {
             guard
                 .as_ref()
-                .map(|store| store.config.startup_view.clone())
+                .map(|store| (store.config.startup_view.clone(), store.config.app_language))
         })
         .unwrap_or_default();
 
@@ -1538,6 +1739,7 @@ fn run_restore_apply_worker(
         &project_root,
         &manifest,
         startup_view,
+        app_language,
         cancelled.as_ref(),
     ) {
         Ok(payload) => payload,
@@ -1578,6 +1780,101 @@ fn run_restore_apply_worker(
         });
     }
 
+    let language_mutation_guard = match state.language_mutation.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let error = restore_command_error(
+                "prepare target config",
+                "language_state_unavailable",
+                "CoffeePOS cannot serialize Desktop language changes with restore cutover.",
+                "The active store is unchanged. Restart CoffeePOS Desktop and retry restore.",
+            );
+            remember_restore_error(&state, &error);
+            let _ = restore::record_restore_error(
+                &data_root,
+                &mut journal,
+                &error.code,
+                &error.message,
+            );
+            match finish_pre_cutover_abort(&state, &data_root, &mut journal, runtime) {
+                Ok(()) => return Err(error),
+                Err(recovery_error) => {
+                    set_restore_recovery_required(&state, &journal, recovery_error.clone());
+                    return Err(recovery_error);
+                }
+            }
+        }
+    };
+    let mut store_guard = match state.store.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let error = restore_command_error(
+                "prepare target config",
+                "store_state_unavailable",
+                "CoffeePOS cannot serialize target Desktop preferences with restore cutover.",
+                "The active store is unchanged. Restart CoffeePOS Desktop and retry restore.",
+            );
+            remember_restore_error(&state, &error);
+            let _ = restore::record_restore_error(
+                &data_root,
+                &mut journal,
+                &error.code,
+                &error.message,
+            );
+            match finish_pre_cutover_abort(&state, &data_root, &mut journal, runtime) {
+                Ok(()) => return Err(error),
+                Err(recovery_error) => {
+                    set_restore_recovery_required(&state, &journal, recovery_error.clone());
+                    return Err(recovery_error);
+                }
+            }
+        }
+    };
+    let preference_sync_result = (|| {
+        let store = store_guard.as_ref().ok_or_else(|| {
+            restore_command_error(
+                "prepare target config",
+                "store_config_unavailable",
+                "CoffeePOS cannot access target Desktop preferences before restore cutover.",
+                "The active store is unchanged. Retry restore after reopening CoffeePOS Desktop.",
+            )
+        })?;
+        let startup_view = store.config.startup_view.clone();
+        let app_language = store.config.app_language;
+        let staging_root = restore::staging_store_root(&data_root, &journal)?;
+        let mut staging_store = Store::open(staging_root).map_err(|error| {
+            restore_command_error(
+                "prepare target config",
+                "restore_target_config_failed",
+                error,
+                "The active store is unchanged. Retry restore after checking staging storage.",
+            )
+        })?;
+        staging_store
+            .save_desktop_preferences(startup_view, app_language)
+            .map_err(|error| {
+                restore_command_error(
+                    "prepare target config",
+                    "restore_target_config_failed",
+                    error,
+                    "The active store is unchanged. Retry restore after checking staging storage.",
+                )
+            })
+    })();
+    if let Err(error) = preference_sync_result {
+        drop(store_guard);
+        remember_restore_error(&state, &error);
+        let _ =
+            restore::record_restore_error(&data_root, &mut journal, &error.code, &error.message);
+        match finish_pre_cutover_abort(&state, &data_root, &mut journal, runtime) {
+            Ok(()) => return Err(error),
+            Err(recovery_error) => {
+                set_restore_recovery_required(&state, &journal, recovery_error.clone());
+                return Err(recovery_error);
+            }
+        }
+    }
+
     let cutover_result = (|| {
         restore::begin_restore_cutover(&data_root, &mut journal)?;
         update_restore_status_from_journal(&state, &journal);
@@ -1591,9 +1888,18 @@ fn run_restore_apply_worker(
         restore::apply_target_config(&data_root, &mut journal)?;
         restore::mark_active_swapped(&data_root, &mut journal)?;
         update_restore_status_from_journal(&state, &journal);
-        refresh_restore_store_state(&state, &data_root)?;
+        *store_guard = None;
+        *store_guard = Some(Store::open(data_root.clone()).map_err(|error| {
+            restore_command_error(
+                "refresh store config",
+                "store_config_unavailable",
+                error,
+                "Keep restore admission blocked and repair the active configuration before retrying recovery.",
+            )
+        })?);
         Ok::<(), restore::RestoreErrorInfo>(())
     })();
+    drop(store_guard);
     if let Err(error) = cutover_result {
         remember_restore_error(&state, &error);
         let _ =
@@ -1683,6 +1989,7 @@ fn run_restore_apply_worker(
     restore::commit_verified_restore(&data_root, &mut journal)?;
     update_restore_status_from_journal(&state, &journal);
     release_reconciled_restore(&state, &data_root, &journal)?;
+    drop(language_mutation_guard);
 
     if runtime_was_running {
         if let Err(error) = runtime.start() {
@@ -3039,7 +3346,11 @@ fn get_shell_info(
         backup::recover_interrupted_backup(&root)
             .map_err(|error| format!("{} {}", error.message, error.recovery))?;
     }
-    with_store(&app, &state, |_| Ok(()))
+    let shell = with_store(&app, &state, |_| Ok(()))?;
+    let language = shell.config.app_language.unwrap_or_default();
+    set_effective_app_language(&state, language);
+    let _ = refresh_native_tray(&app, language);
+    Ok(shell)
 }
 
 #[tauri::command]
@@ -3051,6 +3362,45 @@ fn save_app_settings(
     ensure_restore_allows_managed_operation(&state, "save application settings")?;
     let _lifecycle_guard = try_lifecycle(&state, "save application settings")?;
     with_store(&app, &state, |store| store.save_startup_view(startup_view))
+}
+
+#[tauri::command]
+fn save_app_language(
+    app: tauri::AppHandle,
+    state: State<'_, ShellState>,
+    app_language: AppLanguage,
+) -> Result<ShellInfo, String> {
+    let _language_mutation_guard = state.language_mutation.lock().map_err(|_| {
+        "Application language state unavailable. Restart CoffeePOS Desktop.".to_string()
+    })?;
+    let restore_blocked = restore_gate_blocks(&state)?;
+    let restore_status = state
+        .restore_operation
+        .lock()
+        .map_err(|_| "Restore state unavailable. Restart CoffeePOS Desktop.".to_string())?;
+    let pre_cutover_restore = matches!(
+        restore_status.status.stage.as_str(),
+        "planned"
+            | "validated"
+            | "runtime_stopped"
+            | "recovery_backup_ready"
+            | "staging_prepared"
+            | "database_imported"
+            | "uploads_restored"
+            | "target_secrets_bound"
+            | "staging_verified"
+    );
+    if restore_status.status.recovery_required || (restore_blocked && !pre_cutover_restore) {
+        return Err(
+            "Restore recovery must finish before the application language can be saved.".into(),
+        );
+    }
+    drop(restore_status);
+    let shell = with_store(&app, &state, |store| store.save_app_language(app_language))?;
+    let language = shell.config.app_language.unwrap_or_default();
+    set_effective_app_language(&state, language);
+    let _ = refresh_native_tray(&app, language);
+    Ok(shell)
 }
 
 #[cfg(debug_assertions)]
@@ -3234,33 +3584,36 @@ fn copy_admin_password(app: tauri::AppHandle, state: State<'_, ShellState>) -> R
 }
 
 #[tauri::command]
-async fn get_runtime_info(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
+async fn get_runtime_info(app: tauri::AppHandle) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo> {
     read_runtime_blocking(app, RuntimeManager::refresh).await
 }
 
 #[tauri::command]
-async fn start_runtime(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
+async fn start_runtime(app: tauri::AppHandle) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo> {
     run_runtime_blocking(app, "start the runtime", RuntimeManager::start).await
 }
 
 #[tauri::command]
-async fn stop_runtime(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
+async fn stop_runtime(app: tauri::AppHandle) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo> {
     run_runtime_blocking(app, "stop the runtime", RuntimeManager::stop).await
 }
 
 #[tauri::command]
-async fn restart_runtime(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
+async fn restart_runtime(app: tauri::AppHandle) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo> {
     run_runtime_blocking(app, "restart the runtime", RuntimeManager::restart).await
 }
 
 #[tauri::command]
-async fn retry_runtime_health(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
+async fn retry_runtime_health(
+    app: tauri::AppHandle,
+) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo> {
     run_runtime_blocking(app, "recheck runtime health", |runtime| {
         let info = runtime.refresh();
         if info.state != RuntimeState::Running {
             return Err(runtime::RuntimeErrorInfo {
                 component: "runtime".into(),
                 operation: "health retry".into(),
+                code: "runtime_health_error".into(),
                 message: "The local store is not running.".into(),
                 recovery: "Start the store before retrying its health check.".into(),
             });
@@ -3271,7 +3624,9 @@ async fn retry_runtime_health(app: tauri::AppHandle) -> Result<RuntimeInfo, Stri
 }
 
 #[tauri::command]
-async fn get_health_diagnostics(app: tauri::AppHandle) -> Result<HealthDiagnosticsInfo, String> {
+async fn get_health_diagnostics(
+    app: tauri::AppHandle,
+) -> Result<HealthDiagnosticsInfo, runtime::RuntimeErrorInfo> {
     run_runtime_blocking(app, "check health diagnostics", |runtime| {
         Ok(runtime.health_diagnostics())
     })
@@ -3305,10 +3660,10 @@ fn diagnostics_all_healthy(info: &HealthDiagnosticsInfo) -> bool {
 }
 
 #[tauri::command]
-async fn get_repair_plan(app: tauri::AppHandle) -> Result<RepairPlan, String> {
+async fn get_repair_plan(app: tauri::AppHandle) -> Result<RepairPlan, runtime::RuntimeErrorInfo> {
     #[cfg(debug_assertions)]
     {
-        tauri::async_runtime::spawn_blocking(move || {
+        let result = tauri::async_runtime::spawn_blocking(move || -> Result<RepairPlan, String> {
             let state = app.state::<ShellState>();
             ensure_restore_allows_managed_operation(&state, "inspect the repair plan")?;
             let _lifecycle_guard = try_lifecycle(&state, "inspect the repair plan")?;
@@ -3342,12 +3697,21 @@ async fn get_repair_plan(app: tauri::AppHandle) -> Result<RepairPlan, String> {
             Ok(provisioner.repair_plan(runtime_was_running, machine_auth_failed))
         })
         .await
-        .map_err(|error| format!("Repair-plan worker failed: {error}."))?
+        .map_err(|error| {
+            repair_ipc_error(
+                "inspect repair plan",
+                format!("Repair-plan worker failed: {error}."),
+            )
+        })?;
+        result.map_err(|message| repair_ipc_error("inspect repair plan", message))
     }
     #[cfg(not(debug_assertions))]
     {
         let _ = app;
-        Err("Repair is currently qualified only for the Windows development build until runtime resources are packaged.".into())
+        Err(repair_ipc_error(
+            "inspect repair plan",
+            "Repair is currently qualified only for the Windows development build until runtime resources are packaged.",
+        ))
     }
 }
 
@@ -3356,17 +3720,18 @@ async fn apply_repair(
     app: tauri::AppHandle,
     plan_id: String,
     inputs: Option<RepairInputs>,
-) -> Result<RepairApplyResult, String> {
+) -> Result<RepairApplyResult, runtime::RuntimeErrorInfo> {
     #[cfg(debug_assertions)]
     {
         {
             let state = app.state::<ShellState>();
-            ensure_restore_allows_managed_operation(&state, "apply the repair plan")?;
+            ensure_restore_allows_managed_operation(&state, "apply the repair plan")
+                .map_err(|message| repair_ipc_error("apply repair", message))?;
             if state.lifecycle_requested.swap(true, Ordering::AcqRel) {
-                return Err(
-                    "Runtime lifecycle is busy. Wait for the current operation to finish, then retry repair."
-                        .into(),
-                );
+                return Err(repair_ipc_error(
+                    "apply repair",
+                    "Runtime lifecycle is busy. Wait for the current operation to finish, then retry repair.",
+                ));
             }
         }
         let admin_password = inputs.and_then(|value| value.admin_password);
@@ -3426,6 +3791,7 @@ async fn apply_repair(
                 let error = runtime::RuntimeErrorInfo {
                     component: "repair".into(),
                     operation: "apply plan".into(),
+                    code: "repair_error".into(),
                     message: "The store changed after this repair plan was inspected.".into(),
                     recovery: "Inspect the repair plan again before applying any changes.".into(),
                 };
@@ -3481,6 +3847,7 @@ async fn apply_repair(
                         let error = runtime::RuntimeErrorInfo {
                             component: "database".into(),
                             operation: "verify repair database credentials".into(),
+                            code: "repair_error".into(),
                             message: "The running runtime has no managed MariaDB port for credential verification.".into(),
                             recovery: "Restart the runtime and inspect the repair plan again. Repair mutation has not started.".into(),
                         };
@@ -3561,6 +3928,7 @@ async fn apply_repair(
                         Err(rollback_error) => runtime::RuntimeErrorInfo {
                             component: "repair".into(),
                             operation: "rollback partial offline repair".into(),
+                            code: "repair_error".into(),
                             message: format!(
                                 "Offline repair failed ({}), and a pending plugin rollback also failed: {}",
                                 error.message, rollback_error.message
@@ -3634,6 +4002,7 @@ async fn apply_repair(
                                             failure = Some(runtime::RuntimeErrorInfo {
                                                 component: "repair".into(),
                                                 operation: "rollback repaired plugins".into(),
+                                                code: "repair_error".into(),
                                                 message: format!(
                                                     "Plugin verification failed ({}), and rollback also failed: {}",
                                                     verifier_error.message, rollback_error.message
@@ -3648,6 +4017,7 @@ async fn apply_repair(
                                         failure = Some(runtime::RuntimeErrorInfo {
                                             component: "repair".into(),
                                             operation: "prepare plugin rollback".into(),
+                                            code: "repair_error".into(),
                                             message: format!(
                                                 "Plugin verification failed ({}), but the runtime could not be stopped safely for rollback: {}",
                                                 verifier_error.message, stop_error.message
@@ -3697,6 +4067,7 @@ async fn apply_repair(
                             failure = Some(runtime::RuntimeErrorInfo {
                                 component: "repair".into(),
                                 operation: "verify repaired store".into(),
+                                code: "repair_error".into(),
                                 message: "Repair mutations completed, but the final component health snapshot is not fully healthy.".into(),
                                 recovery: "Keep the repaired files and inspect Hệ thống → Chẩn đoán before retrying the remaining repair.".into(),
                             });
@@ -3731,6 +4102,7 @@ async fn apply_repair(
                         failure = Some(runtime::RuntimeErrorInfo {
                             component: "repair".into(),
                             operation: "stop runtime after repair failure".into(),
+                            code: "repair_error".into(),
                             message: format!(
                                 "Repair failed ({}), and the runtime could not be stopped afterward: {}",
                                 previous.message, stop_error.message
@@ -3778,20 +4150,28 @@ async fn apply_repair(
         app.state::<ShellState>()
             .lifecycle_requested
             .store(false, Ordering::Release);
-        result.map_err(|error| format!("Repair worker failed: {error}."))?
+        let worker_result = result.map_err(|error| {
+            repair_ipc_error("apply repair", format!("Repair worker failed: {error}."))
+        })?;
+        worker_result.map_err(|message| repair_ipc_error("apply repair", message))
     }
     #[cfg(not(debug_assertions))]
     {
         let _ = app;
         let _ = plan_id;
         let _ = inputs;
-        Err("Repair is currently qualified only for the Windows development build until runtime resources are packaged.".into())
+        Err(repair_ipc_error(
+            "apply repair",
+            "Repair is currently qualified only for the Windows development build until runtime resources are packaged.",
+        ))
     }
 }
 
 #[tauri::command]
-async fn refresh_runtime_maintenance(app: tauri::AppHandle) -> Result<RuntimeInfo, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+async fn refresh_runtime_maintenance(
+    app: tauri::AppHandle,
+) -> Result<RuntimeInfo, runtime::RuntimeErrorInfo> {
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<RuntimeInfo, String> {
         let state = app.state::<ShellState>();
         ensure_restore_allows_managed_operation(&state, "run background maintenance")?;
         if state.shutdown_in_progress.load(Ordering::Acquire)
@@ -3870,79 +4250,107 @@ async fn refresh_runtime_maintenance(app: tauri::AppHandle) -> Result<RuntimeInf
         Ok(runtime.commit_background_health(&probe, health))
     })
     .await
-    .map_err(|error| format!("Runtime maintenance worker failed: {error}."))?
+    .map_err(|error| {
+        runtime_ipc_error(
+            "run background maintenance",
+            format!("Runtime maintenance worker failed: {error}."),
+        )
+    })?;
+    result.map_err(|message| runtime_ipc_error("run background maintenance", message))
 }
 
 #[tauri::command]
 fn get_provisioning_info(
     app: tauri::AppHandle,
     state: State<'_, ShellState>,
-) -> Result<ProvisioningInfo, String> {
+) -> Result<ProvisioningInfo, runtime::RuntimeErrorInfo> {
     #[cfg(debug_assertions)]
     {
         inspect_provisioning(&app, &state)
+            .map_err(|message| provisioning_ipc_error("inspect provisioning", message))
     }
     #[cfg(not(debug_assertions))]
     {
         let _ = app;
         let _ = state;
-        Err("Bundled Phase 3 WordPress resources are not packaged yet. Use a development build until runtime packaging is implemented.".into())
+        Err(provisioning_ipc_error(
+            "inspect provisioning",
+            "Bundled WordPress resources are not packaged yet. Use a qualified development build.",
+        ))
     }
 }
 
 #[tauri::command]
-fn open_wordpress(app: tauri::AppHandle, state: State<'_, ShellState>) -> Result<String, String> {
+fn open_wordpress(
+    app: tauri::AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<String, runtime::RuntimeErrorInfo> {
     #[cfg(debug_assertions)]
     {
-        ensure_restore_allows_managed_operation(&state, "open WordPress")?;
-        let _lifecycle_guard = try_lifecycle(&state, "open WordPress")?;
-        let provisioning = inspect_provisioning(&app, &state)?;
-        if provisioning.state != ProvisioningState::Ready {
-            return Err(
-                "WordPress can only be opened after provisioning is ready. Finish or repair provisioning first."
-                    .into(),
-            );
-        }
-        let url = with_runtime(&app, &state, |runtime| {
-            runtime.refresh();
-            runtime.wordpress_url()
-        })?;
-        open_system_browser(&url)?;
-        Ok(url)
+        let result = (|| -> Result<String, String> {
+            ensure_restore_allows_managed_operation(&state, "open WordPress")?;
+            let _lifecycle_guard = try_lifecycle(&state, "open WordPress")?;
+            let provisioning = inspect_provisioning(&app, &state)?;
+            if provisioning.state != ProvisioningState::Ready {
+                return Err(
+                    "WordPress can only be opened after provisioning is ready. Finish or repair provisioning first."
+                        .into(),
+                );
+            }
+            let url = with_runtime(&app, &state, |runtime| {
+                runtime.refresh();
+                runtime.wordpress_url()
+            })?;
+            open_system_browser(&url)?;
+            Ok(url)
+        })();
+        result.map_err(|message| runtime_ipc_error("open WordPress", message))
     }
     #[cfg(not(debug_assertions))]
     {
         let _ = app;
         let _ = state;
-        Err("Bundled runtime resources are not packaged yet. Open WordPress is available only in the qualified development build until Phase 9.".into())
+        Err(runtime_ipc_error(
+            "open WordPress",
+            "Bundled runtime resources are not packaged yet. Open WordPress is available only in a qualified development build.",
+        ))
     }
 }
 
 #[tauri::command]
-fn open_pos(app: tauri::AppHandle, state: State<'_, ShellState>) -> Result<String, String> {
+fn open_pos(
+    app: tauri::AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<String, runtime::RuntimeErrorInfo> {
     #[cfg(debug_assertions)]
     {
-        ensure_restore_allows_managed_operation(&state, "open the POS")?;
-        let _lifecycle_guard = try_lifecycle(&state, "open the POS")?;
-        let provisioning = inspect_provisioning(&app, &state)?;
-        if provisioning.state != ProvisioningState::Ready {
-            return Err(
-                "CoffeePOS can only be opened after provisioning is ready. Finish or recover setup first."
-                    .into(),
-            );
-        }
-        let url = with_runtime(&app, &state, |runtime| {
-            runtime.refresh();
-            runtime.pos_url()
-        })?;
-        open_system_browser(&url)?;
-        Ok(url)
+        let result = (|| -> Result<String, String> {
+            ensure_restore_allows_managed_operation(&state, "open the POS")?;
+            let _lifecycle_guard = try_lifecycle(&state, "open the POS")?;
+            let provisioning = inspect_provisioning(&app, &state)?;
+            if provisioning.state != ProvisioningState::Ready {
+                return Err(
+                    "CoffeePOS can only be opened after provisioning is ready. Finish or recover setup first."
+                        .into(),
+                );
+            }
+            let url = with_runtime(&app, &state, |runtime| {
+                runtime.refresh();
+                runtime.pos_url()
+            })?;
+            open_system_browser(&url)?;
+            Ok(url)
+        })();
+        result.map_err(|message| runtime_ipc_error("open POS", message))
     }
     #[cfg(not(debug_assertions))]
     {
         let _ = app;
         let _ = state;
-        Err("Bundled runtime resources are not packaged yet. Open POS is available only in the qualified development build until Phase 9.".into())
+        Err(runtime_ipc_error(
+            "open POS",
+            "Bundled runtime resources are not packaged yet. Open POS is available only in a qualified development build.",
+        ))
     }
 }
 
@@ -3950,110 +4358,116 @@ fn open_pos(app: tauri::AppHandle, state: State<'_, ShellState>) -> Result<Strin
 fn provision_wordpress(
     app: tauri::AppHandle,
     state: State<'_, ShellState>,
-) -> Result<ProvisioningInfo, String> {
+) -> Result<ProvisioningInfo, runtime::RuntimeErrorInfo> {
     #[cfg(debug_assertions)]
     {
-        ensure_restore_allows_managed_operation(&state, "provision WordPress")?;
-        let _lifecycle_guard = try_lifecycle(&state, "provision WordPress")?;
-        let root = data_root(&app, &state)?;
-        let (store_name, admin_username, admin_email, setup_profile_configured) = {
-            let guard = state.store.lock().map_err(|_| {
-                "Application state unavailable. Restart CoffeePOS Desktop.".to_string()
-            })?;
-            let store = guard
-                .as_ref()
-                .ok_or_else(|| "Configuration unavailable. Retry startup.".to_string())?;
-            (
-                store.config.store_name.clone(),
-                store
-                    .config
-                    .setup_admin_username
-                    .clone()
-                    .unwrap_or_else(|| WORDPRESS_ADMIN_USER.into()),
-                store
-                    .config
-                    .setup_admin_email
-                    .clone()
-                    .unwrap_or_else(|| WORDPRESS_ADMIN_EMAIL.into()),
-                store.config.setup_admin_username.is_some()
-                    && store.config.setup_admin_email.is_some(),
-            )
-        };
-        let provisioning_before = inspect_provisioning(&app, &state)?;
-        if provisioning_before.state == ProvisioningState::NotInstalled {
-            if root.join(WORDPRESS_ADMIN_PENDING_SECRET).exists() {
-                return Err("Administrator credential update is incomplete. Return to setup and save the administrator password again before installing CoffeePOS.".into());
+        let result = (|| -> Result<ProvisioningInfo, String> {
+            ensure_restore_allows_managed_operation(&state, "provision WordPress")?;
+            let _lifecycle_guard = try_lifecycle(&state, "provision WordPress")?;
+            let root = data_root(&app, &state)?;
+            let (store_name, admin_username, admin_email, setup_profile_configured) = {
+                let guard = state.store.lock().map_err(|_| {
+                    "Application state unavailable. Restart CoffeePOS Desktop.".to_string()
+                })?;
+                let store = guard
+                    .as_ref()
+                    .ok_or_else(|| "Configuration unavailable. Retry startup.".to_string())?;
+                (
+                    store.config.store_name.clone(),
+                    store
+                        .config
+                        .setup_admin_username
+                        .clone()
+                        .unwrap_or_else(|| WORDPRESS_ADMIN_USER.into()),
+                    store
+                        .config
+                        .setup_admin_email
+                        .clone()
+                        .unwrap_or_else(|| WORDPRESS_ADMIN_EMAIL.into()),
+                    store.config.setup_admin_username.is_some()
+                        && store.config.setup_admin_email.is_some(),
+                )
+            };
+            let provisioning_before = inspect_provisioning(&app, &state)?;
+            if provisioning_before.state == ProvisioningState::NotInstalled {
+                if root.join(WORDPRESS_ADMIN_PENDING_SECRET).exists() {
+                    return Err("Administrator credential update is incomplete. Return to setup and save the administrator password again before installing CoffeePOS.".into());
+                }
+                let password_ready = secret::load(&root.join(WORDPRESS_ADMIN_SECRET))
+                    .map(|value| !value.is_empty())
+                    .unwrap_or(false);
+                if !setup_profile_configured || !password_ready {
+                    return Err("Complete the store and administrator account step before installing CoffeePOS.".into());
+                }
             }
-            let password_ready = secret::load(&root.join(WORDPRESS_ADMIN_SECRET))
-                .map(|value| !value.is_empty())
-                .unwrap_or(false);
-            if !setup_profile_configured || !password_ready {
-                return Err("Complete the store and administrator account step before installing CoffeePOS.".into());
-            }
-        }
-        let _provisioning_guard = match state.provisioning.try_lock() {
-            Ok(guard) => guard,
-            Err(TryLockError::WouldBlock) => {
-                return Err(
+            let _provisioning_guard = match state.provisioning.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => {
+                    return Err(
                     "WordPress provisioning is already running. Wait for it to finish before retrying."
                         .into(),
                 );
-            }
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(
                     "Provisioning state unavailable. Restart CoffeePOS Desktop before retrying."
                         .into(),
                 );
+                }
+            };
+            let (project_root, manifest) = development_runtime_paths()?;
+            let mut runtime_guard = state
+                .runtime
+                .lock()
+                .map_err(|_| "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string())?;
+            if runtime_guard.is_none() {
+                *runtime_guard = Some(
+                    RuntimeManager::from_development(&project_root, &manifest, root.clone())
+                        .map_err(|error| error.to_string())?,
+                );
             }
-        };
-        let (project_root, manifest) = development_runtime_paths()?;
-        let mut runtime_guard = state
-            .runtime
-            .lock()
-            .map_err(|_| "Runtime state unavailable. Restart CoffeePOS Desktop.".to_string())?;
-        if runtime_guard.is_none() {
-            *runtime_guard = Some(
-                RuntimeManager::from_development(&project_root, &manifest, root.clone())
-                    .map_err(|error| error.to_string())?,
-            );
-        }
-        let runtime = runtime_guard
-            .as_mut()
-            .ok_or_else(|| "Runtime manager unavailable. Retry startup.".to_string())?;
-        if runtime.backup_maintenance_active() {
-            return Err(
+            let runtime = runtime_guard
+                .as_mut()
+                .ok_or_else(|| "Runtime manager unavailable. Retry startup.".to_string())?;
+            if runtime.backup_maintenance_active() {
+                return Err(
                 "Database backup maintenance is active. Finish or cancel the current backup cleanup before provisioning CoffeePOS."
                     .into(),
             );
-        }
-        runtime.stop().map_err(|error| error.to_string())?;
-        let (resolved, runtime_root) = runtime.provisioning_context();
-        let mut provisioner =
-            Provisioner::from_development(&project_root, &manifest, resolved, runtime_root)
+            }
+            runtime.stop().map_err(|error| error.to_string())?;
+            let (resolved, runtime_root) = runtime.provisioning_context();
+            let mut provisioner =
+                Provisioner::from_development(&project_root, &manifest, resolved, runtime_root)
+                    .map_err(|error| error.to_string())?;
+            provisioner
+                .configure_initial_admin(&admin_username, &admin_email)
                 .map_err(|error| error.to_string())?;
-        provisioner
-            .configure_initial_admin(&admin_username, &admin_email)
-            .map_err(|error| error.to_string())?;
-        provisioner.prepare().map_err(|error| error.to_string())?;
-        let runtime_info = runtime
-            .start_for_provisioning()
-            .map_err(|error| error.to_string())?;
-        match provisioner.install_wordpress(&store_name, &runtime_info) {
-            Ok(info) => {
-                runtime.refresh_wordpress_health();
-                Ok(info)
+            provisioner.prepare().map_err(|error| error.to_string())?;
+            let runtime_info = runtime
+                .start_for_provisioning()
+                .map_err(|error| error.to_string())?;
+            match provisioner.install_wordpress(&store_name, &runtime_info) {
+                Ok(info) => {
+                    runtime.refresh_wordpress_health();
+                    Ok(info)
+                }
+                Err(error) => {
+                    let _ = runtime.stop();
+                    Err(error.to_string())
+                }
             }
-            Err(error) => {
-                let _ = runtime.stop();
-                Err(error.to_string())
-            }
-        }
+        })();
+        result.map_err(|message| provisioning_ipc_error("provision WordPress", message))
     }
     #[cfg(not(debug_assertions))]
     {
         let _ = app;
         let _ = state;
-        Err("Bundled Phase 3 WordPress resources are not packaged yet. Use a development build until runtime packaging is implemented.".into())
+        Err(provisioning_ipc_error(
+            "provision WordPress",
+            "Bundled WordPress resources are not packaged yet. Use a qualified development build.",
+        ))
     }
 }
 
@@ -4068,12 +4482,14 @@ fn main() {
                     publish_restore_recovery_failure(&state, &error);
                 }
             }
-            let open_item =
-                MenuItem::with_id(app, TRAY_OPEN_ID, "Mở CoffeePOS", true, None::<&str>)?;
-            let exit_item =
-                MenuItem::with_id(app, TRAY_EXIT_ID, "Thoát hoàn toàn", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open_item, &exit_item])?;
-            let mut tray = TrayIconBuilder::with_id("coffeepos-main")
+            let state = app.state::<ShellState>();
+            let language = application_data_root(app.handle())
+                .ok()
+                .and_then(|root| config::read_app_language(&root).ok().flatten())
+                .unwrap_or_default();
+            set_effective_app_language(&state, language);
+            let menu = native_tray_menu(app, language)?;
+            let mut tray = TrayIconBuilder::with_id(TRAY_MAIN_ID)
                 .menu(&menu)
                 .tooltip("CoffeePOS")
                 .show_menu_on_left_click(false)
@@ -4141,6 +4557,7 @@ fn main() {
             export_support_bundle,
             get_shell_info,
             save_app_settings,
+            save_app_language,
             get_setup_info,
             save_setup_profile,
             copy_admin_password,

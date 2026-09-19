@@ -2043,6 +2043,7 @@ mod tests {
         assert_eq!(value["administrator"]["username"], "owner");
         let object = value.as_object().unwrap();
         assert!(!object.contains_key("startup_view"));
+        assert!(!object.contains_key("app_language"));
         assert!(!object.contains_key("bind_host"));
         assert!(!object.contains_key("data_root"));
     }

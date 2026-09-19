@@ -11,144 +11,160 @@
         <span class="mark" aria-hidden="true">C</span>
         <div class="brand-copy">
           <h1>CoffeePOS</h1>
-          <p>Môi trường bán hàng tại cửa hàng</p>
+          <p data-i18n="app.tagline">Môi trường bán hàng tại cửa hàng</p>
         </div>
       </header>
 
       <main id="main-content">
         <section id="bootstrap" class="card status-card" aria-labelledby="status-title">
           <span class="eyebrow">COFFEEPOS DESKTOP</span>
-          <h2 id="status-title" tabindex="-1">Đang mở cửa hàng…</h2>
-          <p id="status-description" role="status" aria-live="polite">Đang đọc trạng thái cài đặt.</p>
-          <button id="retry" type="button" hidden>Thử lại</button>
+          <h2 id="status-title" tabindex="-1" data-i18n="bootstrap.opening_title">Đang mở cửa hàng…</h2>
+          <p id="status-description" role="status" aria-live="polite" data-i18n="bootstrap.opening_description">Đang đọc trạng thái cài đặt.</p>
+          <button id="retry" type="button" hidden data-i18n="common.retry">Thử lại</button>
+        </section>
+
+        <section id="language-chooser" class="setup-screen" hidden aria-labelledby="language-title">
+          <div class="card setup-panel language-panel">
+            <span class="eyebrow">COFFEEPOS DESKTOP</span>
+            <h2 id="language-title" tabindex="-1">
+              <span data-i18n-locale="vi" data-i18n-key="language.heading_vi">Chọn ngôn ngữ</span>
+              <span aria-hidden="true"> / </span>
+              <span data-i18n-locale="en" data-i18n-key="language.heading_en">Choose your language</span>
+            </h2>
+            <div class="language-actions" role="group" data-i18n-aria-label="accessibility.language_picker" aria-label="Chọn ngôn ngữ CoffeePOS Desktop">
+              <button type="button" data-language="vi" data-i18n-locale="vi" data-i18n-key="language.choose_vi">Tiếng Việt</button>
+              <button type="button" class="secondary" data-language="en" data-i18n-locale="en" data-i18n-key="language.choose_en">English</button>
+            </div>
+            <p id="language-status" class="hint" role="status" aria-live="polite"></p>
+          </div>
         </section>
 
         <section id="setup" class="setup-screen" hidden aria-labelledby="setup-title" aria-busy="false">
           <div id="setup-welcome" class="card setup-panel" data-setup-panel="welcome">
-            <span class="eyebrow">CHÀO MỪNG</span>
-            <h2 id="setup-title" tabindex="-1">Thiết lập cửa hàng CoffeePOS</h2>
-            <p class="lead">Cài một lần trên máy này. Bạn chỉ cần tên cửa hàng và tài khoản quản trị ban đầu; CoffeePOS Desktop tự chuẩn bị WordPress, WooCommerce và CoffeePOS.</p>
+            <span class="eyebrow" data-i18n="onboarding.welcome_eyebrow">CHÀO MỪNG</span>
+            <h2 id="setup-title" tabindex="-1" data-i18n="onboarding.welcome_title">Thiết lập cửa hàng CoffeePOS</h2>
+            <p class="lead" data-i18n="onboarding.welcome_lead">Cài một lần trên máy này. Bạn chỉ cần tên cửa hàng và tài khoản quản trị ban đầu; CoffeePOS Desktop tự chuẩn bị WordPress, WooCommerce và CoffeePOS.</p>
             <ul class="setup-benefits">
-              <li>Dữ liệu cửa hàng được lưu riêng với ứng dụng.</li>
-              <li>Mật khẩu quản trị được bảo vệ bằng Windows DPAPI.</li>
-              <li>Nếu setup bị gián đoạn, lần mở lại tiếp tục từ checkpoint an toàn.</li>
+              <li data-i18n="onboarding.benefit_data">Dữ liệu cửa hàng được lưu riêng với ứng dụng.</li>
+              <li data-i18n="onboarding.benefit_password">Mật khẩu quản trị được bảo vệ bằng Windows DPAPI.</li>
+              <li data-i18n="onboarding.benefit_resume">Nếu setup bị gián đoạn, lần mở lại tiếp tục từ checkpoint an toàn.</li>
             </ul>
-            <div class="actions"><button id="setup-begin" type="button">Thiết lập cửa hàng</button></div>
+            <div class="actions"><button id="setup-begin" type="button" data-i18n="onboarding.new_store">Thiết lập cửa hàng</button></div>
           </div>
 
           <div id="setup-details" class="card setup-panel" data-setup-panel="details" hidden>
             <div class="section-heading">
-              <div><span class="eyebrow">BƯỚC 1 / 2</span><h2 id="setup-details-title" tabindex="-1">Thông tin cửa hàng và tài khoản</h2></div>
+              <div><span class="eyebrow" data-i18n="onboarding.step_1">BƯỚC 1 / 2</span><h2 id="setup-details-title" tabindex="-1" data-i18n="onboarding.details_title">Thông tin cửa hàng và tài khoản</h2></div>
             </div>
             <form id="setup-config-form" class="setup-config-form" novalidate>
               <div class="field-group">
-                <label for="store-name">Tên cửa hàng</label>
+                <label for="store-name" data-i18n="onboarding.store_name">Tên cửa hàng</label>
                 <input id="store-name" name="storeName" maxlength="80" required autocomplete="organization" />
                 <p id="store-name-error" class="field-error" role="alert" hidden></p>
               </div>
               <div class="field-group">
-                <label for="admin-username">Tên đăng nhập quản trị</label>
+                <label for="admin-username" data-i18n="onboarding.admin_username">Tên đăng nhập quản trị</label>
                 <input id="admin-username" name="adminUsername" minlength="3" maxlength="60" pattern="[A-Za-z0-9._-]+" required autocomplete="username" />
-                <p class="hint">3–60 ký tự: chữ, số, dấu chấm, gạch dưới hoặc gạch nối.</p>
+                <p class="hint" data-i18n="onboarding.username_hint">3–60 ký tự: chữ, số, dấu chấm, gạch dưới hoặc gạch nối.</p>
                 <p id="admin-username-error" class="field-error" role="alert" hidden></p>
               </div>
               <div class="field-group">
-                <label for="admin-email">Email quản trị</label>
+                <label for="admin-email" data-i18n="onboarding.admin_email">Email quản trị</label>
                 <input id="admin-email" name="adminEmail" type="email" maxlength="100" required autocomplete="email" />
                 <p id="admin-email-error" class="field-error" role="alert" hidden></p>
               </div>
               <div class="field-group">
-                <label for="admin-password">Mật khẩu quản trị</label>
+                <label for="admin-password" data-i18n="onboarding.admin_password">Mật khẩu quản trị</label>
                 <input id="admin-password" name="adminPassword" type="password" minlength="12" maxlength="128" autocomplete="new-password" />
-                <p id="password-hint" class="hint">Tối thiểu 12 ký tự. Mật khẩu không được lưu trong draft hoặc URL.</p>
+                <p id="password-hint" class="hint" data-i18n="onboarding.password_hint_new">Tối thiểu 12 ký tự. Mật khẩu không được lưu trong draft hoặc URL.</p>
                 <p id="admin-password-error" class="field-error" role="alert" hidden></p>
               </div>
               <div class="field-group">
-                <label for="admin-password-confirm">Nhập lại mật khẩu</label>
+                <label for="admin-password-confirm" data-i18n="onboarding.password_confirm">Nhập lại mật khẩu</label>
                 <input id="admin-password-confirm" name="adminPasswordConfirm" type="password" minlength="12" maxlength="128" autocomplete="new-password" />
                 <p id="admin-password-confirm-error" class="field-error" role="alert" hidden></p>
               </div>
               <p id="save-status" class="error" role="alert" hidden></p>
               <div class="actions split-actions">
-                <button id="setup-back" class="secondary" type="button">Quay lại</button>
-                <button id="save" type="submit">Tiếp tục</button>
+                <button id="setup-back" class="secondary" type="button" data-i18n="common.back">Quay lại</button>
+                <button id="save" type="submit" data-i18n="common.continue">Tiếp tục</button>
               </div>
             </form>
           </div>
 
           <div id="setup-review" class="card setup-panel" data-setup-panel="review" hidden>
-            <span class="eyebrow">BƯỚC 2 / 2</span>
-            <h2 id="setup-review-title" tabindex="-1">Sẵn sàng cài đặt</h2>
-            <p class="lead">Kiểm tra thông tin trước khi CoffeePOS bắt đầu thay đổi dữ liệu trên máy.</p>
+            <span class="eyebrow" data-i18n="onboarding.step_2">BƯỚC 2 / 2</span>
+            <h2 id="setup-review-title" tabindex="-1" data-i18n="onboarding.review_title">Sẵn sàng cài đặt</h2>
+            <p class="lead" data-i18n="onboarding.review_lead">Kiểm tra thông tin trước khi CoffeePOS bắt đầu thay đổi dữ liệu trên máy.</p>
             <dl class="review-list">
-              <dt>Cửa hàng</dt><dd id="review-store-name">—</dd>
-              <dt>Tài khoản quản trị</dt><dd id="review-admin-username">—</dd>
-              <dt>Email</dt><dd id="review-admin-email">—</dd>
-              <dt>Mật khẩu</dt><dd id="review-password-state">Đã lưu bảo mật</dd>
+              <dt data-i18n="onboarding.review_store">Cửa hàng</dt><dd id="review-store-name">—</dd>
+              <dt data-i18n="onboarding.review_admin">Tài khoản quản trị</dt><dd id="review-admin-username">—</dd>
+              <dt data-i18n="onboarding.review_email">Email</dt><dd id="review-admin-email">—</dd>
+              <dt data-i18n="onboarding.review_password">Mật khẩu</dt><dd id="review-password-state" data-i18n="onboarding.review_password_secure">Đã lưu bảo mật</dd>
             </dl>
             <div class="actions split-actions">
-              <button id="setup-edit" class="secondary" type="button">Quay lại sửa</button>
-              <button id="provision-wordpress" type="button">Cài đặt</button>
+              <button id="setup-edit" class="secondary" type="button" data-i18n="onboarding.edit">Quay lại sửa</button>
+              <button id="provision-wordpress" type="button" data-i18n="onboarding.install">Cài đặt</button>
             </div>
           </div>
 
           <div id="setup-progress" class="card setup-panel" data-setup-panel="progress" hidden>
             <div class="section-heading">
-              <div><span class="eyebrow">ĐANG THIẾT LẬP</span><h2 id="setup-progress-title" tabindex="-1">Cài đặt CoffeePOS</h2></div>
+              <div><span class="eyebrow" data-i18n="onboarding.installing_eyebrow">ĐANG THIẾT LẬP</span><h2 id="setup-progress-title" tabindex="-1" data-i18n="onboarding.installing_title">Cài đặt CoffeePOS</h2></div>
               <span id="provisioning-state" class="state-badge">—</span>
             </div>
-            <p id="provisioning-status" role="status" aria-live="polite">Đang kiểm tra trạng thái cài đặt…</p>
+            <p id="provisioning-status" role="status" aria-live="polite" data-i18n="onboarding.installing_status">Đang kiểm tra trạng thái cài đặt…</p>
             <p id="provisioning-error" class="error" role="alert" hidden></p>
-            <div class="actions"><button id="setup-retry" type="button" disabled>Tiếp tục thiết lập</button></div>
+            <div class="actions"><button id="setup-retry" type="button" disabled data-i18n="onboarding.continue_setup">Tiếp tục thiết lập</button></div>
             <details id="provisioning-details" class="technical-details" hidden>
-              <summary>Chi tiết cài đặt</summary>
+              <summary data-i18n="onboarding.install_details">Chi tiết cài đặt</summary>
               <dl>
                 <dt>WordPress</dt><dd id="provisioning-wordpress">—</dd>
                 <dt>WooCommerce</dt><dd id="provisioning-woocommerce">—</dd>
                 <dt>CoffeePOS</dt><dd id="provisioning-coffeepos">—</dd>
-                <dt>Tài khoản quản trị</dt><dd id="provisioning-admin">—</dd>
+                <dt data-i18n="onboarding.review_admin">Tài khoản quản trị</dt><dd id="provisioning-admin">—</dd>
               </dl>
             </details>
           </div>
 
           <div id="setup-complete" class="card setup-panel" data-setup-panel="complete" hidden>
-            <span class="eyebrow">HOÀN TẤT</span>
-            <h2 id="setup-complete-title" tabindex="-1">Cửa hàng đã được cài đặt</h2>
-            <p class="lead">CoffeePOS đã hoàn tất provisioning. Tài khoản quản trị ban đầu được giữ trong protected storage của Windows.</p>
-            <dl><dt>Tài khoản quản trị</dt><dd id="complete-admin-username">—</dd></dl>
+            <span class="eyebrow" data-i18n="onboarding.complete_eyebrow">HOÀN TẤT</span>
+            <h2 id="setup-complete-title" tabindex="-1" data-i18n="onboarding.complete_title">Cửa hàng đã được cài đặt</h2>
+            <p class="lead" data-i18n="onboarding.complete_lead">CoffeePOS đã hoàn tất provisioning. Tài khoản quản trị ban đầu được giữ trong protected storage của Windows.</p>
+            <dl><dt data-i18n="onboarding.review_admin">Tài khoản quản trị</dt><dd id="complete-admin-username">—</dd></dl>
             <div class="actions">
-              <button id="complete-copy-password" class="secondary" type="button">Sao chép mật khẩu quản trị ban đầu</button>
-              <button id="complete-continue" type="button">Vào Tổng quan</button>
+              <button id="complete-copy-password" class="secondary" type="button" data-i18n="onboarding.copy_initial_password">Sao chép mật khẩu quản trị ban đầu</button>
+              <button id="complete-continue" type="button" data-i18n="onboarding.open_overview">Vào Tổng quan</button>
             </div>
             <p id="complete-copy-status" class="hint" role="status" aria-live="polite"></p>
           </div>
         </section>
 
         <div id="installed-shell" hidden>
-          <nav class="app-nav" aria-label="Điều hướng ứng dụng">
-            <button type="button" class="nav-item" data-view="home" aria-controls="view-home" aria-current="page">Tổng quan</button>
-            <button type="button" class="nav-item" data-view="settings" aria-controls="view-settings">Cấu hình</button>
-            <button type="button" class="nav-item" data-view="diagnostics" aria-controls="view-diagnostics">Hệ thống</button>
+          <nav class="app-nav" aria-label="Điều hướng ứng dụng" data-i18n-aria-label="navigation.app">
+            <button type="button" class="nav-item" data-view="home" aria-controls="view-home" aria-current="page" data-i18n="navigation.home">Tổng quan</button>
+            <button type="button" class="nav-item" data-view="settings" aria-controls="view-settings" data-i18n="navigation.settings">Cấu hình</button>
+            <button type="button" class="nav-item" data-view="diagnostics" aria-controls="view-diagnostics" data-i18n="navigation.system">Hệ thống</button>
           </nav>
 
           <section id="view-home" class="view-panel" data-view-panel="home" aria-labelledby="home-title">
             <div class="page-heading">
-              <h2 id="home-title" tabindex="-1">Tổng quan</h2>
-              <p class="page-subtitle">Theo dõi và vận hành CoffeePOS tại cửa hàng này.</p>
+              <h2 id="home-title" tabindex="-1" data-i18n="overview.title">Tổng quan</h2>
+              <p class="page-subtitle" data-i18n="overview.subtitle">Theo dõi và vận hành CoffeePOS tại cửa hàng này.</p>
             </div>
             <div class="card home-status-card">
               <div class="home-card-heading">
                 <div>
-                  <span class="section-label">CỬA HÀNG</span>
+                  <span class="section-label" data-i18n="overview.store_label">CỬA HÀNG</span>
                   <p id="home-store-name" class="store-name">CoffeePOS</p>
                 </div>
-                <span id="home-state" class="state-badge">Đang đọc trạng thái</span>
+                <span id="home-state" class="state-badge" data-i18n="overview.state.reading">Đang đọc trạng thái</span>
               </div>
-              <p id="home-status" class="home-status" role="status" aria-live="polite">Đang kiểm tra hệ thống…</p>
-              <p id="home-detail" class="muted">Trạng thái này lấy trực tiếp từ runtime và CoffeePOS health hiện có.</p>
+              <p id="home-status" class="home-status" role="status" aria-live="polite" data-i18n="overview.reading_status">Đang kiểm tra hệ thống…</p>
+              <p id="home-detail" class="muted" data-i18n="overview.reading_detail">Trạng thái này lấy trực tiếp từ runtime và CoffeePOS health hiện có.</p>
               <div class="actions">
                 <button id="home-action" type="button" hidden></button>
-                <button id="home-diagnostics" class="secondary" type="button">Mở Hệ thống</button>
+                <button id="home-diagnostics" class="secondary" type="button" data-i18n="overview.open_system">Mở Hệ thống</button>
               </div>
               <p id="home-open-status" class="hint" role="status" aria-live="polite"></p>
             </div>
@@ -156,40 +172,49 @@
 
           <section id="view-settings" class="view-panel" data-view-panel="settings" aria-labelledby="settings-title" hidden>
             <div class="page-heading">
-              <h2 id="settings-title" tabindex="-1">Cấu hình</h2>
-              <p class="page-subtitle">Thiết lập cách CoffeePOS Desktop hoạt động trên máy này.</p>
+              <h2 id="settings-title" tabindex="-1" data-i18n="settings.title">Cấu hình</h2>
+              <p class="page-subtitle" data-i18n="settings.subtitle">Thiết lập cách CoffeePOS Desktop hoạt động trên máy này.</p>
             </div>
             <div class="settings-grid">
               <section class="card" id="settings" aria-labelledby="desktop-behavior-title">
-                <span class="section-label">ỨNG DỤNG</span>
-                <h3 id="desktop-behavior-title">Khởi động</h3>
-                <p class="lead">Chọn khu vực hiển thị khi mở hoặc tải lại giao diện Desktop.</p>
+                <span class="section-label" data-i18n="settings.app_label">ỨNG DỤNG</span>
+                <h3 id="desktop-behavior-title" data-i18n="settings.general_title">Khởi động</h3>
+                <p class="lead" data-i18n="settings.startup_lead">Chọn khu vực hiển thị khi mở hoặc tải lại giao diện Desktop.</p>
                 <form id="app-settings-form" class="app-settings-form">
                   <div class="field-group">
-                    <label for="startup-view">Màn hình mở đầu</label>
-                    <select id="startup-view" name="startup-view">
-                      <option value="home">Tổng quan</option>
-                      <option value="settings">Cấu hình</option>
-                      <option value="diagnostics">Hệ thống</option>
+                    <label for="app-language" data-i18n="settings.language_label">Ngôn ngữ</label>
+                    <select id="app-language" name="app-language">
+                      <option value="vi">Tiếng Việt</option>
+                      <option value="en">English</option>
                     </select>
-                    <p class="hint">Tùy chọn này chỉ chọn màn hình hiển thị; không tự khởi động hay dừng cửa hàng.</p>
+                    <p class="hint" data-i18n="settings.language_hint">Ngôn ngữ của CoffeePOS Desktop đổi ngay và không thay locale của WordPress/POS.</p>
+                    <p id="language-settings-status" class="hint" role="status" aria-live="polite"></p>
+                  </div>
+                  <div class="field-group">
+                    <label for="startup-view" data-i18n="settings.startup_label">Màn hình mở đầu</label>
+                    <select id="startup-view" name="startup-view">
+                      <option value="home" data-i18n="navigation.home">Tổng quan</option>
+                      <option value="settings" data-i18n="navigation.settings">Cấu hình</option>
+                      <option value="diagnostics" data-i18n="navigation.system">Hệ thống</option>
+                    </select>
+                    <p class="hint" data-i18n="settings.startup_hint">Tùy chọn này chỉ chọn màn hình hiển thị; không tự khởi động hay dừng cửa hàng.</p>
                   </div>
                   <div class="actions">
-                    <button id="settings-save" type="submit">Lưu cấu hình</button>
+                    <button id="settings-save" type="submit" data-i18n="common.save">Lưu cấu hình</button>
                   </div>
                   <p id="settings-save-status" class="hint" role="status" aria-live="polite"></p>
                 </form>
                 <dl class="info-grid">
-                  <div><dt>Kết nối mặc định</dt><dd>Chỉ trên máy này · 127.0.0.1</dd></div>
-                  <div><dt>Phiên bản ứng dụng</dt><dd id="version"></dd></div>
+                  <div><dt data-i18n="settings.default_connection">Kết nối mặc định</dt><dd data-i18n="settings.local_only">Chỉ trên máy này · 127.0.0.1</dd></div>
+                  <div><dt data-i18n="settings.version">Phiên bản ứng dụng</dt><dd id="version"></dd></div>
                 </dl>
               </section>
               <section class="card" aria-labelledby="admin-access-title">
-                <span class="section-label">TRUY CẬP</span>
-                <h3 id="admin-access-title">Tài khoản quản trị ban đầu</h3>
-                <p class="lead">Dùng khi cần đăng nhập WordPress/CoffeePOS. Nếu mật khẩu được đổi trong WordPress, bản ban đầu do Desktop giữ sẽ không tự cập nhật.</p>
-                <dl class="compact-list"><dt>Tên đăng nhập</dt><dd id="settings-admin-username">—</dd></dl>
-                <button id="settings-copy-password" class="secondary" type="button">Sao chép mật khẩu ban đầu</button>
+                <span class="section-label" data-i18n="settings.access_label">TRUY CẬP</span>
+                <h3 id="admin-access-title" data-i18n="settings.admin_title">Tài khoản quản trị ban đầu</h3>
+                <p class="lead" data-i18n="settings.admin_lead">Dùng khi cần đăng nhập WordPress/CoffeePOS. Nếu mật khẩu được đổi trong WordPress, bản ban đầu do Desktop giữ sẽ không tự cập nhật.</p>
+                <dl class="compact-list"><dt data-i18n="settings.username">Tên đăng nhập</dt><dd id="settings-admin-username">—</dd></dl>
+                <button id="settings-copy-password" class="secondary" type="button" data-i18n="settings.copy_password">Sao chép mật khẩu ban đầu</button>
                 <p id="settings-copy-status" class="hint" role="status" aria-live="polite"></p>
               </section>
             </div>
@@ -197,75 +222,75 @@
 
           <section id="view-diagnostics" class="view-panel" data-view-panel="diagnostics" aria-labelledby="diagnostics-title" hidden>
             <div class="page-heading">
-              <h2 id="diagnostics-title" tabindex="-1">Hệ thống</h2>
-              <p class="page-subtitle">Theo dõi sức khỏe dịch vụ, chẩn đoán lỗi và điều khiển runtime cục bộ.</p>
+              <h2 id="diagnostics-title" tabindex="-1" data-i18n="system.title">Hệ thống</h2>
+              <p class="page-subtitle" data-i18n="system.subtitle">Theo dõi sức khỏe dịch vụ, chẩn đoán lỗi và điều khiển runtime cục bộ.</p>
             </div>
-            <nav class="system-nav" aria-label="Công cụ hệ thống">
-              <button type="button" class="system-nav-item" data-system-section="diagnostics" aria-controls="system-diagnostics-panel" aria-current="page">Chẩn đoán</button>
-              <button type="button" class="system-nav-item" data-system-section="repair" aria-controls="system-repair-panel">Sửa chữa</button>
-              <button type="button" class="system-nav-item" data-system-section="logs" aria-controls="system-logs-panel">Nhật ký</button>
-              <button type="button" class="system-nav-item" data-system-section="backup" aria-controls="system-backup-panel">Sao lưu và khôi phục</button>
+            <nav class="system-nav" aria-label="Công cụ hệ thống" data-i18n-aria-label="navigation.system_tools">
+              <button type="button" class="system-nav-item" data-system-section="diagnostics" aria-controls="system-diagnostics-panel" aria-current="page" data-i18n="navigation.diagnostics">Chẩn đoán</button>
+              <button type="button" class="system-nav-item" data-system-section="repair" aria-controls="system-repair-panel" data-i18n="navigation.repair">Sửa chữa</button>
+              <button type="button" class="system-nav-item" data-system-section="logs" aria-controls="system-logs-panel" data-i18n="navigation.logs">Nhật ký</button>
+              <button type="button" class="system-nav-item" data-system-section="backup" aria-controls="system-backup-panel" data-i18n="navigation.backup_restore">Sao lưu và khôi phục</button>
             </nav>
             <div id="system-diagnostics-panel" data-system-panel="diagnostics">
             <section class="card" id="health-diagnostics" aria-labelledby="health-diagnostics-title">
               <div class="section-heading compact-heading">
                 <div>
-                  <span class="section-label">CHẨN ĐOÁN</span>
-                  <h3 id="health-diagnostics-title" tabindex="-1">Tình trạng hệ thống</h3>
+                  <span class="section-label" data-i18n="diagnostics.label">CHẨN ĐOÁN</span>
+                  <h3 id="health-diagnostics-title" tabindex="-1" data-i18n="diagnostics.title">Tình trạng hệ thống</h3>
                 </div>
                 <span id="health-summary-state" class="state-badge">—</span>
               </div>
-              <p id="health-summary" role="status" aria-live="polite">Mở Hệ thống để kiểm tra các thành phần.</p>
+              <p id="health-summary" role="status" aria-live="polite" data-i18n="diagnostics.open_hint">Mở Hệ thống để kiểm tra các thành phần.</p>
               <div class="health-list">
                 <article class="health-row">
                   <div class="health-row-heading"><strong>Database</strong><span id="health-database-state" class="state-badge">—</span></div>
-                  <p id="health-database-summary" class="health-summary-text">Chưa kiểm tra.</p>
+                  <p id="health-database-summary" class="health-summary-text" data-i18n="diagnostics.pending">Chưa kiểm tra.</p>
                   <p id="health-database-recovery" class="hint"></p>
                 </article>
                 <article class="health-row">
                   <div class="health-row-heading"><strong>PHP</strong><span id="health-php-state" class="state-badge">—</span></div>
-                  <p id="health-php-summary" class="health-summary-text">Chưa kiểm tra.</p>
+                  <p id="health-php-summary" class="health-summary-text" data-i18n="diagnostics.pending">Chưa kiểm tra.</p>
                   <p id="health-php-recovery" class="hint"></p>
                 </article>
                 <article class="health-row">
                   <div class="health-row-heading"><strong>WordPress</strong><span id="health-wordpress-state" class="state-badge">—</span></div>
-                  <p id="health-wordpress-summary" class="health-summary-text">Chưa kiểm tra.</p>
+                  <p id="health-wordpress-summary" class="health-summary-text" data-i18n="diagnostics.pending">Chưa kiểm tra.</p>
                   <p id="health-wordpress-recovery" class="hint"></p>
                 </article>
                 <article class="health-row">
                   <div class="health-row-heading"><strong>WooCommerce</strong><span id="health-woocommerce-state" class="state-badge">—</span></div>
-                  <p id="health-woocommerce-summary" class="health-summary-text">Chưa kiểm tra.</p>
+                  <p id="health-woocommerce-summary" class="health-summary-text" data-i18n="diagnostics.pending">Chưa kiểm tra.</p>
                   <p id="health-woocommerce-recovery" class="hint"></p>
                 </article>
                 <article class="health-row">
                   <div class="health-row-heading"><strong>CoffeePOS</strong><span id="health-coffeepos-state" class="state-badge">—</span></div>
-                  <p id="health-coffeepos-summary" class="health-summary-text">Chưa kiểm tra.</p>
+                  <p id="health-coffeepos-summary" class="health-summary-text" data-i18n="diagnostics.pending">Chưa kiểm tra.</p>
                   <p id="health-coffeepos-recovery" class="hint"></p>
                 </article>
               </div>
               <div class="actions">
-                <button id="health-recheck" class="secondary" type="button">Kiểm tra lại</button>
+                <button id="health-recheck" class="secondary" type="button" data-i18n="diagnostics.check_again">Kiểm tra lại</button>
               </div>
               <p id="health-check-status" class="hint" role="status" aria-live="polite"></p>
             </section>
             <section class="card" id="runtime" aria-labelledby="runtime-title">
               <div class="section-heading compact-heading">
                 <div>
-                  <span class="section-label">VẬN HÀNH</span>
-                  <h3 id="runtime-title">Runtime cục bộ</h3>
+                  <span class="section-label" data-i18n="runtime.label">VẬN HÀNH</span>
+                  <h3 id="runtime-title" data-i18n="runtime.title">Runtime cục bộ</h3>
                 </div>
                 <span id="runtime-state" class="state-badge">—</span>
               </div>
-              <p id="runtime-description" role="status" aria-live="polite">Đang kiểm tra runtime…</p>
+              <p id="runtime-description" role="status" aria-live="polite" data-i18n="runtime.checking">Đang kiểm tra runtime…</p>
               <div class="actions">
-                <button id="runtime-start" type="button">Khởi động</button>
-                <button id="runtime-stop" class="secondary" type="button">Dừng</button>
-                <button id="runtime-restart" class="secondary" type="button">Khởi động lại</button>
-                <button id="open-wordpress" class="secondary" type="button" disabled>Mở WordPress kiểm thử</button>
+                <button id="runtime-start" type="button" data-i18n="runtime.start">Khởi động</button>
+                <button id="runtime-stop" class="secondary" type="button" data-i18n="runtime.stop">Dừng</button>
+                <button id="runtime-restart" class="secondary" type="button" data-i18n="runtime.restart">Khởi động lại</button>
+                <button id="open-wordpress" class="secondary" type="button" disabled data-i18n="runtime.open_wordpress">Mở WordPress kiểm thử</button>
               </div>
               <p id="open-wordpress-status" class="hint" role="status" aria-live="polite"></p>
               <details class="technical-details">
-                <summary>Chi tiết kỹ thuật</summary>
+                <summary data-i18n="common.technical_details">Chi tiết kỹ thuật</summary>
                 <p id="wordpress-health-error" class="error" role="alert" hidden></p>
                 <p id="coffeepos-health-error" class="error" role="alert" hidden></p>
                 <p id="coffeepos-health-details" class="hint"></p>
@@ -276,7 +301,7 @@
                   <dt>MariaDB</dt><dd id="runtime-mariadb">—</dd>
                   <dt>HTTP</dt><dd id="runtime-http">—</dd>
                   <dt>Database</dt><dd id="runtime-database">—</dd>
-                  <dt>Thư mục dữ liệu</dt><dd id="data-dir"></dd>
+                  <dt data-i18n="runtime.data_dir">Thư mục dữ liệu</dt><dd id="data-dir"></dd>
                 </dl>
               </details>
             </section>
@@ -285,30 +310,30 @@
               <section class="card" id="repair" aria-labelledby="repair-title">
                 <div class="section-heading compact-heading">
                   <div>
-                    <span class="section-label">SỬA CHỮA</span>
-                    <h3 id="repair-title" tabindex="-1">Sửa chữa hệ thống</h3>
+                    <span class="section-label" data-i18n="repair.label">SỬA CHỮA</span>
+                    <h3 id="repair-title" tabindex="-1" data-i18n="repair.title">Sửa chữa hệ thống</h3>
                   </div>
-                  <span id="repair-summary-state" class="state-badge">Chưa kiểm tra</span>
+                  <span id="repair-summary-state" class="state-badge" data-i18n="common.not_checked">Chưa kiểm tra</span>
                 </div>
-                <p id="repair-summary" role="status" aria-live="polite">Nhấn Kiểm tra để CoffeePOS lập kế hoạch sửa chữa read-only cho trạng thái hiện tại.</p>
+                <p id="repair-summary" role="status" aria-live="polite" data-i18n="repair.initial">Nhấn Kiểm tra để CoffeePOS lập kế hoạch sửa chữa read-only cho trạng thái hiện tại.</p>
                 <div id="repair-list" class="repair-list" aria-live="polite"></div>
                 <div id="repair-admin-input" class="repair-input" hidden>
-                  <p class="lead">CoffeePOS không thể khôi phục mật khẩu quản trị cũ từ WordPress. Nhập mật khẩu mới để cập nhật đúng tài khoản quản trị hiện tại.</p>
+                  <p class="lead" data-i18n="repair.password_lead">CoffeePOS không thể khôi phục mật khẩu quản trị cũ từ WordPress. Nhập mật khẩu mới để cập nhật đúng tài khoản quản trị hiện tại.</p>
                   <div class="field-group">
-                    <label for="repair-admin-password">Mật khẩu mới</label>
+                    <label for="repair-admin-password" data-i18n="repair.password_new">Mật khẩu mới</label>
                     <input id="repair-admin-password" type="password" autocomplete="new-password" minlength="12" maxlength="128">
                   </div>
                   <div class="field-group">
-                    <label for="repair-admin-password-confirm">Xác nhận mật khẩu</label>
+                    <label for="repair-admin-password-confirm" data-i18n="repair.password_confirm">Xác nhận mật khẩu</label>
                     <input id="repair-admin-password-confirm" type="password" autocomplete="new-password" minlength="12" maxlength="128">
                   </div>
                   <p id="repair-admin-error" class="field-error" role="alert" hidden></p>
                 </div>
                 <p id="repair-error" class="error" role="alert" hidden></p>
                 <div class="actions">
-                  <button id="repair-apply" type="button" disabled>Sửa chữa</button>
-                  <button id="repair-inspect" class="secondary" type="button">Kiểm tra</button>
-                  <button id="repair-open-diagnostics" class="secondary" type="button" hidden>Mở Chẩn đoán</button>
+                  <button id="repair-apply" type="button" disabled data-i18n="repair.apply">Sửa chữa</button>
+                  <button id="repair-inspect" class="secondary" type="button" data-i18n="repair.inspect">Kiểm tra</button>
+                  <button id="repair-open-diagnostics" class="secondary" type="button" hidden data-i18n="repair.open_diagnostics">Mở Chẩn đoán</button>
                 </div>
                 <p id="repair-status" class="hint" role="status" aria-live="polite"></p>
               </section>
@@ -317,49 +342,49 @@
               <section class="card log-viewer-card" id="logs" aria-labelledby="logs-title">
                 <div class="section-heading compact-heading">
                   <div>
-                    <span class="section-label">NHẬT KÝ</span>
-                    <h3 id="logs-title" tabindex="-1">Nhật ký hệ thống</h3>
+                    <span class="section-label" data-i18n="logs.label">NHẬT KÝ</span>
+                    <h3 id="logs-title" tabindex="-1" data-i18n="logs.title">Nhật ký hệ thống</h3>
                   </div>
-                  <span id="logs-read-state" class="state-badge">Chưa tải</span>
+                  <span id="logs-read-state" class="state-badge" data-i18n="logs.not_loaded">Chưa tải</span>
                 </div>
-                <p class="lead">Xem thông tin chẩn đoán gần đây hoặc xuất gói hỗ trợ khi cần xử lý sự cố.</p>
+                <p class="lead" data-i18n="logs.lead">Xem thông tin chẩn đoán gần đây hoặc xuất gói hỗ trợ khi cần xử lý sự cố.</p>
 
                 <div class="log-source-control">
-                  <label for="log-source">Nguồn nhật ký</label>
+                  <label for="log-source" data-i18n="logs.source">Nguồn nhật ký</label>
                   <select id="log-source" aria-describedby="log-source-status">
-                    <option value="">Đang tải danh sách…</option>
+                    <option value="" data-i18n="logs.loading_sources">Đang tải danh sách…</option>
                   </select>
-                  <p id="log-source-status" class="hint" role="status" aria-live="polite">Mở Nhật ký để tải các nguồn có sẵn.</p>
+                  <p id="log-source-status" class="hint" role="status" aria-live="polite" data-i18n="logs.open_hint">Mở Nhật ký để tải các nguồn có sẵn.</p>
                 </div>
 
                 <div class="log-viewer-heading">
                   <div>
-                    <strong id="log-current-label">Nhật ký</strong>
-                    <p id="log-current-meta" class="hint">Chưa có metadata.</p>
+                    <strong id="log-current-label" data-i18n="logs.current">Nhật ký</strong>
+                    <p id="log-current-meta" class="hint" data-i18n="logs.no_metadata">Chưa có metadata.</p>
                   </div>
                   <span id="log-refresh-status" class="hint" role="status" aria-live="polite"></span>
                 </div>
 
                 <div id="log-empty" class="log-message" hidden>
-                  <strong>Chưa có dữ liệu nhật ký cho thành phần này.</strong>
-                  <p>Nhật ký sẽ xuất hiện khi thành phần được chạy hoặc kiểm tra.</p>
+                  <strong data-i18n="logs.empty_title">Chưa có dữ liệu nhật ký cho thành phần này.</strong>
+                  <p data-i18n="logs.empty_description">Nhật ký sẽ xuất hiện khi thành phần được chạy hoặc kiểm tra.</p>
                 </div>
                 <div id="log-read-error" class="log-message log-error" role="alert" hidden>
-                  <strong id="log-read-error-title">Không thể đọc nhật ký</strong>
-                  <p id="log-read-error-message">CoffeePOS không thể đọc file nhật ký hiện tại.</p>
+                  <strong id="log-read-error-title" data-i18n="logs.read_failed">Không thể đọc nhật ký</strong>
+                  <p id="log-read-error-message" data-i18n="logs.read_failed_message">CoffeePOS không thể đọc file nhật ký hiện tại.</p>
                   <details id="log-read-error-details" class="technical-details" hidden>
-                    <summary>Chi tiết kỹ thuật</summary>
+                    <summary data-i18n="common.technical_details">Chi tiết kỹ thuật</summary>
                     <p id="log-read-error-technical" class="hint"></p>
                   </details>
                 </div>
-                <pre id="log-content" class="log-content" tabindex="0" aria-label="Nội dung nhật ký" hidden></pre>
+                <pre id="log-content" class="log-content" tabindex="0" aria-label="Nội dung nhật ký" data-i18n-aria-label="accessibility.log_content" hidden></pre>
 
                 <div class="actions log-page-actions">
-                  <button id="log-load-older" class="secondary" type="button" hidden>Tải dòng cũ hơn</button>
+                  <button id="log-load-older" class="secondary" type="button" hidden data-i18n="logs.load_older">Tải dòng cũ hơn</button>
                 </div>
                 <div class="actions log-main-actions">
-                  <button id="log-refresh" class="secondary" type="button">Làm mới</button>
-                  <button id="log-export" type="button">Xuất gói hỗ trợ</button>
+                  <button id="log-refresh" class="secondary" type="button" data-i18n="logs.refresh">Làm mới</button>
+                  <button id="log-export" type="button" data-i18n="logs.export">Xuất gói hỗ trợ</button>
                 </div>
                 <p id="log-export-status" class="hint" role="status" aria-live="polite"></p>
               </section>
@@ -368,23 +393,23 @@
               <section class="card backup-card" id="backup" aria-labelledby="backup-title" aria-busy="false">
                 <div class="section-heading compact-heading">
                   <div>
-                    <span class="section-label">SAO LƯU VÀ KHÔI PHỤC</span>
-                    <h3 id="backup-title" tabindex="-1">Sao lưu cửa hàng</h3>
+                    <span class="section-label" data-i18n="backup.label">SAO LƯU VÀ KHÔI PHỤC</span>
+                    <h3 id="backup-title" tabindex="-1" data-i18n="backup.title">Sao lưu cửa hàng</h3>
                   </div>
-                  <span id="backup-state" class="state-badge">Sẵn sàng</span>
+                  <span id="backup-state" class="state-badge" data-i18n="common.ready">Sẵn sàng</span>
                 </div>
-                <p class="lead">Tạo một bản sao lưu mã hóa gồm dữ liệu cửa hàng, hình ảnh tải lên và cấu hình cần thiết để khôi phục trên CoffeePOS Desktop tương thích.</p>
+                <p class="lead" data-i18n="backup.lead">Tạo một bản sao lưu mã hóa gồm dữ liệu cửa hàng, hình ảnh tải lên và cấu hình cần thiết để khôi phục trên CoffeePOS Desktop tương thích.</p>
 
                 <div id="backup-last-success" class="backup-last-success" hidden>
-                  <span class="section-label">LẦN SAO LƯU GẦN NHẤT</span>
+                  <span class="section-label" data-i18n="backup.last">LẦN SAO LƯU GẦN NHẤT</span>
                   <strong id="backup-last-success-time">—</strong>
-                  <span>Đã hoàn thành</span>
+                  <span data-i18n="backup.complete_label">Đã hoàn thành</span>
                 </div>
 
                 <div data-backup-view="landing">
-                  <p class="hint">Bản sao lưu không mang theo plugin hoặc theme tùy chỉnh. Trong lúc tạo snapshot, POS sẽ tạm dừng để giữ dữ liệu nhất quán.</p>
+                  <p class="hint" data-i18n="backup.landing_hint">Bản sao lưu không mang theo plugin hoặc theme tùy chỉnh. Trong lúc tạo snapshot, POS sẽ tạm dừng để giữ dữ liệu nhất quán.</p>
                   <div class="actions">
-                    <button id="backup-create" type="button">Tạo bản sao lưu</button>
+                    <button id="backup-create" type="button" data-i18n="backup.create">Tạo bản sao lưu</button>
                   </div>
                   <p id="backup-landing-status" class="hint" role="status" aria-live="polite"></p>
                 </div>
@@ -392,57 +417,57 @@
                 <div data-backup-view="password" hidden>
                   <form id="backup-password-form" class="backup-password-form" novalidate>
                     <div class="field-group">
-                      <label for="backup-password">Mật khẩu bản sao lưu</label>
+                      <label for="backup-password" data-i18n="backup.password">Mật khẩu bản sao lưu</label>
                       <input id="backup-password" type="password" maxlength="128" autocomplete="new-password" required />
                     </div>
                     <div class="field-group">
-                      <label for="backup-password-confirm">Nhập lại mật khẩu</label>
+                      <label for="backup-password-confirm" data-i18n="backup.password_confirm">Nhập lại mật khẩu</label>
                       <input id="backup-password-confirm" type="password" maxlength="128" autocomplete="new-password" required />
                     </div>
-                    <p class="hint">Mật khẩu này cần khi khôi phục trên máy hoặc Windows profile khác. CoffeePOS không lưu lại mật khẩu sau thao tác.</p>
+                    <p class="hint" data-i18n="backup.password_hint">Mật khẩu này cần khi khôi phục trên máy hoặc Windows profile khác. CoffeePOS không lưu lại mật khẩu sau thao tác.</p>
                     <p id="backup-password-error" class="field-error" role="alert" hidden></p>
                     <div class="actions split-actions">
-                      <button id="backup-password-cancel" class="secondary" type="button">Hủy</button>
-                      <button id="backup-choose-destination" type="submit">Chọn nơi lưu</button>
+                      <button id="backup-password-cancel" class="secondary" type="button" data-i18n="common.cancel">Hủy</button>
+                      <button id="backup-choose-destination" type="submit" data-i18n="backup.choose_destination">Chọn nơi lưu</button>
                     </div>
                   </form>
                 </div>
 
                 <div data-backup-view="progress" hidden>
                   <div class="backup-progress-copy">
-                    <strong id="backup-progress-title">Đang sao lưu…</strong>
-                    <p id="backup-progress-stage" role="status" aria-live="polite">Đang chuẩn bị dữ liệu cửa hàng.</p>
+                    <strong id="backup-progress-title" data-i18n="backup.progress_title">Đang sao lưu…</strong>
+                    <p id="backup-progress-stage" role="status" aria-live="polite" data-i18n="backup.progress_prepare">Đang chuẩn bị dữ liệu cửa hàng.</p>
                     <progress id="backup-progress" max="100" value="0">0%</progress>
-                    <p id="backup-progress-count" class="hint">Đang chờ thông tin tiến độ từ hệ thống.</p>
+                    <p id="backup-progress-count" class="hint" data-i18n="backup.progress_wait">Đang chờ thông tin tiến độ từ hệ thống.</p>
                   </div>
-                  <p class="hint">POS tạm dừng trong khi CoffeePOS tạo snapshot nhất quán.</p>
+                  <p class="hint" data-i18n="backup.progress_pause">POS tạm dừng trong khi CoffeePOS tạo snapshot nhất quán.</p>
                   <div class="actions">
-                    <button id="backup-cancel" class="secondary" type="button">Hủy</button>
+                    <button id="backup-cancel" class="secondary" type="button" data-i18n="common.cancel">Hủy</button>
                   </div>
                   <p id="backup-progress-status" class="hint" role="status" aria-live="polite"></p>
                 </div>
 
                 <div data-backup-view="success" hidden>
                   <div class="backup-result">
-                    <strong>Đã sao lưu cửa hàng</strong>
-                    <p>File backup đã được kiểm tra và lưu tại vị trí bạn chọn.</p>
-                    <p id="backup-success-warning" class="hint" role="status" hidden>Một số plugin hoặc theme tùy chỉnh không nằm trong file backup. Dữ liệu cửa hàng, uploads và cấu hình portable vẫn đã được sao lưu.</p>
+                    <strong data-i18n="backup.success_title">Đã sao lưu cửa hàng</strong>
+                    <p data-i18n="backup.success_description">File backup đã được kiểm tra và lưu tại vị trí bạn chọn.</p>
+                    <p id="backup-success-warning" class="hint" role="status" hidden data-i18n="backup.success_warning">Một số plugin hoặc theme tùy chỉnh không nằm trong file backup. Dữ liệu cửa hàng, uploads và cấu hình portable vẫn đã được sao lưu.</p>
                   </div>
                   <div class="actions">
-                    <button id="backup-open-folder" type="button">Mở thư mục chứa file</button>
-                    <button id="backup-create-another" class="secondary" type="button">Tạo bản sao lưu khác</button>
+                    <button id="backup-open-folder" type="button" data-i18n="backup.open_folder">Mở thư mục chứa file</button>
+                    <button id="backup-create-another" class="secondary" type="button" data-i18n="backup.create_another">Tạo bản sao lưu khác</button>
                   </div>
                   <p id="backup-success-status" class="hint" role="status" aria-live="polite"></p>
                 </div>
 
                 <div data-backup-view="failure" hidden>
                   <div class="backup-result backup-result-error" role="alert">
-                    <strong>Không thể tạo bản sao lưu</strong>
-                    <p id="backup-failure-message">CoffeePOS chưa thể hoàn tất thao tác sao lưu.</p>
+                    <strong data-i18n="backup.failure_title">Không thể tạo bản sao lưu</strong>
+                    <p id="backup-failure-message" data-i18n="backup.failure_message">CoffeePOS chưa thể hoàn tất thao tác sao lưu.</p>
                     <p id="backup-failure-recovery" class="hint"></p>
                   </div>
                   <div class="actions">
-                    <button id="backup-retry" type="button">Thử lại</button>
+                    <button id="backup-retry" type="button" data-i18n="common.retry">Thử lại</button>
                   </div>
                 </div>
               </section>
@@ -451,7 +476,7 @@
         </div>
       </main>
 
-      <footer>Dữ liệu cửa hàng được lưu riêng với ứng dụng.</footer>
+      <footer data-i18n="footer.data_separate">Dữ liệu cửa hàng được lưu riêng với ứng dụng.</footer>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

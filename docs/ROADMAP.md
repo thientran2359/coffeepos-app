@@ -59,8 +59,8 @@ Giữ nguyên số và bằng chứng của Phase 1–4.12 đã hoàn thành. Ng
 | 7.1 — Backup format | ✅ Hoàn thành Windows-first | Encrypted portable container + strict manifest/inventory/checksum/path/compatibility validation + native inspect/validate; focused tests pass; xem [PHASE-07.1](PHASE-07.1.md) |
 | 7.2 — Database backup | ✅ Hoàn thành Windows-first | Managed mariadb-dump + maintenance snapshot + disposable import/fingerprint verification + crash-safe child cleanup; focused tests pass; xem [PHASE-07.2](PHASE-07.2.md) |
 | 7.3 — Uploads/config backup | ✅ Hoàn thành Windows-first | Complete encrypted backup + native Save As/progress/cancel + same-snapshot uploads/config/admin secret + crash recovery/final validation; real disposable-store smoke pass; xem [PHASE-07.3](PHASE-07.3.md) |
-| 7.4 — Restore | 📘 Đã có đặc tả, chưa triển khai | Inspect + recovery snapshot + isolated staging + target secrets + cutover/rollback; xem [PHASE-07.4](PHASE-07.4.md) |
-| 7.5 — Desktop localization | 📘 Đã có đặc tả, chưa triển khai | Tiếng Việt/English; first-run language chooser + persisted Settings hot-switch + full Desktop-shell i18n; xem [PHASE-07.5](PHASE-07.5.md) |
+| 7.4 — Restore | 🟡 Đã triển khai, chờ manual acceptance | Inspect + recovery snapshot + isolated staging + target secrets + transaction-owned cutover/rollback/recovery; focused restore checks pass; xem [PHASE-07.4](PHASE-07.4.md) |
+| 7.5 — Desktop localization | 🟡 Đã triển khai, chờ manual acceptance | Tiếng Việt/English; first-run language chooser + persisted Settings hot-switch + full Desktop-shell i18n + native tray/close locale + stable user-facing error codes; UI/Rust checks pass; xem [PHASE-07.5](PHASE-07.5.md) |
 
 ## Phase 4 — Setup WordPress, WooCommerce và CoffeePOS
 
@@ -350,4 +350,4 @@ macOS vẫn chưa có acceptance. Sau baseline Windows, lập kế hoạch targe
 
 ## Thứ tự thực hiện ngay tiếp theo
 
-Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6** và **Phase 6.1–6.3** đã triển khai theo trạng thái ghi ở bảng trên; **Phase 6.4** đã được user xác nhận hoàn thành Windows-first. Bộ đặc tả **Phase 7.1–7.5** đã được tạo; implementation Phase 7 tiếp tục theo thứ tự dependency của các subphase và Phase 7.5 thực hiện sau restore 7.4 để sweep đầy đủ các surface Desktop hiện có.
+Phase 4.1–4.12 và **Phase 5.1–5.2** đã pass Windows-first. **Phase 5.3–5.6** và **Phase 6.1–6.3** đã triển khai theo trạng thái ghi ở bảng trên; **Phase 6.4** đã được user xác nhận hoàn thành Windows-first. **Phase 7.1–7.3** đã hoàn thành Windows-first; **Phase 7.4–7.5** đã triển khai và đang chờ manual acceptance theo trạng thái ở bảng trên.

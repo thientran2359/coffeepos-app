@@ -1,4 +1,16 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import {
+  applyDocumentTranslations,
+  formatBytes,
+  formatDateTime,
+  formatNumber,
+  getLocale,
+  hasTranslation,
+  isAppLanguage,
+  setLocale,
+  t,
+  type AppLanguage,
+} from "./i18n";
 import "./styles.css";
 
 interface ShellInfo {
@@ -9,6 +21,7 @@ interface ShellInfo {
     store_name: string;
     bind_host: string;
     startup_view: "home" | "settings" | "diagnostics";
+    app_language?: AppLanguage | null;
     setup_admin_username?: string;
     setup_admin_email?: string;
   };
@@ -25,6 +38,7 @@ interface SetupInfo {
 interface RuntimeErrorInfo {
   component: string;
   operation: string;
+  code: string;
   message: string;
   recovery: string;
 }
@@ -258,7 +272,7 @@ function installRestoreUi(): void {
     button.id = "setup-restore";
     button.type = "button";
     button.className = "secondary";
-    button.textContent = "Khôi phục từ bản sao lưu";
+    button.dataset.i18n = "onboarding.restore_backup";
     setupWelcomeActions.append(button);
   }
 
@@ -272,11 +286,11 @@ function installRestoreUi(): void {
     button.id = "restore-installed-start";
     button.type = "button";
     button.className = "secondary";
-    button.textContent = "Khôi phục từ bản sao lưu";
+    button.dataset.i18n = "onboarding.restore_backup";
     actions.append(button);
     backupLead.insertAdjacentElement("afterend", actions);
     const titleNode = document.getElementById("backup-title");
-    if (titleNode) titleNode.textContent = "Sao lưu và khôi phục";
+    if (titleNode) titleNode.dataset.i18n = "backup.title";
   }
 
   if (document.getElementById("restore-screen")) return;
@@ -290,94 +304,95 @@ function installRestoreUi(): void {
   screen.innerHTML = `
     <div class="card backup-card" id="restore-card">
       <div class="section-heading compact-heading">
-        <div><span class="section-label">KHÔI PHỤC</span><h2 id="restore-title" tabindex="-1">Khôi phục cửa hàng</h2></div>
-        <span id="restore-state" class="state-badge">Sẵn sàng</span>
+        <div><span class="section-label" data-i18n="restore.label"></span><h2 id="restore-title" tabindex="-1" data-i18n="restore.title"></h2></div>
+        <span id="restore-state" class="state-badge" data-i18n="common.ready"></span>
       </div>
 
       <div data-restore-view="password">
-        <p class="lead">Chọn một bản sao lưu CoffeePOS và kiểm tra tính toàn vẹn, phiên bản và khả năng tương thích trước khi thay đổi cửa hàng.</p>
+        <p class="lead" data-i18n="restore.password_lead"></p>
         <form id="restore-password-form" class="backup-password-form" novalidate>
           <div class="field-group">
-            <label for="restore-password">Mật khẩu bản sao lưu</label>
+            <label for="restore-password" data-i18n="restore.password"></label>
             <input id="restore-password" type="password" maxlength="128" autocomplete="current-password" required />
           </div>
-          <p class="hint">Cửa sổ Open của Windows sẽ chọn file. Đường dẫn file và dữ liệu giải mã không được đưa vào giao diện.</p>
+          <p class="hint" data-i18n="restore.password_hint"></p>
           <p id="restore-password-error" class="field-error" role="alert" hidden></p>
           <div class="actions split-actions">
-            <button id="restore-password-cancel" class="secondary" type="button">Quay lại</button>
-            <button id="restore-inspect" type="submit">Chọn và kiểm tra bản sao lưu</button>
+            <button id="restore-password-cancel" class="secondary" type="button" data-i18n="common.back"></button>
+            <button id="restore-inspect" type="submit" data-i18n="restore.inspect"></button>
           </div>
         </form>
       </div>
 
       <div data-restore-view="review" hidden>
-        <p class="lead">Bản sao lưu đã vượt qua bước kiểm tra read-only. Xác nhận thông tin an toàn bên dưới trước khi khôi phục.</p>
+        <p class="lead" data-i18n="restore.review_lead"></p>
         <dl class="review-list">
-          <dt>Cửa hàng</dt><dd id="restore-review-store">—</dd>
-          <dt>Tạo lúc</dt><dd id="restore-review-created">—</dd>
+          <dt data-i18n="onboarding.review_store"></dt><dd id="restore-review-store">—</dd>
+          <dt data-i18n="restore.created_at"></dt><dd id="restore-review-created">—</dd>
           <dt>WordPress</dt><dd id="restore-review-wordpress">—</dd>
           <dt>WooCommerce</dt><dd id="restore-review-woocommerce">—</dd>
           <dt>CoffeePOS</dt><dd id="restore-review-coffeepos">—</dd>
-          <dt>Uploads</dt><dd id="restore-review-uploads">—</dd>
-          <dt>Tương thích</dt><dd id="restore-review-compatibility">—</dd>
+          <dt data-i18n="restore.uploads"></dt><dd id="restore-review-uploads">—</dd>
+          <dt data-i18n="restore.compatibility"></dt><dd id="restore-review-compatibility">—</dd>
         </dl>
         <div id="restore-unmanaged-warning" class="backup-result backup-result-error" hidden>
-          <strong>Có mã site không được quản lý</strong>
-          <p>Bản sao lưu có dấu hiệu plugin, theme hoặc mã site tùy chỉnh không thuộc gói managed. CoffeePOS chỉ dựng lại mã managed tương thích; hãy kiểm tra chức năng tùy chỉnh sau khi khôi phục.</p>
+          <strong data-i18n="restore.unmanaged_title"></strong>
+          <p data-i18n="restore.unmanaged_description"></p>
         </div>
         <p id="restore-review-impact" class="hint"></p>
         <p id="restore-review-error" class="error" role="alert" hidden></p>
         <div class="actions split-actions">
-          <button id="restore-review-cancel" class="secondary" type="button">Hủy</button>
-          <button id="restore-apply" type="button">Khôi phục</button>
+          <button id="restore-review-cancel" class="secondary" type="button" data-i18n="common.cancel"></button>
+          <button id="restore-apply" type="button" data-i18n="restore.apply"></button>
         </div>
       </div>
 
       <div data-restore-view="progress" hidden>
         <div class="backup-progress-copy">
-          <strong>Đang khôi phục…</strong>
-          <p id="restore-progress-stage" role="status" aria-live="polite">Đang chuẩn bị giao dịch khôi phục.</p>
-          <progress id="restore-progress" max="1">Đang xử lý</progress>
-          <p id="restore-progress-detail" class="hint">CoffeePOS đang giữ cửa hàng ở trạng thái an toàn trong khi kiểm tra và chuyển dữ liệu.</p>
+          <strong data-i18n="restore.progress_title"></strong>
+          <p id="restore-progress-stage" role="status" aria-live="polite" data-i18n="restore.progress_prepare"></p>
+          <progress id="restore-progress" max="1" data-i18n="common.processing"></progress>
+          <p id="restore-progress-detail" class="hint" data-i18n="restore.progress_detail"></p>
         </div>
-        <p id="restore-close-guidance" class="hint">Không tắt máy trong khi dữ liệu đang được chuyển.</p>
-        <div class="actions"><button id="restore-cancel" class="secondary" type="button">Hủy khôi phục</button></div>
+        <p id="restore-close-guidance" class="hint" data-i18n="restore.close_guidance"></p>
+        <div class="actions"><button id="restore-cancel" class="secondary" type="button" data-i18n="restore.cancel"></button></div>
         <p id="restore-progress-status" class="hint" role="status" aria-live="polite"></p>
       </div>
 
       <div data-restore-view="success" hidden>
         <div class="backup-result">
-          <strong>Khôi phục hoàn tất</strong>
-          <p>CoffeePOS đã kiểm tra dữ liệu và trạng thái cửa hàng sau khôi phục.</p>
+          <strong data-i18n="restore.success_title"></strong>
+          <p data-i18n="restore.success_description"></p>
         </div>
-        <div class="actions"><button id="restore-open-home" type="button">Mở Tổng quan</button></div>
+        <div class="actions"><button id="restore-open-home" type="button" data-i18n="restore.open_overview"></button></div>
       </div>
 
       <div data-restore-view="failure" hidden>
         <div class="backup-result backup-result-error" role="alert">
-          <strong id="restore-failure-title">Không thể khôi phục</strong>
-          <p id="restore-failure-message">CoffeePOS chưa thể hoàn tất thao tác khôi phục.</p>
+          <strong id="restore-failure-title" data-i18n="restore.failure_title"></strong>
+          <p id="restore-failure-message" data-i18n="restore.failure_message"></p>
           <p id="restore-failure-recovery" class="hint"></p>
         </div>
         <div class="actions split-actions">
-          <button id="restore-failure-back" class="secondary" type="button">Quay lại</button>
-          <button id="restore-retry" type="button">Thử lại</button>
+          <button id="restore-failure-back" class="secondary" type="button" data-i18n="common.back"></button>
+          <button id="restore-retry" type="button" data-i18n="common.retry"></button>
         </div>
       </div>
 
       <div data-restore-view="recovery" hidden>
         <div class="backup-result backup-result-error" role="alert">
-          <strong>Khôi phục cần xử lý</strong>
-          <p>CoffeePOS đang giữ trạng thái cửa hàng và dữ liệu phục hồi để tránh tiếp tục vận hành trên trạng thái chưa được xác minh.</p>
+          <strong data-i18n="restore.recovery_title"></strong>
+          <p data-i18n="restore.recovery_description"></p>
         </div>
         <details class="technical-details">
-          <summary>Xem chi tiết kỹ thuật</summary>
+          <summary data-i18n="common.technical_details"></summary>
           <p id="restore-recovery-details" class="hint"></p>
         </details>
-        <div class="actions"><button id="restore-recovery-refresh" type="button">Kiểm tra lại trạng thái</button></div>
+        <div class="actions"><button id="restore-recovery-refresh" type="button" data-i18n="restore.refresh_recovery"></button></div>
       </div>
     </div>`;
   main.append(screen);
+  applyDocumentTranslations(screen);
 }
 
 installRestoreUi();
@@ -386,6 +401,10 @@ const bootstrapPanel = element("bootstrap");
 const title = element("status-title");
 const description = element("status-description");
 const retry = element<HTMLButtonElement>("retry");
+const languageChooser = element<HTMLElement>("language-chooser");
+const languageTitle = element<HTMLElement>("language-title");
+const languageStatus = element("language-status");
+const languageButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-language]"));
 const setup = element("setup");
 const setupTitle = element<HTMLElement>("setup-title");
 const setupPanels = Array.from(document.querySelectorAll<HTMLElement>("[data-setup-panel]"));
@@ -433,6 +452,8 @@ const settingsAdminUsername = element("settings-admin-username");
 const settingsCopyPassword = element<HTMLButtonElement>("settings-copy-password");
 const settingsCopyStatus = element("settings-copy-status");
 const appSettingsForm = element<HTMLFormElement>("app-settings-form");
+const settingsAppLanguage = element<HTMLSelectElement>("app-language");
+const languageSettingsStatus = element("language-settings-status");
 const settingsStartupView = element<HTMLSelectElement>("startup-view");
 const settingsSave = element<HTMLButtonElement>("settings-save");
 const settingsSaveStatus = element("settings-save-status");
@@ -559,6 +580,10 @@ let provisioningAction: "provision" | "refresh" = "refresh";
 let setupProfileBusy = false;
 let completionPending = false;
 let settingsBusy = false;
+let languageBusy = false;
+let persistedLanguage: AppLanguage | null = null;
+let currentShellInfo: ShellInfo | null = null;
+let languageResolutionPending = true;
 let runtimeTransition: "starting" | "stopping" | "checking" | null = null;
 let runtimeLoadError: string | null = null;
 let homeActionKind: "start" | "retry_health" | "refresh" | "open_pos" | null = null;
@@ -570,6 +595,8 @@ let runtimeMaintenanceBusy = false;
 let currentDiagnostics: HealthDiagnosticsInfo | null = null;
 let currentSystemSection: SystemSection = "diagnostics";
 let currentRepairPlan: RepairPlan | null = null;
+let currentRepairResult: RepairApplyResult | null = null;
+let currentRepairResultPlan: RepairPlan | null = null;
 let repairOperation: "inspect" | "apply" | null = null;
 let repairRouteRequired = false;
 let currentLogCatalog: LogCatalog | null = null;
@@ -599,6 +626,67 @@ const LOG_VIEW_MAX_LINES = 1000;
 const BACKUP_POLL_INTERVAL_MS = 750;
 const RESTORE_POLL_INTERVAL_MS = 750;
 
+function localizedErrorCode(code: unknown, fallbackKey = "errors.generic"): string {
+  if (typeof code === "string" && code.trim()) {
+    const key = `errors.${code.trim()}`;
+    if (hasTranslation(key)) return t(key);
+  }
+  return t(fallbackKey);
+}
+
+function localizedNativeError(error: unknown, fallbackKey = "errors.generic"): string {
+  const value = recordValue(error);
+  if (value) {
+    if (typeof value.code === "string") return localizedErrorCode(value.code, fallbackKey);
+  }
+  return t(fallbackKey);
+}
+
+function rawNativeError(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  const value = recordValue(error);
+  if (value) {
+    const message = typeof value.message === "string" ? value.message : "";
+    const recovery = typeof value.recovery === "string" ? value.recovery : "";
+    return [message, recovery].filter(Boolean).join("\n");
+  }
+  return "";
+}
+
+function applyLocaleStaticText(reveal = true): void {
+  applyDocumentTranslations();
+  settingsAppLanguage.value = getLocale();
+  if (reveal) document.documentElement.dataset.i18nReady = "true";
+  else delete document.documentElement.dataset.i18nReady;
+}
+
+function setupProfileCommitted(): boolean {
+  return Boolean(
+    currentShellInfo?.config.setup_admin_username
+    || currentShellInfo?.config.setup_admin_email,
+  );
+}
+
+function freshProfileNeedsLanguageChoice(): boolean {
+  return persistedLanguage === null
+    && currentProvisioning?.state === "not_installed"
+    && !setupProfileCommitted()
+    && !restoreSystemBusy();
+}
+
+function showLanguageChooser(): void {
+  bootstrapPanel.hidden = true;
+  setup.hidden = true;
+  installedShell.hidden = true;
+  restoreScreen.hidden = true;
+  languageChooser.hidden = false;
+  languageResolutionPending = true;
+  setTextIfChanged(languageStatus, "");
+  applyLocaleStaticText();
+  languageTitle.focus();
+}
+
 function getLogCatalog(): Promise<LogCatalog> {
   return invoke<LogCatalog>("get_log_catalog");
 }
@@ -614,16 +702,6 @@ function readLogPage(logId: string, cursor: string | null, direction: "tail" | "
 
 function exportSupportBundle(): Promise<SupportBundleResult> {
   return invoke<SupportBundleResult>("export_support_bundle");
-}
-
-function nativeErrorText(error: unknown): string {
-  if (typeof error === "string") return error;
-  if (error instanceof Error) return error.message;
-  try {
-    return JSON.stringify(error);
-  } catch {
-    return String(error);
-  }
 }
 
 function recordValue(value: unknown): Record<string, unknown> | null {
@@ -648,13 +726,10 @@ function firstFiniteNumber(...values: unknown[]): number | null {
 
 function restoreErrorInfo(error: unknown): { message: string; recovery: string } {
   const value = recordValue(error);
+  const code = value && typeof value.code === "string" ? value.code : null;
   return {
-    message: value && typeof value.message === "string"
-      ? value.message
-      : "CoffeePOS không thể hoàn tất thao tác khôi phục.",
-    recovery: value && typeof value.recovery === "string"
-      ? value.recovery
-      : "Kiểm tra bản sao lưu và thử lại. Chi tiết đường dẫn file được giữ ở native layer.",
+    message: localizedErrorCode(code, "errors.restore_failed"),
+    recovery: t("errors.recovery.retry"),
   };
 }
 
@@ -678,28 +753,25 @@ function restoreCompatibility(inspection: RestoreInspection): { compatible: bool
   if (backup && typeof backup.can_restore === "boolean") {
     const compatibility = recordValue(backup.compatibility);
     const status = firstString(compatibility?.status);
-    const label = firstString(compatibility?.message, status)
-      || (backup.can_restore
-        ? "Tương thích với phiên bản CoffeePOS Desktop hiện tại."
-        : "Bản sao lưu không tương thích với phiên bản hiện tại.");
+    const label = backup.can_restore ? t("restore.compatible") : t("restore.incompatible");
     return { compatible: backup.can_restore, label };
   }
   if (typeof inspection.compatible === "boolean") {
     return {
       compatible: inspection.compatible,
-      label: inspection.compatible ? "Tương thích với phiên bản CoffeePOS Desktop hiện tại." : "Bản sao lưu không tương thích với phiên bản hiện tại.",
+      label: inspection.compatible ? t("restore.compatible") : t("restore.incompatible"),
     };
   }
   if (typeof inspection.compatibility === "boolean") {
     return {
       compatible: inspection.compatibility,
-      label: inspection.compatibility ? "Tương thích với phiên bản CoffeePOS Desktop hiện tại." : "Bản sao lưu không tương thích với phiên bản hiện tại.",
+      label: inspection.compatibility ? t("restore.compatible") : t("restore.incompatible"),
     };
   }
   if (typeof inspection.compatibility === "string") {
     const value = inspection.compatibility.trim();
     const compatible = !/blocked|incompatible|unsupported|reject/i.test(value);
-    return { compatible, label: value || (compatible ? "Tương thích." : "Không tương thích.") };
+    return { compatible, label: compatible ? t("restore.compatible_short") : t("restore.incompatible_short") };
   }
   const compatibility = recordValue(inspection.compatibility);
   if (compatibility) {
@@ -708,13 +780,12 @@ function restoreCompatibility(inspection: RestoreInspection): { compatible: bool
     const compatible = typeof compatibleValue === "boolean"
       ? compatibleValue
       : !/blocked|incompatible|unsupported|reject/i.test(status);
-    const label = firstString(compatibility.message, compatibility.reason, status)
-      || (compatible ? "Tương thích với phiên bản CoffeePOS Desktop hiện tại." : "Bản sao lưu không tương thích với phiên bản hiện tại.");
+    const label = compatible ? t("restore.compatible") : t("restore.incompatible");
     return { compatible, label };
   }
   return {
     compatible: false,
-    label: "Không thể xác nhận khả năng tương thích từ kết quả kiểm tra bản sao lưu.",
+    label: t("restore.compatibility_unknown"),
   };
 }
 
@@ -829,39 +900,16 @@ function formatBackupTimestamp(value: number | string | null | undefined): strin
       ? new Date(value < 10_000_000_000 ? value * 1000 : value)
       : new Date(Number.NaN);
   if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat("vi-VN", {
-    dateStyle: "short",
-    timeStyle: "short",
-  }).format(date);
+  return formatDateTime(date);
 }
 
 function formatBackupBytes(value: number): string {
-  if (!Number.isFinite(value) || value <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let amount = value;
-  let unit = 0;
-  while (amount >= 1024 && unit < units.length - 1) {
-    amount /= 1024;
-    unit += 1;
-  }
-  return `${amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
+  return formatBytes(value);
 }
 
 function backupStageLabel(stage: string): string {
-  const labels: Record<string, string> = {
-    planned: "Đang chuẩn bị sao lưu",
-    selecting_destination: "Đang chờ chọn nơi lưu",
-    preflight: "Đang kiểm tra điều kiện sao lưu",
-    quiesce: "Đang tạm dừng dịch vụ cửa hàng",
-    database: "Đang sao lưu cơ sở dữ liệu",
-    uploads: "Đang sao lưu hình ảnh tải lên",
-    archive: "Đang tạo file sao lưu mã hóa",
-    validate: "Đang kiểm tra file sao lưu",
-    finalize: "Đang hoàn tất file sao lưu",
-    cleanup: "Đang dọn dữ liệu tạm",
-    resume: "Đang khôi phục trạng thái cửa hàng",
-  };
-  return labels[stage] ?? "Đang xử lý dữ liệu cửa hàng";
+  const key = `backup.stage.${stage}`;
+  return hasTranslation(key) ? t(key) : t("backup.stage.default");
 }
 
 function selectBackupView(view: BackupView, moveFocus = false): void {
@@ -919,19 +967,19 @@ function renderBackupProgress(status: BackupStatus): void {
     backupProgress.value = Math.min(processedFiles, estimatedFiles);
     setTextIfChanged(
       backupProgressCount,
-      `Đã xử lý ${processedFiles.toLocaleString("vi-VN")} / ${estimatedFiles.toLocaleString("vi-VN")} tệp.`,
+      t("backup.progress_files", { processed: formatNumber(processedFiles), estimated: formatNumber(estimatedFiles) }),
     );
   } else if (estimatedBytes > 0) {
     backupProgress.max = estimatedBytes;
     backupProgress.value = Math.min(processedBytes, estimatedBytes);
     setTextIfChanged(
       backupProgressCount,
-      `Đã xử lý ${formatBackupBytes(processedBytes)} / ${formatBackupBytes(estimatedBytes)}.`,
+      t("backup.progress_bytes", { processed: formatBackupBytes(processedBytes), estimated: formatBackupBytes(estimatedBytes) }),
     );
   } else {
     backupProgress.max = 1;
     backupProgress.removeAttribute("value");
-    setTextIfChanged(backupProgressCount, "Đang chờ thông tin tiến độ từ hệ thống.");
+    setTextIfChanged(backupProgressCount, t("backup.progress_wait"));
   }
 }
 
@@ -946,26 +994,26 @@ function renderBackupStatus(status: BackupStatus): void {
   if (lastSuccess) setTextIfChanged(backupLastSuccessTime, formatBackupTimestamp(lastSuccess));
 
   if (status.succeeded) {
-    setTextIfChanged(backupState, "Đã hoàn thành");
+    setTextIfChanged(backupState, t("common.completed"));
     setTextIfChanged(backupSuccessStatus, "");
     selectBackupView("success");
   } else if (status.failed) {
-    setTextIfChanged(backupState, "Có lỗi");
-    setTextIfChanged(backupFailureMessage, status.last_error?.message ?? "CoffeePOS chưa thể hoàn tất thao tác sao lưu.");
-    setTextIfChanged(backupFailureRecovery, status.last_error?.recovery ?? "");
+    setTextIfChanged(backupState, t("common.error"));
+    setTextIfChanged(backupFailureMessage, localizedErrorCode(status.last_error?.code, "errors.backup_failed"));
+    setTextIfChanged(backupFailureRecovery, status.last_error ? t("errors.recovery.retry") : "");
     selectBackupView("failure");
   } else if (status.cancelled) {
-    setTextIfChanged(backupState, "Đã hủy");
-    setTextIfChanged(backupLandingStatus, "Đã hủy sao lưu. Không có file backup mới được hoàn tất.");
+    setTextIfChanged(backupState, t("common.cancelled"));
+    setTextIfChanged(backupLandingStatus, t("backup.cancelled_message"));
     selectBackupView("landing");
   } else if (backupIsActive(status)) {
-    setTextIfChanged(backupState, "Đang sao lưu");
-    setTextIfChanged(backupProgressTitle, "Đang sao lưu…");
-    setTextIfChanged(backupProgressStatus, backupOperation === "cancel" ? "Đã yêu cầu hủy. CoffeePOS đang dọn dữ liệu tạm an toàn…" : "");
+    setTextIfChanged(backupState, t("backup.state.running"));
+    setTextIfChanged(backupProgressTitle, t("backup.progress_title"));
+    setTextIfChanged(backupProgressStatus, backupOperation === "cancel" ? t("backup.cancel_requested") : "");
     renderBackupProgress(status);
     selectBackupView("progress");
   } else if (currentBackupView !== "password" || backupOperation === null) {
-    setTextIfChanged(backupState, "Sẵn sàng");
+    setTextIfChanged(backupState, t("common.ready"));
     if (currentBackupView !== "password") selectBackupView("landing");
   }
   syncOperationControls();
@@ -988,9 +1036,9 @@ function showBackupFailure(error: unknown): void {
     warnings: [],
     last_error: structured,
   };
-  setTextIfChanged(backupState, "Có lỗi");
-  setTextIfChanged(backupFailureMessage, structured?.message ?? nativeErrorText(error));
-  setTextIfChanged(backupFailureRecovery, structured?.recovery ?? "");
+  setTextIfChanged(backupState, t("common.error"));
+  setTextIfChanged(backupFailureMessage, localizedErrorCode(structured?.code, "errors.backup_failed"));
+  setTextIfChanged(backupFailureRecovery, t("errors.recovery.retry"));
   selectBackupView("failure", true);
   syncOperationControls();
 }
@@ -1023,7 +1071,7 @@ async function refreshBackupStatus(moveFocus = false): Promise<BackupStatus | nu
     return status;
   } catch (error) {
     if (backupOperation === "create" || backupOperation === "cancel" || backupIsActive()) {
-      setTextIfChanged(backupProgressStatus, "Không thể cập nhật tiến độ tạm thời. CoffeePOS vẫn giữ thao tác sao lưu hiện tại.");
+      setTextIfChanged(backupProgressStatus, t("backup.status_update_failed"));
       ensureBackupPolling();
       return currentBackupStatus;
     }
@@ -1043,14 +1091,14 @@ function validateBackupPassword(): string | null {
   const password = backupPassword.value;
   if (password.length === 0) {
     backupPassword.setAttribute("aria-invalid", "true");
-    setTextIfChanged(backupPasswordError, "Nhập mật khẩu cho bản sao lưu.");
+    setTextIfChanged(backupPasswordError, t("backup.validation.password_required"));
     backupPasswordError.hidden = false;
     backupPassword.focus();
     return null;
   }
   if (password !== backupPasswordConfirm.value) {
     backupPasswordConfirm.setAttribute("aria-invalid", "true");
-    setTextIfChanged(backupPasswordError, "Hai lần nhập mật khẩu chưa khớp.");
+    setTextIfChanged(backupPasswordError, t("backup.validation.password_mismatch"));
     backupPasswordError.hidden = false;
     backupPasswordConfirm.focus();
     return null;
@@ -1063,9 +1111,9 @@ async function createBackup(): Promise<void> {
   let password = validateBackupPassword();
   if (password === null) return;
   backupOperation = "create";
-  setTextIfChanged(backupState, "Đang chuẩn bị");
-  setTextIfChanged(backupProgressStage, "Chọn nơi lưu trong cửa sổ Save As của Windows.");
-  setTextIfChanged(backupProgressCount, "CoffeePOS sẽ bắt đầu snapshot sau khi bạn chọn vị trí lưu.");
+  setTextIfChanged(backupState, t("backup.state.preparing"));
+  setTextIfChanged(backupProgressStage, t("backup.select_destination"));
+  setTextIfChanged(backupProgressCount, t("backup.snapshot_after_destination"));
   setTextIfChanged(backupProgressStatus, "");
   backupProgress.max = 1;
   backupProgress.removeAttribute("value");
@@ -1079,7 +1127,7 @@ async function createBackup(): Promise<void> {
     await createPromise;
     const status = await refreshBackupStatus();
     if (status && !status.operation_id && !status.succeeded && !status.failed) {
-      setTextIfChanged(backupState, "Sẵn sàng");
+      setTextIfChanged(backupState, t("common.ready"));
       setTextIfChanged(backupLandingStatus, "");
       selectBackupView("landing");
     }
@@ -1101,13 +1149,13 @@ async function cancelBackup(): Promise<void> {
   const operationId = currentBackupStatus?.operation_id;
   if (!isTauri() || !operationId || !backupIsActive() || backupOperation) return;
   backupOperation = "cancel";
-  setTextIfChanged(backupProgressStatus, "Đang yêu cầu hủy sao lưu…");
+  setTextIfChanged(backupProgressStatus, t("backup.cancelling"));
   syncOperationControls();
   try {
     await invoke<unknown>("cancel_backup", { operationId });
     ensureBackupPolling();
   } catch (error) {
-    setTextIfChanged(backupProgressStatus, backupErrorInfo(error)?.message ?? nativeErrorText(error));
+    setTextIfChanged(backupProgressStatus, localizedErrorCode(backupErrorInfo(error)?.code, "errors.backup_failed"));
   } finally {
     backupOperation = null;
     await refreshBackupStatus();
@@ -1119,13 +1167,13 @@ async function openBackupFolder(): Promise<void> {
   const operationId = currentBackupStatus?.operation_id;
   if (!isTauri() || !operationId || !currentBackupStatus?.succeeded || backupOperation) return;
   backupOperation = "open_folder";
-  setTextIfChanged(backupSuccessStatus, "Đang mở thư mục…");
+  setTextIfChanged(backupSuccessStatus, t("backup.opening_folder"));
   setBackupControls();
   try {
     await invoke<void>("open_backup_folder", { operationId });
-    setTextIfChanged(backupSuccessStatus, "Đã yêu cầu Windows mở thư mục chứa file sao lưu.");
+    setTextIfChanged(backupSuccessStatus, t("backup.opened_folder"));
   } catch (error) {
-    setTextIfChanged(backupSuccessStatus, backupErrorInfo(error)?.message ?? nativeErrorText(error));
+    setTextIfChanged(backupSuccessStatus, localizedErrorCode(backupErrorInfo(error)?.code, "errors.backup_failed"));
   } finally {
     backupOperation = null;
     setBackupControls();
@@ -1136,33 +1184,14 @@ function showBackupPasswordStep(): void {
   if (backupSystemBusy() || currentProvisioning?.state !== "ready" || repairRouteRequired) return;
   clearBackupPasswordFields();
   setTextIfChanged(backupLandingStatus, "");
-  setTextIfChanged(backupState, "Sẵn sàng");
+  setTextIfChanged(backupState, t("common.ready"));
   selectBackupView("password", true);
   setBackupControls();
 }
 
 function restoreStageLabel(stage: string): string {
-  const labels: Record<string, string> = {
-    planned: "Đã lập kế hoạch khôi phục",
-    validated: "Đã kiểm tra bản sao lưu",
-    runtime_stopped: "Đã tạm dừng cửa hàng",
-    recovery_backup_ready: "Đã tạo bản sao an toàn của trạng thái hiện tại",
-    staging_prepared: "Đang chuẩn bị dữ liệu khôi phục",
-    database_imported: "Đã khôi phục cơ sở dữ liệu vào staging",
-    uploads_restored: "Đã khôi phục uploads vào staging",
-    target_secrets_bound: "Đã tạo credential cho Windows profile này",
-    staging_verified: "Đã kiểm tra staging",
-    cutover_started: "Đang chuyển cửa hàng đã kiểm tra sang trạng thái active",
-    active_swapped: "Đang kiểm tra cửa hàng sau khi chuyển dữ liệu",
-    active_verified: "Cửa hàng mới đã vượt qua kiểm tra cuối",
-    committed: "Đã commit khôi phục",
-    cleanup: "Đang dọn dữ liệu tạm an toàn",
-    abort_started: "Đang hủy khôi phục và khôi phục trạng thái trước",
-    rollback_started: "Đang hoàn tác về cửa hàng trước khi khôi phục",
-    rolled_back: "Đã hoàn tác về trạng thái trước",
-    aborted: "Đã hủy khôi phục",
-  };
-  return labels[stage] ?? "CoffeePOS đang xử lý giao dịch khôi phục";
+  const key = `restore.stage.${stage}`;
+  return hasTranslation(key) ? t(key) : t("restore.stage.default");
 }
 
 function restoreCancellationAvailable(status = currentRestoreStatus): boolean {
@@ -1268,37 +1297,37 @@ function renderRestoreInspection(inspection: RestoreInspection): void {
   restoreReviewError.hidden = compatibility.compatible;
   setTextIfChanged(
     restoreReviewError,
-    compatibility.compatible ? "" : "Bản sao lưu này chưa thể được áp dụng trên phiên bản CoffeePOS Desktop hiện tại.",
+    compatibility.compatible ? "" : t("restore.review_incompatible"),
   );
   setTextIfChanged(
     restoreReviewImpact,
     restoreEntrySource === "fresh"
-      ? "Khôi phục sẽ tạo cửa hàng trên Windows profile này từ bản sao lưu đã kiểm tra."
-      : "Khôi phục sẽ thay dữ liệu cửa hàng hiện tại. CoffeePOS sẽ tạo một bản sao an toàn của trạng thái hiện tại trước khi thay.",
+      ? t("restore.impact.fresh")
+      : t("restore.impact.installed"),
   );
-  setTextIfChanged(restoreState, compatibility.compatible ? "Đã kiểm tra" : "Không tương thích");
+  setTextIfChanged(restoreState, compatibility.compatible ? t("restore.state.inspected") : t("restore.state.incompatible"));
   showRestoreScreen("review", true);
   setRestoreControls();
 }
 
 function renderRestoreProgress(status: RestoreStatus): void {
-  setTextIfChanged(restoreState, "Đang khôi phục");
+  setTextIfChanged(restoreState, t("restore.state.restoring"));
   setTextIfChanged(restoreProgressStage, restoreStageLabel(status.stage));
   const afterCutover = restoreCutoverStarted(status);
   const canCancel = restoreCancellationAvailable(status);
   setTextIfChanged(
     restoreProgressDetail,
     afterCutover
-      ? "Dữ liệu đã bước vào giai đoạn chuyển active. Nếu dừng lúc này, CoffeePOS phải hoàn tất rollback có kiểm tra thay vì bỏ dở giao dịch."
-      : "CoffeePOS đang giữ thao tác này trong admission gate để backup, repair, provisioning và runtime action khác không chạy đồng thời.",
+      ? t("restore.after_cutover_detail")
+      : t("restore.before_cutover_detail"),
   );
   setTextIfChanged(
     restoreCloseGuidance,
     afterCutover
-      ? "Không tắt máy trong khi dữ liệu đang được chuyển hoặc hoàn tác. Đóng cửa sổ sẽ đi qua native lifecycle guard."
-      : "Không tắt máy trong khi dữ liệu đang được chuẩn bị. Bạn có thể dùng Hủy khi nút còn khả dụng.",
+      ? t("restore.after_cutover_close")
+      : t("restore.before_cutover_close"),
   );
-  setTextIfChanged(restoreCancel, afterCutover ? "Dừng và hoàn tác" : "Hủy khôi phục");
+  setTextIfChanged(restoreCancel, afterCutover ? t("restore.rollback") : t("restore.cancel"));
   restoreCancel.hidden = !canCancel && !restoreOperation;
   showRestoreScreen("progress");
 }
@@ -1307,8 +1336,8 @@ function restoreStatusError(status: RestoreStatus): { message: string; recovery:
   const error = status.last_error;
   if (!error) {
     return {
-      message: "CoffeePOS chưa thể hoàn tất thao tác khôi phục.",
-      recovery: "Kiểm tra trạng thái hiện tại rồi thử lại khi hệ thống cho phép.",
+      message: t("restore.failure_message"),
+      recovery: t("restore.generic_recovery"),
     };
   }
   return restoreErrorInfo(error);
@@ -1322,46 +1351,46 @@ function renderRestoreStatus(status: RestoreStatus): void {
   const terminal = restoreTerminalKind(status);
   if (terminal === "recovery") {
     const error = restoreStatusError(status);
-    setTextIfChanged(restoreState, "Cần xử lý");
+    setTextIfChanged(restoreState, t("restore.state.action_required"));
     setTextIfChanged(
       restoreRecoveryDetails,
-      [error.message, error.recovery].filter(Boolean).join(" ") || "Native restore recovery đang giữ admission gate để bảo vệ dữ liệu cửa hàng.",
+      [error.message, error.recovery].filter(Boolean).join(" ") || t("restore.recovery_gate"),
     );
     showRestoreScreen("recovery");
   } else if (terminal === "success") {
-    setTextIfChanged(restoreState, "Hoàn tất");
+    setTextIfChanged(restoreState, t("restore.state.done"));
     setTextIfChanged(restoreProgressStatus, "");
     clearRestorePassword();
     showRestoreScreen("success");
   } else if (terminal === "rolled_back") {
     const error = restoreStatusError(status);
-    setTextIfChanged(restoreState, "Đã hoàn tác");
-    setTextIfChanged(restoreFailureTitle, "Không thể khôi phục");
+    setTextIfChanged(restoreState, t("restore.state.rolled_back"));
+    setTextIfChanged(restoreFailureTitle, t("restore.failure_title"));
     setTextIfChanged(
       restoreFailureMessage,
       restoreEntrySource === "fresh"
-        ? "CoffeePOS đã đưa profile về trạng thái chưa cài đặt sau khi khôi phục không hoàn tất."
-        : "CoffeePOS đã đưa cửa hàng về trạng thái trước khi khôi phục.",
+        ? t("restore.rollback_fresh")
+        : t("restore.rollback_installed"),
     );
     setTextIfChanged(restoreFailureRecovery, [error.message, error.recovery].filter(Boolean).join(" "));
     clearRestorePassword();
     showRestoreScreen("failure");
   } else if (terminal === "cancelled") {
-    setTextIfChanged(restoreState, "Đã hủy");
-    setTextIfChanged(restoreFailureTitle, "Đã hủy khôi phục");
+    setTextIfChanged(restoreState, t("common.cancelled"));
+    setTextIfChanged(restoreFailureTitle, t("restore.cancelled_title"));
     setTextIfChanged(
       restoreFailureMessage,
       restoreEntrySource === "fresh"
-        ? "CoffeePOS đã dọn dữ liệu tạm và giữ profile ở trạng thái chưa cài đặt."
-        : "CoffeePOS đã dọn dữ liệu tạm và xác minh lại trạng thái cửa hàng trước đó.",
+        ? t("restore.cancelled_fresh")
+        : t("restore.cancelled_installed"),
     );
     setTextIfChanged(restoreFailureRecovery, "");
     clearRestorePassword();
     showRestoreScreen("failure");
   } else if (terminal === "failed") {
     const error = restoreStatusError(status);
-    setTextIfChanged(restoreState, "Có lỗi");
-    setTextIfChanged(restoreFailureTitle, "Không thể khôi phục");
+    setTextIfChanged(restoreState, t("common.error"));
+    setTextIfChanged(restoreFailureTitle, t("restore.failure_title"));
     setTextIfChanged(restoreFailureMessage, error.message);
     setTextIfChanged(restoreFailureRecovery, error.recovery);
     clearRestorePassword();
@@ -1380,8 +1409,8 @@ function renderRestoreStatus(status: RestoreStatus): void {
 
 function showRestoreFailure(error: unknown): void {
   const safe = restoreErrorInfo(error);
-  setTextIfChanged(restoreState, "Có lỗi");
-  setTextIfChanged(restoreFailureTitle, "Không thể khôi phục");
+  setTextIfChanged(restoreState, t("common.error"));
+  setTextIfChanged(restoreFailureTitle, t("restore.failure_title"));
   setTextIfChanged(restoreFailureMessage, safe.message);
   setTextIfChanged(restoreFailureRecovery, safe.recovery);
   clearRestorePassword();
@@ -1421,7 +1450,7 @@ async function refreshRestoreStatus(moveFocus = false): Promise<RestoreStatus | 
     return status;
   } catch (error) {
     if (restoreIsActive() || restoreOperation === "apply" || restoreOperation === "cancel") {
-      setTextIfChanged(restoreProgressStatus, "Không thể cập nhật tiến độ tạm thời. Native restore transaction vẫn đang giữ trạng thái hiện tại.");
+      setTextIfChanged(restoreProgressStatus, t("restore.progress_update_failed"));
       ensureRestorePolling();
       return currentRestoreStatus;
     }
@@ -1447,7 +1476,7 @@ function beginRestore(source: RestoreEntrySource): void {
   currentRestoreStatus = null;
   clearRestorePassword();
   restoreReviewError.hidden = true;
-  setTextIfChanged(restoreState, "Sẵn sàng");
+  setTextIfChanged(restoreState, t("common.ready"));
   showRestoreScreen("password", true);
   setRestoreControls();
   setBackupControls();
@@ -1460,7 +1489,7 @@ async function inspectRestoreBackup(): Promise<void> {
   restorePassword.removeAttribute("aria-invalid");
   if (password.length === 0) {
     restorePassword.setAttribute("aria-invalid", "true");
-    setTextIfChanged(restorePasswordError, "Nhập mật khẩu của bản sao lưu.");
+    setTextIfChanged(restorePasswordError, t("restore.validation.password_required"));
     restorePasswordError.hidden = false;
     restorePassword.focus();
     return;
@@ -1468,7 +1497,7 @@ async function inspectRestoreBackup(): Promise<void> {
 
   restoreOperation = "inspect";
   currentRestoreInspection = null;
-  setTextIfChanged(restoreState, "Đang kiểm tra");
+  setTextIfChanged(restoreState, t("restore.state.inspecting"));
   setTextIfChanged(restorePasswordError, "");
   setRestoreControls();
   setBackupControls();
@@ -1476,14 +1505,14 @@ async function inspectRestoreBackup(): Promise<void> {
     const inspection = await invoke<RestoreInspection | null>("inspect_restore_backup", { backupPassword: password });
     if (!inspection || !restoreCandidateId(inspection)) {
       clearRestorePassword();
-      setTextIfChanged(restoreState, "Sẵn sàng");
+      setTextIfChanged(restoreState, t("common.ready"));
       return;
     }
     renderRestoreInspection(inspection);
   } catch (error) {
     const safe = restoreErrorInfo(error);
     clearRestorePassword();
-    setTextIfChanged(restoreState, "Không thể kiểm tra");
+    setTextIfChanged(restoreState, t("restore.state.inspect_failed"));
     setTextIfChanged(restorePasswordError, [safe.message, safe.recovery].filter(Boolean).join(" "));
     restorePasswordError.hidden = false;
     showRestoreScreen("password");
@@ -1501,7 +1530,7 @@ async function applyRestore(): Promise<void> {
   let password = restorePassword.value;
   if (password.length === 0) {
     currentRestoreInspection = null;
-    setTextIfChanged(restorePasswordError, "Nhập lại mật khẩu để kiểm tra bản sao lưu trước khi khôi phục.");
+    setTextIfChanged(restorePasswordError, t("restore.validation.password_again"));
     restorePasswordError.hidden = false;
     showRestoreScreen("password", true);
     return;
@@ -1549,8 +1578,8 @@ async function cancelRestore(): Promise<void> {
   setTextIfChanged(
     restoreProgressStatus,
     afterCutover
-      ? "Đã yêu cầu dừng. CoffeePOS đang hoàn tác và xác minh trạng thái trước khi khôi phục…"
-      : "Đã yêu cầu hủy. CoffeePOS đang dọn staging và xác minh trạng thái trước khi khôi phục…",
+      ? t("restore.cancel_requested.after_cutover")
+      : t("restore.cancel_requested.before_cutover"),
   );
   setRestoreControls();
   try {
@@ -1589,7 +1618,7 @@ async function leaveRestoreFlow(openHome = false): Promise<void> {
 }
 
 function structuredErrorText(error: RuntimeErrorInfo): string {
-  return `${error.message}\n${error.recovery}`;
+  return localizedErrorCode(error.code, error.component === "provisioning" ? "errors.provisioning" : "errors.runtime");
 }
 
 function setTextIfChanged(node: HTMLElement, value: string): void {
@@ -1611,37 +1640,37 @@ function healthComponentName(component: HealthComponent): string {
 }
 
 function healthStateLabel(state: ComponentHealthState): string {
-  if (state === "healthy") return "Khỏe";
-  if (state === "unhealthy") return "Có lỗi";
-  if (state === "unknown") return "Chưa xác minh";
-  return "Không hoạt động";
+  if (state === "healthy") return t("common.healthy");
+  if (state === "unhealthy") return t("common.error");
+  if (state === "unknown") return t("common.not_verified");
+  return t("common.unavailable");
 }
 
 function defaultHealthSummary(component: HealthComponent, state: ComponentHealthState, runtimeState: RuntimeInfo["state"]): string {
   const displayName = healthComponentName(component);
   if (state === "healthy") {
-    if (component === "database") return "MariaDB trả lời truy vấn chẩn đoán đã xác thực.";
-    if (component === "php") return "PHP thực thi đúng nonce probe trên HTTP runtime hiện tại.";
-    if (component === "wordpress") return "WordPress trả readiness response hợp lệ.";
-    return `Machine-health đã xác nhận ${displayName} sẵn sàng.`;
+    if (component === "database") return t("diagnostics.healthy.database");
+    if (component === "php") return t("diagnostics.healthy.php");
+    if (component === "wordpress") return t("diagnostics.healthy.wordpress");
+    return t("diagnostics.healthy.generic", { component: displayName });
   }
   if (state === "unavailable") {
     return runtimeState === "running"
-      ? `${displayName} chưa thể được kiểm tra ở trạng thái hiện tại.`
-      : `${displayName} chưa được kiểm tra vì runtime không chạy.`;
+      ? t("diagnostics.unavailable.running", { component: displayName })
+      : t("diagnostics.unavailable.stopped", { component: displayName });
   }
-  if (state === "unknown") return `Chưa đủ bằng chứng để kết luận sức khỏe ${displayName}.`;
-  return `${displayName} chưa vượt qua health check.`;
+  if (state === "unknown") return t("diagnostics.unknown", { component: displayName });
+  return t("diagnostics.unhealthy", { component: displayName });
 }
 
 function defaultHealthRecovery(component: HealthComponent, state: ComponentHealthState, runtimeState: RuntimeInfo["state"]): string {
   if (state === "healthy") return "";
-  if (state === "unavailable" && runtimeState !== "running") return "Khởi động hệ thống rồi kiểm tra lại.";
+  if (state === "unavailable" && runtimeState !== "running") return t("diagnostics.recovery.start");
   if (state === "unknown") {
-    if (component === "woocommerce") return "Xử lý lỗi WordPress/CoffeePOS phía trên rồi chọn Kiểm tra lại.";
-    return "Xử lý dependency đang lỗi rồi chọn Kiểm tra lại.";
+    if (component === "woocommerce") return t("diagnostics.recovery.wordpress");
+    return t("diagnostics.recovery.dependency");
   }
-  return "Chọn Kiểm tra lại. Nếu lỗi lặp lại, dùng Khởi động lại trong Runtime trước khi chuyển sang repair.";
+  return t("diagnostics.recovery.retry");
 }
 
 function renderHealthComponent(component: HealthComponent, info: ComponentHealthInfo, runtimeState: RuntimeInfo["state"]): void {
@@ -1650,9 +1679,9 @@ function renderHealthComponent(component: HealthComponent, info: ComponentHealth
   const recoveryNode = element(`health-${component}-recovery`);
   setTextIfChanged(stateNode, healthStateLabel(info.state));
   stateNode.dataset.healthState = info.state;
-  setTextIfChanged(summaryNode, info.error?.message ?? defaultHealthSummary(component, info.state, runtimeState));
-  const recovery = info.error?.recovery ?? defaultHealthRecovery(component, info.state, runtimeState);
-  setTextIfChanged(recoveryNode, recovery ? `Hướng xử lý: ${recovery}` : "");
+  setTextIfChanged(summaryNode, info.error ? structuredErrorText(info.error) : defaultHealthSummary(component, info.state, runtimeState));
+  const recovery = defaultHealthRecovery(component, info.state, runtimeState);
+  setTextIfChanged(recoveryNode, recovery ? t("diagnostics.recovery_prefix", { recovery }) : "");
 }
 
 function setHealthControls(): void {
@@ -1671,27 +1700,27 @@ function renderHealthDiagnostics(info: HealthDiagnosticsInfo): void {
   for (const component of healthComponents) renderHealthComponent(component, info[component], info.runtime_state);
   const states = healthComponents.map((component) => info[component].state);
   if (states.includes("unhealthy")) {
-    setTextIfChanged(healthSummaryState, "Cần xử lý");
-    setTextIfChanged(healthSummary, "Ít nhất một thành phần đã được xác minh là chưa sẵn sàng. Xem đúng dòng lỗi và hướng xử lý bên dưới.");
+    setTextIfChanged(healthSummaryState, t("diagnostics.state.action_required"));
+    setTextIfChanged(healthSummary, t("diagnostics.summary.unhealthy"));
   } else if (states.includes("unknown")) {
-    setTextIfChanged(healthSummaryState, "Chưa xác minh");
-    setTextIfChanged(healthSummary, "Một số thành phần chưa thể được xác minh; CoffeePOS không suy đoán dependency lỗi khi chưa có bằng chứng.");
+    setTextIfChanged(healthSummaryState, t("common.not_verified"));
+    setTextIfChanged(healthSummary, t("diagnostics.summary.unknown"));
   } else if (states.every((state) => state === "healthy")) {
-    setTextIfChanged(healthSummaryState, "Sẵn sàng");
-    setTextIfChanged(healthSummary, "Database, PHP, WordPress, WooCommerce và CoffeePOS đều vượt qua health check hiện tại.");
+    setTextIfChanged(healthSummaryState, t("common.ready"));
+    setTextIfChanged(healthSummary, t("diagnostics.summary.healthy"));
   } else if (info.runtime_state !== "running") {
-    setTextIfChanged(healthSummaryState, "Đang dừng");
-    setTextIfChanged(healthSummary, "Runtime chưa chạy. Khởi động hệ thống để kiểm tra health đầy đủ.");
+    setTextIfChanged(healthSummaryState, t("overview.state.stopping"));
+    setTextIfChanged(healthSummary, t("diagnostics.summary.stopped"));
   } else {
-    setTextIfChanged(healthSummaryState, "Chưa xác minh");
-    setTextIfChanged(healthSummary, "Health snapshot hiện tại chưa đủ để kết luận tất cả thành phần.");
+    setTextIfChanged(healthSummaryState, t("common.not_verified"));
+    setTextIfChanged(healthSummary, t("diagnostics.summary.incomplete"));
   }
   setHealthControls();
 }
 
 function renderHealthChecking(
-  summaryState = "Đang kiểm tra",
-  summaryText = "Đang kiểm tra lần lượt Database, PHP, WordPress và machine-health của CoffeePOS…",
+  summaryState = t("diagnostics.state.checking"),
+  summaryText = t("diagnostics.summary.checking"),
 ): void {
   currentDiagnostics = null;
   setTextIfChanged(healthSummaryState, summaryState);
@@ -1699,8 +1728,8 @@ function renderHealthChecking(
   for (const component of healthComponents) {
     const stateNode = element(`health-${component}-state`);
     stateNode.dataset.healthState = "checking";
-    setTextIfChanged(stateNode, "Đang kiểm tra");
-    setTextIfChanged(element(`health-${component}-summary`), "Đang chờ kết quả health hiện tại.");
+    setTextIfChanged(stateNode, t("diagnostics.state.checking"));
+    setTextIfChanged(element(`health-${component}-summary`), t("diagnostics.component.waiting"));
     setTextIfChanged(element(`health-${component}-recovery`), "");
   }
   setHealthControls();
@@ -1708,13 +1737,13 @@ function renderHealthChecking(
 
 function renderHealthCommandError(error: unknown): void {
   currentDiagnostics = null;
-  setTextIfChanged(healthSummaryState, "Không thể kiểm tra");
-  setTextIfChanged(healthSummary, nativeErrorText(error));
+  setTextIfChanged(healthSummaryState, t("diagnostics.state.check_failed"));
+  setTextIfChanged(healthSummary, localizedNativeError(error, "errors.health"));
   for (const component of healthComponents) {
     const stateNode = element(`health-${component}-state`);
     stateNode.dataset.healthState = "unknown";
-    setTextIfChanged(stateNode, "Chưa xác minh");
-    setTextIfChanged(element(`health-${component}-summary`), "Snapshot chẩn đoán chưa hoàn tất nên không gán lỗi cho component này.");
+    setTextIfChanged(stateNode, t("common.not_verified"));
+    setTextIfChanged(element(`health-${component}-summary`), t("diagnostics.component.incomplete"));
     setTextIfChanged(element(`health-${component}-recovery`), "");
   }
   setHealthControls();
@@ -1725,15 +1754,15 @@ async function refreshHealthDiagnostics(): Promise<void> {
   diagnosticsBusy = true;
   setRuntimeControls(currentRuntime);
   renderHealthChecking();
-  setTextIfChanged(healthCheckStatus, "Đang chạy health diagnostics…");
+  setTextIfChanged(healthCheckStatus, t("diagnostics.running"));
   try {
     const info = await invoke<HealthDiagnosticsInfo>("get_health_diagnostics");
     renderHealthDiagnostics(info);
-    setTextIfChanged(healthCheckStatus, "Đã kiểm tra sức khỏe các thành phần.");
+    setTextIfChanged(healthCheckStatus, t("diagnostics.checked"));
     await refreshRuntime();
   } catch (error) {
     renderHealthCommandError(error);
-    setTextIfChanged(healthCheckStatus, nativeErrorText(error));
+    setTextIfChanged(healthCheckStatus, localizedNativeError(error, "errors.health"));
   } finally {
     diagnosticsBusy = false;
     setHealthControls();
@@ -1742,9 +1771,9 @@ async function refreshHealthDiagnostics(): Promise<void> {
 }
 
 function repairClassificationLabel(classification: RepairClassification): string {
-  if (classification === "repairable") return "Có thể sửa";
-  if (classification === "requires_input") return "Cần xác nhận";
-  return "Không thể tự sửa";
+  if (classification === "repairable") return t("repair.classification.repairable");
+  if (classification === "requires_input") return t("repair.classification.requires_input");
+  return t("repair.classification.blocked");
 }
 
 function setRepairControls(): void {
@@ -1768,18 +1797,20 @@ function clearRepairPasswordFields(): void {
 
 function resetRepairInspectionState(): void {
   currentRepairPlan = null;
+  currentRepairResult = null;
+  currentRepairResultPlan = null;
   repairList.replaceChildren();
   repairAdminInput.hidden = true;
   clearRepairPasswordFields();
   repairError.textContent = "";
   repairError.hidden = true;
   repairOpenDiagnostics.hidden = true;
-  setTextIfChanged(repairSummaryState, "Chưa kiểm tra");
+  setTextIfChanged(repairSummaryState, t("common.not_checked"));
   setTextIfChanged(
     repairSummary,
-    "Nhấn Kiểm tra để CoffeePOS lập kế hoạch sửa chữa read-only cho trạng thái hiện tại.",
+    t("repair.initial"),
   );
-  setTextIfChanged(repairInspect, "Kiểm tra");
+  setTextIfChanged(repairInspect, t("repair.inspect"));
   setTextIfChanged(repairStatus, "");
 }
 
@@ -1791,7 +1822,8 @@ function renderRepairItems(items: RepairItem[]): void {
     const heading = document.createElement("div");
     heading.className = "repair-row-heading";
     const target = document.createElement("strong");
-    target.textContent = item.target;
+    const targetKey = `repair.item.target.${item.id}`;
+    target.textContent = hasTranslation(targetKey) ? t(targetKey) : t("repair.item.target.unknown", { component: item.component });
     const badge = document.createElement("span");
     badge.className = "state-badge";
     badge.dataset.repairClassification = item.classification;
@@ -1799,13 +1831,13 @@ function renderRepairItems(items: RepairItem[]): void {
     heading.append(target, badge);
     const action = document.createElement("p");
     action.className = "repair-action";
-    action.textContent = item.action;
+    action.textContent = t(`repair.item.action.${item.classification}`);
     const reason = document.createElement("p");
     reason.className = "repair-summary-text";
-    reason.textContent = item.reason;
+    reason.textContent = t(`repair.item.reason.${item.classification}`);
     const impact = document.createElement("p");
     impact.className = "hint";
-    impact.textContent = item.impact;
+    impact.textContent = t(item.requires_runtime_stop ? "repair.item.impact.runtime_stop" : "repair.item.impact.no_runtime_stop");
     article.append(heading, action, reason, impact);
     repairList.append(article);
   }
@@ -1813,7 +1845,9 @@ function renderRepairItems(items: RepairItem[]): void {
 
 function renderRepairPlan(plan: RepairPlan): void {
   currentRepairPlan = plan;
-  setTextIfChanged(repairInspect, "Kiểm tra lại");
+  currentRepairResult = null;
+  currentRepairResultPlan = null;
+  setTextIfChanged(repairInspect, t("repair.inspect_again"));
   repairError.hidden = true;
   repairError.textContent = "";
   repairOpenDiagnostics.hidden = true;
@@ -1827,29 +1861,31 @@ function renderRepairPlan(plan: RepairPlan): void {
   if (!needsAdminPassword) clearRepairPasswordFields();
 
   if (plan.items.length === 0) {
-    setTextIfChanged(repairSummaryState, "Không cần sửa");
-    setTextIfChanged(repairSummary, "CoffeePOS không phát hiện thành phần managed nào cần sửa ở snapshot hiện tại.");
+    setTextIfChanged(repairSummaryState, t("repair.none"));
+    setTextIfChanged(repairSummary, t("repair.none_summary"));
   } else if (repairable + needsInput > 0) {
-    setTextIfChanged(repairSummaryState, "Có thể sửa");
-    const parts = [`${repairable + needsInput} mục có hành động an toàn`];
-    if (blocked > 0) parts.push(`${blocked} mục bị chặn`);
-    setTextIfChanged(repairSummary, `${parts.join(" · ")}. Xem phạm vi và ảnh hưởng của từng mục trước khi sửa.`);
+    setTextIfChanged(repairSummaryState, t("repair.available"));
+    const blockedSuffix = blocked > 0 ? t("repair.blocked_suffix", { count: formatNumber(blocked) }) : "";
+    setTextIfChanged(repairSummary, t("repair.available_summary", {
+      repairable: formatNumber(repairable + needsInput),
+      blocked: blockedSuffix,
+    }));
   } else {
-    setTextIfChanged(repairSummaryState, "Không thể tự sửa");
-    setTextIfChanged(repairSummary, `${blocked} mục cần được giữ nguyên vì CoffeePOS chưa có đủ ownership/authority để sửa tự động.`);
+    setTextIfChanged(repairSummaryState, t("repair.classification.blocked"));
+    setTextIfChanged(repairSummary, t("repair.blocked_summary", { count: formatNumber(blocked) }));
   }
   setRepairControls();
 }
 
 function renderRepairCommandError(error: unknown): void {
   currentRepairPlan = null;
-  setTextIfChanged(repairInspect, "Kiểm tra lại");
-  setTextIfChanged(repairSummaryState, "Không thể kiểm tra");
-  setTextIfChanged(repairSummary, "CoffeePOS chưa tạo được repair plan an toàn cho store hiện tại.");
+  setTextIfChanged(repairInspect, t("repair.inspect_again"));
+  setTextIfChanged(repairSummaryState, t("repair.inspect_failed"));
+  setTextIfChanged(repairSummary, t("repair.inspect_failed_summary"));
   repairList.replaceChildren();
   repairAdminInput.hidden = true;
   clearRepairPasswordFields();
-  repairError.textContent = nativeErrorText(error);
+  repairError.textContent = localizedNativeError(error, "errors.repair");
   repairError.hidden = false;
   setRepairControls();
 }
@@ -1859,9 +1895,9 @@ async function refreshRepairPlan(): Promise<void> {
   if (currentProvisioning?.state !== "ready" && currentProvisioning?.state !== "needs_repair") return;
   repairOperation = "inspect";
   currentRepairPlan = null;
-  setTextIfChanged(repairSummaryState, "Đang kiểm tra");
-  setTextIfChanged(repairSummary, "Đang kiểm tra ownership, pinned artifacts và protected credential state…");
-  setTextIfChanged(repairStatus, "Đang lập repair plan read-only…");
+  setTextIfChanged(repairSummaryState, t("repair.inspecting"));
+  setTextIfChanged(repairSummary, t("repair.inspecting_summary"));
+  setTextIfChanged(repairStatus, t("repair.inspecting_status"));
   repairError.hidden = true;
   repairOpenDiagnostics.hidden = true;
   setRepairControls();
@@ -1869,10 +1905,10 @@ async function refreshRepairPlan(): Promise<void> {
   setHealthControls();
   try {
     renderRepairPlan(await invoke<RepairPlan>("get_repair_plan"));
-    setTextIfChanged(repairStatus, "Repair plan đã được tạo từ trạng thái native hiện tại.");
+    setTextIfChanged(repairStatus, t("repair.plan_ready"));
   } catch (error) {
     renderRepairCommandError(error);
-    setTextIfChanged(repairStatus, nativeErrorText(error));
+    setTextIfChanged(repairStatus, localizedNativeError(error, "errors.repair"));
   } finally {
     repairOperation = null;
     setRepairControls();
@@ -1891,14 +1927,14 @@ function validateRepairAdminPassword(): string | null {
   const count = Array.from(password).length;
   if (count < 12 || count > 128 || /[\u0000-\u001f\u007f]/.test(password)) {
     repairAdminPassword.setAttribute("aria-invalid", "true");
-    repairAdminError.textContent = "Mật khẩu phải có 12–128 ký tự và không chứa ký tự điều khiển.";
+    repairAdminError.textContent = t("repair.password_invalid");
     repairAdminError.hidden = false;
     repairAdminPassword.focus();
     return null;
   }
   if (password !== confirmation) {
     repairAdminPasswordConfirm.setAttribute("aria-invalid", "true");
-    repairAdminError.textContent = "Hai lần nhập mật khẩu chưa khớp.";
+    repairAdminError.textContent = t("repair.password_mismatch");
     repairAdminError.hidden = false;
     repairAdminPasswordConfirm.focus();
     return null;
@@ -1908,25 +1944,35 @@ function validateRepairAdminPassword(): string | null {
 
 function renderRepairResult(result: RepairApplyResult, previousPlan: RepairPlan): void {
   currentRepairPlan = null;
-  setTextIfChanged(repairInspect, "Kiểm tra lại");
+  currentRepairResult = result;
+  currentRepairResultPlan = previousPlan;
+  setTextIfChanged(repairInspect, t("repair.inspect_again"));
   repairList.replaceChildren();
   repairAdminInput.hidden = true;
   clearRepairPasswordFields();
-  const targets = new Map(previousPlan.items.map((item) => [item.id, item.target]));
   for (const item of result.items) {
     const article = document.createElement("article");
     article.className = "repair-row";
     const heading = document.createElement("div");
     heading.className = "repair-row-heading";
     const target = document.createElement("strong");
-    target.textContent = targets.get(item.id) ?? item.id;
+    const targetKey = `repair.item.target.${item.id}`;
+    target.textContent = hasTranslation(targetKey) ? t(targetKey) : t("repair.item.target.unknown", { component: item.id });
     const badge = document.createElement("span");
     badge.className = "state-badge";
-    badge.textContent = item.status === "repaired" ? "Đã sửa" : item.status === "blocked" ? "Bị chặn" : "Chưa xử lý";
+    badge.textContent = item.status === "repaired"
+      ? t("repair.result.repaired")
+      : item.status === "blocked"
+        ? t("repair.result.blocked")
+        : t("repair.result.skipped");
     heading.append(target, badge);
     const messageNode = document.createElement("p");
     messageNode.className = "repair-summary-text";
-    messageNode.textContent = item.message;
+    messageNode.textContent = item.status === "repaired"
+      ? t("repair.item.reason.repairable")
+      : item.status === "blocked"
+        ? t("repair.item.reason.blocked")
+        : t("repair.item.reason.requires_input");
     article.append(heading, messageNode);
     repairList.append(article);
   }
@@ -1934,17 +1980,17 @@ function renderRepairResult(result: RepairApplyResult, previousPlan: RepairPlan)
   repairError.textContent = result.last_error ? structuredErrorText(result.last_error) : "";
   repairOpenDiagnostics.hidden = result.status === "stale";
   if (result.status === "repaired") {
-    setTextIfChanged(repairSummaryState, "Đã sửa xong");
-    setTextIfChanged(repairSummary, "Các mục repairable đã được khôi phục, verifier đạt và runtime đã được trả về trạng thái vận hành trước khi sửa.");
-    setTextIfChanged(repairStatus, "Sửa chữa hoàn tất.");
+    setTextIfChanged(repairSummaryState, t("repair.done"));
+    setTextIfChanged(repairSummary, t("repair.done_summary"));
+    setTextIfChanged(repairStatus, t("repair.done_status"));
   } else if (result.status === "stale") {
-    setTextIfChanged(repairSummaryState, "Cần kiểm tra lại");
-    setTextIfChanged(repairSummary, "Store đã thay đổi sau lần kiểm tra trước. Không có mutation nào được áp dụng từ repair plan cũ.");
-    setTextIfChanged(repairStatus, "Kiểm tra lại để lấy repair plan mới.");
+    setTextIfChanged(repairSummaryState, t("repair.stale"));
+    setTextIfChanged(repairSummary, t("repair.stale_summary"));
+    setTextIfChanged(repairStatus, t("repair.stale_status"));
   } else {
-    setTextIfChanged(repairSummaryState, "Cần xử lý tiếp");
-    setTextIfChanged(repairSummary, "Một phần repair đã hoàn tất hoặc còn mục bị chặn/verifier chưa đạt. Dữ liệu store hiện có được giữ nguyên.");
-    setTextIfChanged(repairStatus, "Xem lỗi và chạy Kiểm tra lại sau khi xử lý nguyên nhân còn lại.");
+    setTextIfChanged(repairSummaryState, t("repair.partial"));
+    setTextIfChanged(repairSummary, t("repair.partial_summary"));
+    setTextIfChanged(repairStatus, t("repair.partial_status"));
   }
   setRepairControls();
 }
@@ -1959,9 +2005,9 @@ async function applyRepair(): Promise<void> {
     if (adminPassword === null) return;
   }
   repairOperation = "apply";
-  setTextIfChanged(repairSummaryState, "Đang sửa chữa");
-  setTextIfChanged(repairSummary, "CoffeePOS đang áp dụng repair plan dưới lifecycle lock và sẽ tự kiểm tra lại trước khi kết luận.");
-  setTextIfChanged(repairStatus, "Đang sửa chữa hệ thống…");
+  setTextIfChanged(repairSummaryState, t("repair.applying"));
+  setTextIfChanged(repairSummary, t("repair.applying_summary"));
+  setTextIfChanged(repairStatus, t("repair.applying_status"));
   repairError.hidden = true;
   setRepairControls();
   setRuntimeControls(currentRuntime);
@@ -1981,12 +2027,12 @@ async function applyRepair(): Promise<void> {
     await refreshRuntime();
   } catch (error) {
     currentRepairPlan = null;
-    setTextIfChanged(repairInspect, "Kiểm tra lại");
-    repairError.textContent = nativeErrorText(error);
+    setTextIfChanged(repairInspect, t("repair.inspect_again"));
+    repairError.textContent = localizedNativeError(error, "errors.repair");
     repairError.hidden = false;
-    setTextIfChanged(repairSummaryState, "Sửa chữa chưa hoàn tất");
-    setTextIfChanged(repairSummary, "Native repair command chưa hoàn tất. Store được giữ theo repair transaction hiện tại; kiểm tra lại trước khi thử tiếp.");
-    setTextIfChanged(repairStatus, nativeErrorText(error));
+    setTextIfChanged(repairSummaryState, t("repair.command_failed"));
+    setTextIfChanged(repairSummary, t("repair.command_failed_summary"));
+    setTextIfChanged(repairStatus, localizedNativeError(error, "errors.repair"));
     await refreshProvisioning();
     await refreshRuntime();
   } finally {
@@ -2003,29 +2049,23 @@ function selectedLogEntry(): LogCatalogEntry | null {
 }
 
 function formatLogBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
-  if (bytes < 1024) return `${Math.round(bytes)} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KiB`;
-  return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MiB`;
+  return formatBytes(bytes);
 }
 
 function formatLogTimestamp(value: number | null): string {
-  if (!value || !Number.isFinite(value)) return "Chưa có dữ liệu";
+  if (!value || !Number.isFinite(value)) return t("logs.no_data");
   const milliseconds = value < 1_000_000_000_000 ? value * 1000 : value;
-  const date = new Date(milliseconds);
-  if (Number.isNaN(date.getTime())) return "Không xác định";
-  return new Intl.DateTimeFormat("vi-VN", {
-    dateStyle: "short",
-    timeStyle: "short",
-  }).format(date);
+  return formatDateTime(milliseconds);
 }
 
-function logErrorMessage(error: unknown, fallback: string): string {
-  if (error && typeof error === "object" && "message" in error) {
-    const message = (error as { message?: unknown }).message;
-    if (typeof message === "string" && message.trim()) return message;
-  }
-  return fallback;
+function logErrorMessage(error: unknown, fallbackKey = "errors.logs"): string {
+  const value = recordValue(error);
+  return localizedErrorCode(value?.code, fallbackKey);
+}
+
+function logLabel(entry: Pick<LogCatalogEntry, "id" | "label">): string {
+  const key = `logs.id.${entry.id}`;
+  return hasTranslation(key) ? t(key) : t("logs.source_unknown", { id: entry.id });
 }
 
 function setLogControls(): void {
@@ -2041,17 +2081,17 @@ function setLogControls(): void {
 
 function renderLogMetadata(entry: LogCatalogEntry | null): void {
   if (!entry) {
-    setTextIfChanged(logCurrentLabel, "Nhật ký");
-    setTextIfChanged(logCurrentMeta, "Chưa có metadata.");
+    setTextIfChanged(logCurrentLabel, t("logs.current"));
+    setTextIfChanged(logCurrentMeta, t("logs.no_metadata"));
     return;
   }
-  setTextIfChanged(logCurrentLabel, entry.label);
+  setTextIfChanged(logCurrentLabel, logLabel(entry));
   const metadata = entry.exists
-    ? `Cập nhật gần nhất: ${formatLogTimestamp(entry.modified_at)} · ${formatLogBytes(entry.size_bytes)}`
-    : "Chưa có file nhật ký cho nguồn này.";
+    ? t("logs.meta", { size: formatLogBytes(entry.size_bytes), time: formatLogTimestamp(entry.modified_at) })
+    : t("logs.meta_missing");
   const flags: string[] = [];
-  if (currentLogTruncated) flags.push("trang hiện tại đã được giới hạn");
-  if (currentLogRedactionCount > 0) flags.push(`đã ẩn ${currentLogRedactionCount} giá trị nhạy cảm`);
+  if (currentLogTruncated) flags.push(t("logs.meta_truncated"));
+  if (currentLogRedactionCount > 0) flags.push(t("logs.meta_redacted", { count: formatNumber(currentLogRedactionCount) }));
   setTextIfChanged(logCurrentMeta, flags.length > 0 ? `${metadata} · ${flags.join(" · ")}` : metadata);
 }
 
@@ -2070,23 +2110,23 @@ function renderLogBody(): void {
   logContent.textContent = hasLines ? currentLogLines.join("\n") : "";
   logEmpty.hidden = hasLines || !!entry?.exists || !entry;
   if (!entry) {
-    setTextIfChanged(logsReadState, "Chưa tải");
+    setTextIfChanged(logsReadState, t("logs.not_loaded"));
   } else if (!entry.exists) {
-    setTextIfChanged(logsReadState, "Chưa có dữ liệu");
+    setTextIfChanged(logsReadState, t("logs.no_data"));
   } else if (hasLines) {
-    setTextIfChanged(logsReadState, currentLogTruncated ? "Đã giới hạn" : "Đã tải");
+    setTextIfChanged(logsReadState, currentLogTruncated ? t("logs.limited") : t("logs.loaded"));
   } else {
-    setTextIfChanged(logsReadState, "Không có dòng");
+    setTextIfChanged(logsReadState, t("logs.no_lines"));
     logEmpty.hidden = false;
   }
   setLogControls();
 }
 
 function showLogReadError(titleText: string, error: unknown, preserveContent: boolean): void {
-  setTextIfChanged(logsReadState, "Không thể đọc");
+  setTextIfChanged(logsReadState, t("logs.read_failed"));
   setTextIfChanged(logReadErrorTitle, titleText);
-  setTextIfChanged(logReadErrorMessage, logErrorMessage(error, "CoffeePOS không thể đọc dữ liệu nhật ký hiện tại."));
-  const technical = nativeErrorText(error);
+  setTextIfChanged(logReadErrorMessage, logErrorMessage(error, "errors.logs"));
+  const technical = rawNativeError(error);
   logReadErrorTechnical.textContent = technical;
   logReadErrorDetails.hidden = technical.length === 0;
   logReadErrorDetails.open = false;
@@ -2111,7 +2151,8 @@ function renderLogCatalog(catalog: LogCatalog): void {
   for (const entry of catalog.logs) {
     const option = document.createElement("option");
     option.value = entry.id;
-    option.textContent = entry.exists ? entry.label : `${entry.label} · chưa có dữ liệu`;
+    const label = logLabel(entry);
+    option.textContent = entry.exists ? label : t("logs.source_missing", { label });
     logSource.append(option);
   }
 
@@ -2133,11 +2174,11 @@ function renderLogCatalog(catalog: LogCatalog): void {
   if (catalog.logs.length === 0) {
     const option = document.createElement("option");
     option.value = "";
-    option.textContent = "Không có nguồn nhật ký";
+    option.textContent = t("logs.source_none");
     logSource.append(option);
-    setTextIfChanged(logSourceStatus, "Native chưa trả về nguồn nhật ký nào trong allowlist.");
+    setTextIfChanged(logSourceStatus, t("logs.source_none"));
   } else {
-    setTextIfChanged(logSourceStatus, `${available}/${catalog.logs.length} nguồn hiện có dữ liệu.`);
+    setTextIfChanged(logSourceStatus, t("logs.source_count", { available: formatNumber(available), total: formatNumber(catalog.logs.length) }));
   }
   clearLogReadError();
   renderLogBody();
@@ -2160,25 +2201,25 @@ async function loadCurrentLogTail(preserveExisting = false): Promise<void> {
 
   logOperation = "read";
   clearLogReadError();
-  setTextIfChanged(logsReadState, preserveExisting && currentLogLines.length > 0 ? "Đang làm mới" : "Đang đọc");
-  setTextIfChanged(logRefreshStatus, preserveExisting && currentLogLines.length > 0 ? "Đang làm mới…" : "Đang đọc…");
+  setTextIfChanged(logsReadState, preserveExisting && currentLogLines.length > 0 ? t("logs.refreshing") : t("logs.reading"));
+  setTextIfChanged(logRefreshStatus, preserveExisting && currentLogLines.length > 0 ? t("logs.refreshing_status") : t("logs.reading_status"));
   if (currentLogLines.length === 0) logEmpty.hidden = true;
   setLogControls();
   const requestedLogId = entry.id;
   try {
     const page = await readLogPage(requestedLogId, null, "tail");
-    if (page.log_id !== requestedLogId) throw new Error("Native trả về trang nhật ký không khớp nguồn đã chọn.");
+    if (page.log_id !== requestedLogId) throw new Error("log_page_source_mismatch");
     const hitViewerLimit = page.lines.length > LOG_VIEW_MAX_LINES;
     currentLogLines = hitViewerLimit ? page.lines.slice(-LOG_VIEW_MAX_LINES) : page.lines;
     currentLogOlderCursor = page.older_cursor;
     currentLogHasOlder = !hitViewerLimit && page.has_older;
     currentLogTruncated = page.truncated || hitViewerLimit;
     currentLogRedactionCount = page.redaction_count;
-    setTextIfChanged(logRefreshStatus, "Đã cập nhật.");
+    setTextIfChanged(logRefreshStatus, t("logs.updated"));
     renderLogBody();
   } catch (error) {
-    showLogReadError(`Không thể đọc nhật ký ${entry.label}`, error, preserveExisting && currentLogLines.length > 0);
-    setTextIfChanged(logRefreshStatus, "Không thể làm mới.");
+    showLogReadError(t("logs.read_failed_source", { label: logLabel(entry) }), error, preserveExisting && currentLogLines.length > 0);
+    setTextIfChanged(logRefreshStatus, t("logs.refresh_failed"));
   } finally {
     logOperation = null;
     setLogControls();
@@ -2189,8 +2230,8 @@ async function refreshLogCatalogAndTail(preserveExisting = true): Promise<void> 
   if (!isTauri() || logOperation || logExportBusy) return;
   logOperation = "catalog";
   clearLogReadError();
-  setTextIfChanged(logsReadState, currentLogLines.length > 0 ? "Đang làm mới" : "Đang tải");
-  setTextIfChanged(logRefreshStatus, currentLogLines.length > 0 ? "Đang làm mới…" : "Đang tải danh sách…");
+  setTextIfChanged(logsReadState, currentLogLines.length > 0 ? t("logs.refreshing") : t("logs.loading"));
+  setTextIfChanged(logRefreshStatus, currentLogLines.length > 0 ? t("logs.refreshing_status") : t("logs.loading_catalog"));
   setLogControls();
   let loadTail = false;
   try {
@@ -2198,9 +2239,9 @@ async function refreshLogCatalogAndTail(preserveExisting = true): Promise<void> 
     renderLogCatalog(catalog);
     loadTail = !!currentLogId;
   } catch (error) {
-    showLogReadError("Không thể tải danh sách nhật ký", error, preserveExisting && currentLogLines.length > 0);
-    setTextIfChanged(logSourceStatus, "Không thể cập nhật danh sách nguồn nhật ký.");
-    setTextIfChanged(logRefreshStatus, "Không thể làm mới.");
+    showLogReadError(t("logs.catalog_read_failed"), error, preserveExisting && currentLogLines.length > 0);
+    setTextIfChanged(logSourceStatus, t("logs.catalog_failed"));
+    setTextIfChanged(logRefreshStatus, t("logs.refresh_failed"));
   } finally {
     logOperation = null;
     setLogControls();
@@ -2214,13 +2255,13 @@ async function loadOlderLogLines(): Promise<void> {
   if (!isTauri() || logOperation || logExportBusy || !entry?.exists || !cursor || !currentLogHasOlder) return;
   logOperation = "older";
   clearLogReadError();
-  setTextIfChanged(logsReadState, "Đang tải thêm");
-  setTextIfChanged(logRefreshStatus, "Đang tải dòng cũ hơn…");
+  setTextIfChanged(logsReadState, t("logs.loading_more"));
+  setTextIfChanged(logRefreshStatus, t("logs.loading_older"));
   setLogControls();
   const requestedLogId = entry.id;
   try {
     const page = await readLogPage(requestedLogId, cursor, "older");
-    if (page.log_id !== requestedLogId) throw new Error("Native trả về trang nhật ký không khớp nguồn đã chọn.");
+    if (page.log_id !== requestedLogId) throw new Error("log_page_source_mismatch");
     const combinedLines = [...page.lines, ...currentLogLines];
     const hitViewerLimit = combinedLines.length > LOG_VIEW_MAX_LINES;
     currentLogLines = hitViewerLimit ? combinedLines.slice(0, LOG_VIEW_MAX_LINES) : combinedLines;
@@ -2231,15 +2272,15 @@ async function loadOlderLogLines(): Promise<void> {
     setTextIfChanged(
       logRefreshStatus,
       hitViewerLimit
-        ? "Đã đạt giới hạn 1.000 dòng hiển thị. Chọn Làm mới để quay về phần mới nhất."
+        ? t("logs.viewer_limit")
         : page.lines.length > 0
-          ? "Đã tải thêm dòng cũ."
-          : "Không còn dòng cũ hơn.",
+          ? t("logs.loaded_older")
+          : t("logs.no_older"),
     );
     renderLogBody();
   } catch (error) {
-    showLogReadError(`Không thể tải dòng cũ của ${entry.label}`, error, true);
-    setTextIfChanged(logRefreshStatus, "Không thể tải thêm.");
+    showLogReadError(t("logs.older_failed_source", { label: logLabel(entry) }), error, true);
+    setTextIfChanged(logRefreshStatus, t("logs.load_more_failed"));
   } finally {
     logOperation = null;
     setLogControls();
@@ -2249,7 +2290,7 @@ async function loadOlderLogLines(): Promise<void> {
 async function exportLogsSupportBundle(): Promise<void> {
   if (!isTauri() || logExportBusy || logOperation) return;
   logExportBusy = true;
-  setTextIfChanged(logExportStatus, "Đang tạo gói hỗ trợ… CoffeePOS đang thu thập nhật ký và loại bỏ thông tin nhạy cảm.");
+  setTextIfChanged(logExportStatus, t("logs.exporting"));
   setLogControls();
   try {
     const result = await exportSupportBundle();
@@ -2257,10 +2298,9 @@ async function exportLogsSupportBundle(): Promise<void> {
       setTextIfChanged(logExportStatus, "");
       return;
     }
-    setTextIfChanged(logExportStatus, "Đã xuất gói hỗ trợ. File đã được lưu tại vị trí bạn chọn.");
+    setTextIfChanged(logExportStatus, t("logs.exported"));
   } catch (error) {
-    const message = logErrorMessage(error, "CoffeePOS chưa thể tạo gói hỗ trợ.");
-    setTextIfChanged(logExportStatus, `Không thể xuất gói hỗ trợ. ${message}`);
+    setTextIfChanged(logExportStatus, logErrorMessage(error, "logs.export_failed"));
   } finally {
     logExportBusy = false;
     setLogControls();
@@ -2279,10 +2319,82 @@ function setHomeAction(
 }
 
 function applyShellInfo(info: ShellInfo): void {
+  currentShellInfo = info;
   element("data-dir").textContent = info.data_dir;
   element("version").textContent = info.version;
   preferredStartupView = info.config.startup_view;
   settingsStartupView.value = preferredStartupView;
+  const configuredLanguage = isAppLanguage(info.config.app_language) ? info.config.app_language : null;
+  persistedLanguage = configuredLanguage;
+  setLocale(configuredLanguage ?? "vi");
+  if (configuredLanguage) languageResolutionPending = false;
+  applyLocaleStaticText(configuredLanguage !== null || !languageResolutionPending);
+}
+
+function rerenderLocalizedState(): void {
+  const focused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  applyLocaleStaticText();
+  if (currentSetupInfo) {
+    passwordHint.textContent = currentSetupInfo.password_configured
+      ? t("onboarding.password_hint_existing")
+      : t("onboarding.password_hint_new");
+  }
+  if (currentProvisioning) renderProvisioning(currentProvisioning);
+  if (currentRuntime) renderRuntime(currentRuntime);
+  if (currentDiagnostics) renderHealthDiagnostics(currentDiagnostics);
+  if (currentRepairPlan) renderRepairPlan(currentRepairPlan);
+  else if (currentRepairResult && currentRepairResultPlan) renderRepairResult(currentRepairResult, currentRepairResultPlan);
+  if (currentLogCatalog) {
+    renderLogCatalog(currentLogCatalog);
+    renderLogBody();
+  }
+  if (currentBackupStatus) renderBackupStatus(currentBackupStatus);
+  if (currentRestoreInspection && currentRestoreView === "review") renderRestoreInspection(currentRestoreInspection);
+  if (currentRestoreStatus) renderRestoreStatus(currentRestoreStatus);
+  renderHome();
+  if (focused?.isConnected) focused.focus({ preventScroll: true });
+}
+
+async function saveLanguage(nextLanguage: AppLanguage, source: "chooser" | "settings"): Promise<void> {
+  if (!isTauri() || languageBusy || nextLanguage === persistedLanguage) {
+    if (nextLanguage === persistedLanguage && source === "settings") settingsAppLanguage.value = nextLanguage;
+    return;
+  }
+  const previousPersisted = persistedLanguage;
+  const previousLocale = getLocale();
+  const startupViewDraft = settingsStartupView.value;
+  languageBusy = true;
+  languageButtons.forEach((button) => { button.disabled = true; });
+  settingsAppLanguage.disabled = true;
+  setTextIfChanged(source === "chooser" ? languageStatus : languageSettingsStatus, "");
+  try {
+    const info = await invoke<ShellInfo>("save_app_language", { appLanguage: nextLanguage });
+    applyShellInfo(info);
+    settingsStartupView.value = startupViewDraft;
+    languageResolutionPending = false;
+    rerenderLocalizedState();
+    if (source === "chooser") {
+      languageChooser.hidden = true;
+      if (currentProvisioning?.state === "not_installed") await refreshSetupInfo();
+      if (currentProvisioning) renderProvisioning(currentProvisioning);
+      if (!backupSystemBusy()) await refreshRuntime();
+    } else {
+      setTextIfChanged(languageSettingsStatus, t("language.saved"));
+    }
+  } catch {
+    persistedLanguage = previousPersisted;
+    setLocale(previousLocale);
+    rerenderLocalizedState();
+    settingsAppLanguage.value = previousLocale;
+    setTextIfChanged(
+      source === "chooser" ? languageStatus : languageSettingsStatus,
+      t("language.save_failed"),
+    );
+  } finally {
+    languageBusy = false;
+    languageButtons.forEach((button) => { button.disabled = false; });
+    settingsAppLanguage.disabled = false;
+  }
 }
 
 function setupHeading(step: SetupStep): HTMLElement {
@@ -2307,8 +2419,8 @@ function applySetupInfo(info: SetupInfo): void {
   adminPassword.required = !info.password_configured;
   adminPasswordConfirm.required = !info.password_configured;
   passwordHint.textContent = info.password_configured
-    ? "Mật khẩu đã được lưu bảo mật. Để trống hai ô mật khẩu để giữ nguyên, hoặc nhập mật khẩu mới trước khi bắt đầu cài đặt."
-    : "Tối thiểu 12 ký tự. Mật khẩu không được lưu trong draft hoặc URL.";
+    ? t("onboarding.password_hint_existing")
+    : t("onboarding.password_hint_new");
   name.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
   adminUsername.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
   adminEmail.disabled = !info.editable || setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy();
@@ -2328,7 +2440,7 @@ async function refreshSetupInfo(): Promise<SetupInfo | null> {
     applySetupInfo(info);
     return info;
   } catch (error) {
-    message.textContent = nativeErrorText(error);
+    message.textContent = localizedNativeError(error, "errors.config");
     message.hidden = false;
     return null;
   }
@@ -2363,28 +2475,28 @@ function validateSetupForm(): boolean {
   const confirmation = adminPasswordConfirm.value;
   const passwordLength = Array.from(password).length;
   if (!storeName || Array.from(storeName).length > 80 || /[\u0000-\u001f\u007f]/.test(storeName)) {
-    return fieldError(name, "Nhập tên cửa hàng từ 1–80 ký tự.");
+    return fieldError(name, t("onboarding.validation.store_length"));
   }
   if (/[<>]/.test(storeName) || /  /.test(storeName) || /%[0-9A-Fa-f]{2}/.test(storeName)) {
-    return fieldError(name, "Tên cửa hàng không được chứa dấu ngoặc HTML, khoảng trắng lặp hoặc chuỗi mã hóa như %20.");
+    return fieldError(name, t("onboarding.validation.store_unsafe"));
   }
   if (!/^[A-Za-z0-9._-]{3,60}$/.test(username)) {
-    return fieldError(adminUsername, "Tên đăng nhập phải có 3–60 ký tự: chữ, số, dấu chấm, gạch dưới hoặc gạch nối.");
+    return fieldError(adminUsername, t("onboarding.validation.username_invalid"));
   }
   const emailPattern = /^[A-Za-z0-9.+_-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/;
   const [emailLocal = ""] = email.split("@");
   if (!adminEmail.checkValidity() || email.length > 100 || emailLocal.length > 64 || emailLocal.startsWith(".") || emailLocal.endsWith(".") || emailLocal.includes("..") || !emailPattern.test(email)) {
-    return fieldError(adminEmail, "Nhập email quản trị hợp lệ.");
+    return fieldError(adminEmail, t("onboarding.validation.email_required"));
   }
   const passwordRequired = !currentSetupInfo?.password_configured;
   if ((passwordRequired || password.length > 0) && (passwordLength < 12 || passwordLength > 128 || /[\u0000-\u001f\u007f]/.test(password))) {
-    return fieldError(adminPassword, "Mật khẩu phải có 12–128 ký tự và không chứa ký tự điều khiển.");
+    return fieldError(adminPassword, t("onboarding.validation.password_invalid"));
   }
   if (confirmation.length > 0 && password.length === 0) {
-    return fieldError(adminPassword, "Nhập mật khẩu mới trước khi nhập lại mật khẩu.");
+    return fieldError(adminPassword, t("onboarding.validation.password_new_required"));
   }
   if ((passwordRequired || password.length > 0) && password !== confirmation) {
-    return fieldError(adminPasswordConfirm, "Hai lần nhập mật khẩu chưa khớp.");
+    return fieldError(adminPasswordConfirm, t("onboarding.validation.password_mismatch"));
   }
   return true;
 }
@@ -2446,12 +2558,23 @@ function showBootstrapError(error: unknown): void {
   setup.hidden = true;
   installedShell.hidden = true;
   bootstrapPanel.hidden = false;
-  title.textContent = "Không thể đọc trạng thái cửa hàng";
-  description.textContent = nativeErrorText(error);
+  languageChooser.hidden = true;
+  if (!document.documentElement.dataset.i18nReady) {
+    setLocale("vi");
+    applyLocaleStaticText();
+  }
+  title.textContent = t("bootstrap.error_title");
+  description.textContent = localizedNativeError(error, "errors.config");
   retry.hidden = false;
 }
 
 function applyInstallationLayout(info: ProvisioningInfo): void {
+  if (languageResolutionPending) {
+    setup.hidden = true;
+    installedShell.hidden = true;
+    return;
+  }
+  languageChooser.hidden = true;
   const repairMode = repairRouteRequired;
   const useInstalledShell = info.state === "ready" || repairMode;
   const enteringInstalledShell = useInstalledShell && installedShell.hidden === true;
@@ -2499,76 +2622,76 @@ function applyInstallationLayout(info: ProvisioningInfo): void {
 function renderHome(): void {
   const payload = currentRuntime?.coffeepos_health.payload;
   const verifiedStoreName = payload?.store.name.trim();
-  homeStoreName.textContent = verifiedStoreName || "Cửa hàng CoffeePOS đã cài đặt";
+  homeStoreName.textContent = verifiedStoreName || t("overview.default_store");
   const posReady = currentRuntime?.state === "running"
     && currentRuntime.wordpress_health === "healthy"
     && currentRuntime.coffeepos_health.state === "healthy";
   if (!posReady && !posOpenBusy) setTextIfChanged(homeOpenStatus, "");
   if (repairRouteRequired) {
-    setTextIfChanged(homeState, "Cần sửa chữa");
-    setTextIfChanged(homeStatus, "Cửa hàng cần được kiểm tra an toàn");
-    setTextIfChanged(homeDetail, "Mở Hệ thống → Sửa chữa để xem repair plan. CoffeePOS sẽ giữ nguyên dữ liệu khi ownership hoặc authority chưa đủ.");
-    setTextIfChanged(homeDiagnostics, "Mở Sửa chữa");
+    setTextIfChanged(homeState, t("overview.state.needs_repair"));
+    setTextIfChanged(homeStatus, t("overview.repair_status"));
+    setTextIfChanged(homeDetail, t("overview.repair_detail"));
+    setTextIfChanged(homeDiagnostics, t("overview.open_repair"));
     setHomeAction(null);
     return;
   }
   if (restoreSystemBusy()) {
-    setTextIfChanged(homeState, restoreNeedsRecovery() ? "Cần xử lý" : "Đang khôi phục");
-    setTextIfChanged(homeStatus, restoreNeedsRecovery() ? "Khôi phục cần được kiểm tra" : "CoffeePOS đang khôi phục cửa hàng");
+    setTextIfChanged(homeState, restoreNeedsRecovery() ? t("overview.state.action_required") : t("overview.state.restoring"));
+    setTextIfChanged(homeStatus, restoreNeedsRecovery() ? t("overview.restore_recovery_status") : t("overview.restore_active_status"));
     setTextIfChanged(
       homeDetail,
       restoreNeedsRecovery()
-        ? "CoffeePOS đang giữ admission gate để bảo vệ dữ liệu phục hồi. Mở luồng khôi phục để xem trạng thái."
-        : "POS và các thao tác thay đổi hệ thống tạm khóa trong khi restore transaction đang hoạt động.",
+        ? t("overview.restore_recovery_detail")
+        : t("overview.restore_active_detail"),
     );
-    setTextIfChanged(homeDiagnostics, "Mở khôi phục");
+    setTextIfChanged(homeDiagnostics, t("overview.open_restore"));
     setHomeAction(null);
     return;
   }
   if (backupOperation === "create" || backupOperation === "cancel" || backupIsActive()) {
-    setTextIfChanged(homeState, "Đang sao lưu");
-    setTextIfChanged(homeStatus, "CoffeePOS đang sao lưu cửa hàng");
-    setTextIfChanged(homeDetail, "POS tạm dừng trong khi CoffeePOS tạo snapshot nhất quán. Mở Sao lưu và khôi phục để xem tiến độ.");
-    setTextIfChanged(homeDiagnostics, "Mở Sao lưu");
+    setTextIfChanged(homeState, t("overview.state.backing_up"));
+    setTextIfChanged(homeStatus, t("overview.backup_status"));
+    setTextIfChanged(homeDetail, t("overview.backup_detail"));
+    setTextIfChanged(homeDiagnostics, t("overview.open_backup"));
     setHomeAction(null);
     return;
   }
-  setTextIfChanged(homeDiagnostics, "Mở Hệ thống");
+  setTextIfChanged(homeDiagnostics, t("overview.open_system"));
 
   if (runtimeTransition === "starting") {
-    setTextIfChanged(homeState, "Đang khởi động");
-    setTextIfChanged(homeStatus, "Đang khởi động cửa hàng…");
-    setTextIfChanged(homeDetail, "CoffeePOS đang chuẩn bị hệ thống và kiểm tra cửa hàng trước khi báo sẵn sàng.");
-    setHomeAction("start", "Đang khởi động…", true);
+    setTextIfChanged(homeState, t("overview.state.starting"));
+    setTextIfChanged(homeStatus, t("overview.starting_status"));
+    setTextIfChanged(homeDetail, t("overview.starting_detail"));
+    setHomeAction("start", t("overview.action.starting"), true);
     return;
   }
 
   if (runtimeTransition === "stopping") {
-    setTextIfChanged(homeState, "Đang dừng");
-    setTextIfChanged(homeStatus, "Đang dừng hệ thống…");
-    setTextIfChanged(homeDetail, "Vui lòng chờ thao tác hiện tại hoàn tất.");
-    setHomeAction("start", "Đang dừng…", true);
+    setTextIfChanged(homeState, t("overview.state.stopping"));
+    setTextIfChanged(homeStatus, t("overview.stopping_status"));
+    setTextIfChanged(homeDetail, t("overview.wait_detail"));
+    setHomeAction("start", t("overview.action.stopping"), true);
     return;
   }
 
   if (runtimeTransition === "checking") {
-    setTextIfChanged(homeState, "Đang kiểm tra");
-    setTextIfChanged(homeStatus, "Đang kiểm tra lại cửa hàng…");
-    setTextIfChanged(homeDetail, "CoffeePOS đang kiểm tra lại trạng thái sử dụng hiện tại.");
-    setHomeAction("retry_health", "Đang kiểm tra…", true);
+    setTextIfChanged(homeState, t("overview.state.checking"));
+    setTextIfChanged(homeStatus, t("overview.checking_status"));
+    setTextIfChanged(homeDetail, t("overview.checking_detail"));
+    setHomeAction("retry_health", t("overview.action.checking"), true);
     return;
   }
 
   if (!currentRuntime) {
     if (runtimeLoadError) {
-      setTextIfChanged(homeState, "Có lỗi");
-      setTextIfChanged(homeStatus, "Không thể đọc trạng thái cửa hàng");
-      setTextIfChanged(homeDetail, "Thử đọc lại trạng thái hoặc mở Hệ thống để xem chi tiết.");
-      setHomeAction("refresh", "Thử lại");
+      setTextIfChanged(homeState, t("common.error"));
+      setTextIfChanged(homeStatus, t("overview.read_failed_status"));
+      setTextIfChanged(homeDetail, t("overview.read_failed_detail"));
+      setHomeAction("refresh", t("common.retry"));
     } else {
-      setTextIfChanged(homeState, "Đang kiểm tra");
-      setTextIfChanged(homeStatus, "Đang đọc trạng thái hệ thống…");
-      setTextIfChanged(homeDetail, "CoffeePOS đang đọc trạng thái cửa hàng trên máy này.");
+      setTextIfChanged(homeState, t("overview.state.checking"));
+      setTextIfChanged(homeStatus, t("overview.reading_status"));
+      setTextIfChanged(homeDetail, t("overview.reading_detail"));
       setHomeAction(null);
     }
     return;
@@ -2576,86 +2699,86 @@ function renderHome(): void {
 
   if (currentRuntime.state === "stopped") {
     if (currentRuntime.last_error) {
-      setTextIfChanged(homeState, "Có lỗi");
-      setTextIfChanged(homeStatus, "Không thể khởi động hệ thống");
-      setTextIfChanged(homeDetail, "Lần khởi động gần nhất chưa hoàn tất. Bạn có thể thử lại hoặc xem chi tiết trong Hệ thống.");
-      setHomeAction("start", "Thử lại");
+      setTextIfChanged(homeState, t("common.error"));
+      setTextIfChanged(homeStatus, t("overview.start_failed_status"));
+      setTextIfChanged(homeDetail, t("overview.start_failed_detail"));
+      setHomeAction("start", t("common.retry"));
     } else {
-      setTextIfChanged(homeState, "Đã cài đặt");
-      setTextIfChanged(homeStatus, "Hệ thống đang dừng");
-      setTextIfChanged(homeDetail, "Cửa hàng đã được cài đặt và chưa chạy trên máy này.");
-      setHomeAction("start", "Khởi động");
+      setTextIfChanged(homeState, t("overview.state.installed"));
+      setTextIfChanged(homeStatus, t("overview.stopped_status"));
+      setTextIfChanged(homeDetail, t("overview.stopped_detail"));
+      setHomeAction("start", t("overview.action.start"));
     }
     return;
   }
 
   if (currentRuntime.state === "starting" || currentRuntime.state === "installing") {
-    setTextIfChanged(homeState, "Đang khởi động");
-    setTextIfChanged(homeStatus, "Đang khởi động cửa hàng…");
-    setTextIfChanged(homeDetail, "CoffeePOS đang chuẩn bị hệ thống và kiểm tra cửa hàng trước khi báo sẵn sàng.");
-    setHomeAction("start", "Đang khởi động…", true);
+    setTextIfChanged(homeState, t("overview.state.starting"));
+    setTextIfChanged(homeStatus, t("overview.starting_status"));
+    setTextIfChanged(homeDetail, t("overview.starting_detail"));
+    setHomeAction("start", t("overview.action.starting"), true);
     return;
   }
 
   if (currentRuntime.state === "stopping") {
-    setTextIfChanged(homeState, "Đang dừng");
-    setTextIfChanged(homeStatus, "Đang dừng hệ thống…");
-    setTextIfChanged(homeDetail, "Vui lòng chờ thao tác hiện tại hoàn tất.");
-    setHomeAction("start", "Đang dừng…", true);
+    setTextIfChanged(homeState, t("overview.state.stopping"));
+    setTextIfChanged(homeStatus, t("overview.stopping_status"));
+    setTextIfChanged(homeDetail, t("overview.wait_detail"));
+    setHomeAction("start", t("overview.action.stopping"), true);
     return;
   }
 
   if (currentRuntime.state !== "running") {
-    setTextIfChanged(homeState, "Có lỗi");
-    setTextIfChanged(homeStatus, "Hệ thống chưa sẵn sàng");
-    setTextIfChanged(homeDetail, "Mở Hệ thống để xem chi tiết trạng thái hiện tại.");
+    setTextIfChanged(homeState, t("common.error"));
+    setTextIfChanged(homeStatus, t("overview.not_ready_status"));
+    setTextIfChanged(homeDetail, t("overview.not_ready_detail"));
     setHomeAction(null);
     return;
   }
 
   if (currentRuntime.wordpress_health === "checking") {
-    setTextIfChanged(homeState, "Đang kiểm tra");
-    setTextIfChanged(homeStatus, "Đang kiểm tra cửa hàng…");
-    setTextIfChanged(homeDetail, "Hệ thống đã chạy và đang hoàn tất kiểm tra sẵn sàng.");
+    setTextIfChanged(homeState, t("overview.state.checking"));
+    setTextIfChanged(homeStatus, t("overview.health_check_status"));
+    setTextIfChanged(homeDetail, t("overview.health_check_detail"));
     setHomeAction(null);
     return;
   }
 
   if (currentRuntime.wordpress_health !== "healthy") {
-    setTextIfChanged(homeState, "Có lỗi");
-    setTextIfChanged(homeStatus, "Cửa hàng chưa sẵn sàng");
-    setTextIfChanged(homeDetail, "Hệ thống đang chạy nhưng kiểm tra cửa hàng chưa đạt. Bạn có thể thử lại mà không cần cài đặt lại.");
-    setHomeAction("retry_health", "Thử lại");
+    setTextIfChanged(homeState, t("common.error"));
+    setTextIfChanged(homeStatus, t("overview.store_not_ready"));
+    setTextIfChanged(homeDetail, t("overview.store_not_ready_detail"));
+    setHomeAction("retry_health", t("common.retry"));
     return;
   }
 
   if (currentRuntime.coffeepos_health.state === "healthy") {
-    setTextIfChanged(homeState, "Sẵn sàng");
-    setTextIfChanged(homeStatus, "Hệ thống đã sẵn sàng");
-    setTextIfChanged(homeDetail, "Cửa hàng đang chạy. Mở POS trong trình duyệt và đăng nhập nếu được yêu cầu.");
-    setHomeAction("open_pos", posOpenBusy ? "Đang mở…" : "Mở bán hàng", posOpenBusy);
+    setTextIfChanged(homeState, t("common.ready"));
+    setTextIfChanged(homeStatus, t("overview.ready_status"));
+    setTextIfChanged(homeDetail, t("overview.ready_detail"));
+    setHomeAction("open_pos", posOpenBusy ? t("overview.action.opening") : t("overview.action.open_pos"), posOpenBusy);
     return;
   }
 
   if (currentRuntime.coffeepos_health.state === "degraded") {
-    setTextIfChanged(homeState, "Cần kiểm tra");
-    setTextIfChanged(homeStatus, "Cửa hàng chưa sẵn sàng");
-    setTextIfChanged(homeDetail, "Một thành phần của cửa hàng chưa sẵn sàng. Thử kiểm tra lại hoặc xem chi tiết trong Hệ thống.");
-    setHomeAction("retry_health", "Thử lại");
+    setTextIfChanged(homeState, t("overview.state.needs_check"));
+    setTextIfChanged(homeStatus, t("overview.store_not_ready"));
+    setTextIfChanged(homeDetail, t("overview.degraded_detail"));
+    setHomeAction("retry_health", t("common.retry"));
     return;
   }
 
   if (currentRuntime.coffeepos_health.state === "failed") {
-    setTextIfChanged(homeState, "Có lỗi");
-    setTextIfChanged(homeStatus, "Không thể kiểm tra cửa hàng");
-    setTextIfChanged(homeDetail, "Kiểm tra ứng dụng chưa hoàn tất. Bạn có thể thử lại mà không cần cài đặt lại.");
-    setHomeAction("retry_health", "Thử lại");
+    setTextIfChanged(homeState, t("common.error"));
+    setTextIfChanged(homeStatus, t("overview.check_failed_status"));
+    setTextIfChanged(homeDetail, t("overview.check_failed_detail"));
+    setHomeAction("retry_health", t("common.retry"));
     return;
   }
 
-  setTextIfChanged(homeState, "Đang kiểm tra");
-  setTextIfChanged(homeStatus, "Đang kiểm tra cửa hàng…");
-  setTextIfChanged(homeDetail, "Hệ thống đang chạy và đang hoàn tất kiểm tra sẵn sàng.");
+  setTextIfChanged(homeState, t("overview.state.checking"));
+  setTextIfChanged(homeStatus, t("overview.health_check_status"));
+  setTextIfChanged(homeDetail, t("overview.health_check_detail"));
   setHomeAction(null);
 }
 
@@ -2685,57 +2808,66 @@ function setRuntimeControls(info: RuntimeInfo | null): void {
 
 function renderRuntime(info: RuntimeInfo): void {
   currentRuntime = info;
-  element("runtime-state").textContent = info.state;
+  element("runtime-state").textContent = t(`runtime.state.${info.state}`);
   element("runtime-php").textContent = info.php_version ?? "—";
   element("runtime-mariadb").textContent = info.mariadb_version ?? "—";
   element("runtime-http").textContent = info.http_port ? `127.0.0.1:${info.http_port}` : "—";
   element("runtime-database").textContent = info.database_port ? `127.0.0.1:${info.database_port}` : "—";
-  wordpressHealth.textContent = info.wordpress_health;
+  wordpressHealth.textContent = t(`runtime.health.${info.wordpress_health}`);
   setHiddenIfChanged(wordpressHealthError, !info.wordpress_error);
   setTextIfChanged(wordpressHealthError, info.wordpress_error ? structuredErrorText(info.wordpress_error) : "");
-  coffeeposHealth.textContent = info.coffeepos_health.state;
+  coffeeposHealth.textContent = t(`runtime.health.${info.coffeepos_health.state}`);
   setHiddenIfChanged(coffeeposHealthError, !info.coffeepos_health.error);
   setTextIfChanged(
     coffeeposHealthError,
-    info.coffeepos_health.error
-      ? `${info.coffeepos_health.failure_kind ? `${info.coffeepos_health.failure_kind}: ` : ""}${structuredErrorText(info.coffeepos_health.error)}`
-      : "",
+    info.coffeepos_health.error ? structuredErrorText(info.coffeepos_health.error) : "",
   );
   const appHealth = info.coffeepos_health.payload;
   coffeeposHealthDetails.textContent = appHealth
-    ? `${appHealth.store.name} · WP ${appHealth.versions.wordpress} [${appHealth.wordpress ? "ready" : "not ready"}] · Woo ${appHealth.versions.woocommerce} [${appHealth.woocommerce ? "ready" : "not ready"}] · CoffeePOS ${appHealth.versions.coffeepos} [${appHealth.coffeepos ? "ready" : "not ready"}] · schema ${appHealth.versions.coffeepos_schema} · DB ${appHealth.database ? "ready" : "not ready"} · POS ${appHealth.pos_path}`
+    ? t("runtime.health_details", {
+      store: appHealth.store.name,
+      wordpressVersion: appHealth.versions.wordpress,
+      wordpressState: t(appHealth.wordpress ? "common.ready_lower" : "common.not_ready_lower"),
+      woocommerceVersion: appHealth.versions.woocommerce,
+      woocommerceState: t(appHealth.woocommerce ? "common.ready_lower" : "common.not_ready_lower"),
+      coffeeposVersion: appHealth.versions.coffeepos,
+      coffeeposState: t(appHealth.coffeepos ? "common.ready_lower" : "common.not_ready_lower"),
+      schema: appHealth.versions.coffeepos_schema,
+      databaseState: t(appHealth.database ? "common.ready_lower" : "common.not_ready_lower"),
+      posPath: appHealth.pos_path,
+    })
     : "";
   setRuntimeControls(info);
   setHealthControls();
 
   if (provisioningBusy) {
-    setTextIfChanged(runtimeDescription, "Runtime controls tạm khóa trong khi CoffeePOS đang được provision.");
+    setTextIfChanged(runtimeDescription, t("runtime.description.provisioning"));
   } else if (runtimeBusy) {
-    setTextIfChanged(runtimeDescription, "Đang cập nhật runtime…");
+    setTextIfChanged(runtimeDescription, t("runtime.description.updating"));
   } else if (info.last_error) {
-    setTextIfChanged(runtimeDescription, `${info.last_error.message} ${info.last_error.recovery}`);
+    setTextIfChanged(runtimeDescription, structuredErrorText(info.last_error));
   } else if (info.state === "not_installed") {
-    setTextIfChanged(runtimeDescription, "Runtime bundle đã sẵn sàng; WordPress/database chưa được provision.");
+    setTextIfChanged(runtimeDescription, t("runtime.description.not_installed"));
   } else if (info.state === "running") {
     if (info.wordpress_health === "healthy") {
       if (info.coffeepos_health.state === "healthy") {
-        setTextIfChanged(runtimeDescription, "MariaDB, PHP, WordPress và CoffeePOS application health đều healthy.");
+        setTextIfChanged(runtimeDescription, t("runtime.description.healthy"));
       } else if (info.coffeepos_health.state === "degraded") {
-        setTextIfChanged(runtimeDescription, "Runtime và WordPress đang chạy, nhưng CoffeePOS báo dependency/application state degraded.");
+        setTextIfChanged(runtimeDescription, t("runtime.description.degraded"));
       } else if (info.coffeepos_health.state === "failed") {
-        setTextIfChanged(runtimeDescription, "WordPress đang healthy nhưng CoffeePOS machine-health probe thất bại. Xem phân loại lỗi bên dưới.");
+        setTextIfChanged(runtimeDescription, t("runtime.description.failed"));
       } else {
-        setTextIfChanged(runtimeDescription, "MariaDB, PHP và WordPress đã vượt qua readiness checks; CoffeePOS application health chưa được xác minh.");
+        setTextIfChanged(runtimeDescription, t("runtime.description.pending_app"));
       }
     } else if (info.wordpress_health === "unhealthy") {
-      setTextIfChanged(runtimeDescription, "MariaDB và PHP đang chạy, nhưng WordPress chưa healthy. Có thể khởi động lại runtime để thử lại; không cần cài lại WordPress.");
+      setTextIfChanged(runtimeDescription, t("runtime.description.wordpress_unhealthy"));
     } else {
-      setTextIfChanged(runtimeDescription, "MariaDB và PHP đang chạy; đang xác minh WordPress.");
+      setTextIfChanged(runtimeDescription, t("runtime.description.wordpress_checking"));
     }
   } else if (info.state === "stopped") {
-      setTextIfChanged(runtimeDescription, "Runtime đang dừng. Có thể khởi động lại từ Hệ thống khi cần.");
+      setTextIfChanged(runtimeDescription, t("runtime.description.stopped"));
   } else {
-    setTextIfChanged(runtimeDescription, "Runtime manager đã sẵn sàng.");
+    setTextIfChanged(runtimeDescription, t("runtime.description.ready"));
   }
 
   renderHome();
@@ -2753,13 +2885,19 @@ function renderProvisioning(info: ProvisioningInfo, commandError?: string): void
   currentProvisioning = info;
   provisioningAction = "provision";
   setup.setAttribute("aria-busy", provisioningBusy ? "true" : "false");
-  provisioningState.textContent = info.state;
+  provisioningState.textContent = info.state === "not_installed"
+    ? t("runtime.state.not_installed")
+    : info.state === "installing"
+      ? t("runtime.state.installing")
+      : info.state === "ready"
+        ? t("common.ready")
+        : t("overview.state.needs_repair");
   provisioningWordPress.textContent = info.wordpress_version || "—";
   provisioningWooCommerce.textContent = info.woocommerce_version
-    ? `${info.woocommerce_version} · ${info.woocommerce_active ? "active" : "not active"}`
+    ? `${info.woocommerce_version} · ${t(info.woocommerce_active ? "common.active" : "common.inactive")}`
     : "—";
   provisioningCoffeePos.textContent = info.coffeepos_version
-    ? `${info.coffeepos_version} · ${info.coffeepos_active ? "active" : "not active"}`
+    ? `${info.coffeepos_version} · ${t(info.coffeepos_active ? "common.active" : "common.inactive")}`
     : "—";
   provisioningAdmin.textContent = info.admin_username ?? "—";
   settingsAdminUsername.textContent = info.admin_username ?? "—";
@@ -2777,27 +2915,27 @@ function renderProvisioning(info: ProvisioningInfo, commandError?: string): void
   }
 
   if (provisioningBusy || info.state === "installing") {
-    provisioningState.textContent = "installing";
-    provisioningStatus.textContent = "Đang đảm bảo database, WordPress, WooCommerce và CoffeePOS. Nếu app bị đóng ngoài ý muốn, lần mở lại sẽ đọc provisioning journal và tiếp tục từ mốc an toàn.";
-    setupRetry.textContent = "Đang cài đặt…";
+    provisioningState.textContent = t("runtime.state.installing");
+    provisioningStatus.textContent = t("onboarding.installing_long");
+    setupRetry.textContent = t("onboarding.installing_button");
     setupRetry.hidden = false;
     setupRetry.disabled = true;
   } else if (info.state === "not_installed") {
-    provisioningStatus.textContent = "Cửa hàng chưa được thiết lập trên máy này.";
+    provisioningStatus.textContent = t("onboarding.not_installed");
     setupRetry.hidden = true;
     provisionWordPress.disabled = setupProfileBusy || provisioningBusy || runtimeBusy || restoreSystemBusy() || !currentSetupInfo?.password_configured;
   } else if (info.state === "ready") {
-    provisioningStatus.textContent = "CoffeePOS đã được cài đặt và activation baseline đã hoàn tất.";
+    provisioningStatus.textContent = t("onboarding.ready");
     setupRetry.hidden = true;
   } else if (info.can_retry) {
-    provisioningStatus.textContent = "Thiết lập chưa hoàn tất. Có thể tiếp tục từ checkpoint an toàn mà không xóa dữ liệu hiện có.";
-    setupRetry.textContent = "Tiếp tục thiết lập";
+    provisioningStatus.textContent = t("onboarding.retryable");
+    setupRetry.textContent = t("onboarding.continue_setup");
     setupRetry.hidden = false;
     setupRetry.disabled = runtimeBusy || provisioningBusy;
     provisioningAction = "provision";
   } else {
-    provisioningStatus.textContent = "Cửa hàng cần được kiểm tra trước khi setup có thể tiếp tục an toàn. Dữ liệu hiện có được giữ nguyên.";
-    setupRetry.textContent = "Kiểm tra lại trạng thái";
+    provisioningStatus.textContent = t("onboarding.needs_repair");
+    setupRetry.textContent = t("restore.refresh_recovery");
     setupRetry.hidden = false;
     setupRetry.disabled = runtimeBusy || provisioningBusy;
     provisioningAction = "refresh";
@@ -2847,7 +2985,7 @@ async function refreshRuntime(): Promise<void> {
     renderRuntime(await invoke<RuntimeInfo>("get_runtime_info"));
   } catch (error) {
     currentRuntime = null;
-    runtimeLoadError = nativeErrorText(error);
+    runtimeLoadError = localizedNativeError(error, "errors.runtime");
     setTextIfChanged(runtimeDescription, runtimeLoadError);
     setRuntimeControls(null);
     renderHome();
@@ -2891,7 +3029,7 @@ async function provision(): Promise<void> {
   try {
     result = await invoke<ProvisioningInfo>("provision_wordpress");
   } catch (error) {
-    failure = nativeErrorText(error);
+    failure = localizedNativeError(error, "errors.provisioning");
   } finally {
     provisioningBusy = false;
   }
@@ -2900,7 +3038,7 @@ async function provision(): Promise<void> {
     completionPending = result.state === "ready";
     await renderProvisioningWithRepairRouting(result);
   } else {
-    await refreshProvisioning(failure ?? "Provisioning thất bại nhưng native layer không trả chi tiết lỗi.");
+    await refreshProvisioning(failure ?? t("errors.provisioning"));
   }
   await refreshRuntime();
 }
@@ -2908,12 +3046,12 @@ async function provision(): Promise<void> {
 async function copyAdminPassword(status: HTMLElement, button: HTMLButtonElement): Promise<void> {
   if (provisioningBusy || runtimeBusy || repairOperation || backupSystemBusy()) return;
   button.disabled = true;
-  setTextIfChanged(status, "Đang sao chép…");
+  setTextIfChanged(status, t("settings.copying"));
   try {
     await invoke<void>("copy_admin_password");
-    setTextIfChanged(status, "Đã sao chép mật khẩu vào clipboard Windows.");
+    setTextIfChanged(status, t("settings.copied"));
   } catch (error) {
-    setTextIfChanged(status, nativeErrorText(error));
+    setTextIfChanged(status, localizedNativeError(error, "errors.config"));
   } finally {
     button.disabled = false;
   }
@@ -2925,11 +3063,11 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
   runtimeTransition = command === "stop_runtime" ? "stopping" : command === "retry_runtime_health" ? "checking" : "starting";
   if (currentProvisioning) renderProvisioning(currentProvisioning);
   setRuntimeControls(null);
-  if (command !== "retry_runtime_health") element("runtime-state").textContent = runtimeTransition;
-  wordpressHealth.textContent = "unavailable";
+  if (command !== "retry_runtime_health") element("runtime-state").textContent = t(`runtime.state.${runtimeTransition}`);
+  wordpressHealth.textContent = t("runtime.health.unavailable");
   setHiddenIfChanged(wordpressHealthError, true);
   setTextIfChanged(wordpressHealthError, "");
-  coffeeposHealth.textContent = "unavailable";
+  coffeeposHealth.textContent = t("runtime.health.unavailable");
   setHiddenIfChanged(coffeeposHealthError, true);
   setTextIfChanged(coffeeposHealthError, "");
   coffeeposHealthDetails.textContent = "";
@@ -2937,24 +3075,24 @@ async function runtimeAction(command: "start_runtime" | "stop_runtime" | "restar
   homeOpenStatus.textContent = "";
   if (currentView === "diagnostics") {
     if (command === "stop_runtime") {
-      renderHealthChecking("Đang dừng", "Runtime đang dừng; kết quả health cũ đã được loại khỏi màn hình.");
+      renderHealthChecking(t("runtime.health_stale.stop_title"), t("runtime.health_stale.stop"));
     } else if (command === "restart_runtime") {
-      renderHealthChecking("Đang khởi động lại", "Runtime đang khởi động lại; health sẽ được kiểm tra trên process mới.");
+      renderHealthChecking(t("runtime.health_stale.restart_title"), t("runtime.health_stale.restart"));
     } else {
       renderHealthChecking();
     }
   }
   runtimeDescription.textContent = command === "stop_runtime"
-    ? "Đang dừng PHP và MariaDB…"
+    ? t("runtime.transition.stop")
     : command === "retry_runtime_health"
-      ? "Đang kiểm tra lại WordPress và CoffeePOS health…"
-      : "Đang khởi động runtime và kiểm tra WordPress…";
+      ? t("runtime.transition.health")
+      : t("runtime.transition.start");
   renderHome();
 
   try {
     renderRuntime(await invoke<RuntimeInfo>(command));
   } catch (error) {
-    runtimeDescription.textContent = nativeErrorText(error);
+    runtimeDescription.textContent = localizedNativeError(error, "errors.runtime");
     await refreshRuntime();
   } finally {
     runtimeBusy = false;
@@ -2984,13 +3122,13 @@ async function saveAppSettings(): Promise<void> {
   if (settingsBusy || backupSystemBusy()) return;
   settingsBusy = true;
   settingsSave.disabled = true;
-  setTextIfChanged(settingsSaveStatus, "Đang lưu…");
+  setTextIfChanged(settingsSaveStatus, t("settings.saving"));
   try {
     const info = await invoke<ShellInfo>("save_app_settings", { startupView: settingsStartupView.value });
     applyShellInfo(info);
-    setTextIfChanged(settingsSaveStatus, "Đã lưu cấu hình Desktop.");
+    setTextIfChanged(settingsSaveStatus, t("settings.saved"));
   } catch (error) {
-    setTextIfChanged(settingsSaveStatus, nativeErrorText(error));
+    setTextIfChanged(settingsSaveStatus, localizedNativeError(error, "errors.config"));
   } finally {
     settingsBusy = false;
     settingsSave.disabled = backupSystemBusy();
@@ -3000,12 +3138,12 @@ async function saveAppSettings(): Promise<void> {
 async function openManagedWordPress(): Promise<void> {
   if (provisioningBusy || runtimeBusy || repairOperation || backupSystemBusy() || repairRouteRequired || openWordPress.disabled) return;
   openWordPress.disabled = true;
-  openWordPressStatus.textContent = "Đang mở WordPress bằng địa chỉ runtime hiện tại…";
+  openWordPressStatus.textContent = t("runtime.opening_wordpress");
   try {
     const url = await invoke<string>("open_wordpress");
-    openWordPressStatus.textContent = `Đã yêu cầu mở ${url}`;
+    openWordPressStatus.textContent = t("runtime.opened_url", { url });
   } catch (error) {
-    openWordPressStatus.textContent = nativeErrorText(error);
+    openWordPressStatus.textContent = localizedNativeError(error, "errors.runtime");
     await refreshRuntime();
   } finally {
     setRuntimeControls(currentRuntime);
@@ -3016,13 +3154,13 @@ async function openPos(): Promise<void> {
   if (provisioningBusy || runtimeBusy || repairOperation || backupSystemBusy() || repairRouteRequired || posOpenBusy || currentProvisioning?.state !== "ready") return;
   posOpenBusy = true;
   renderHome();
-  setTextIfChanged(homeOpenStatus, "Đang yêu cầu mở POS trong trình duyệt…");
+  setTextIfChanged(homeOpenStatus, t("runtime.opening_pos"));
   let feedback = "";
   try {
     await invoke<string>("open_pos");
-    feedback = "Đã yêu cầu mở trình duyệt. Đăng nhập trong CoffeePOS nếu được yêu cầu.";
+    feedback = t("runtime.opened_pos");
   } catch (error) {
-    feedback = nativeErrorText(error);
+    feedback = localizedNativeError(error, "errors.runtime");
     await refreshRuntime();
   } finally {
     posOpenBusy = false;
@@ -3034,17 +3172,23 @@ async function openPos(): Promise<void> {
 async function bootstrap(): Promise<void> {
   if (bootstrapBusy) return;
   bootstrapBusy = true;
+  languageResolutionPending = true;
+  delete document.documentElement.dataset.i18nReady;
   setup.hidden = true;
   installedShell.hidden = true;
+  languageChooser.hidden = true;
   bootstrapPanel.hidden = false;
   retry.hidden = true;
   retry.disabled = true;
-  title.textContent = "Đang mở cửa hàng…";
-  description.textContent = "Đang đọc trạng thái cài đặt.";
+  title.textContent = t("bootstrap.opening_title");
+  description.textContent = t("bootstrap.opening_description");
 
   if (!isTauri()) {
-    title.textContent = "Bản xem trước giao diện";
-    description.textContent = "Chạy npm run dev để mở ứng dụng desktop. Bản xem trước không gọi native provisioning hoặc runtime.";
+    setLocale("vi");
+    languageResolutionPending = false;
+    applyLocaleStaticText();
+    title.textContent = t("bootstrap.preview_title");
+    description.textContent = t("bootstrap.preview_description");
     bootstrapBusy = false;
     return;
   }
@@ -3061,13 +3205,24 @@ async function bootstrap(): Promise<void> {
     // Restore recovery must be read before provisioning/runtime work so a WebView reload cannot
     // race daily startup while a restore journal still owns the external admission gate.
     await refreshRestoreStatus();
-    if (restoreIsActive() || restoreNeedsRecovery()) return;
+    if (restoreIsActive() || restoreNeedsRecovery()) {
+      languageResolutionPending = false;
+      applyLocaleStaticText();
+      return;
+    }
 
     // Reconnect to an active native backup before provisioning/runtime reads. Backup status and
     // cancellation remain lock-independent so a WebView reload can resume progress immediately.
     await refreshBackupStatus();
     const provisioningLoaded = await refreshProvisioning();
     if (!provisioningLoaded) return;
+    if (freshProfileNeedsLanguageChoice()) {
+      showLanguageChooser();
+      return;
+    }
+    languageResolutionPending = false;
+    applyLocaleStaticText();
+    if (currentProvisioning) applyInstallationLayout(currentProvisioning);
     if (currentProvisioning?.state === "not_installed") {
       await refreshSetupInfo();
       if (currentProvisioning) renderProvisioning(currentProvisioning);
@@ -3088,6 +3243,16 @@ async function bootstrap(): Promise<void> {
 }
 
 retry.addEventListener("click", () => void bootstrap());
+for (const button of languageButtons) {
+  button.addEventListener("click", () => {
+    const language = button.dataset.language;
+    if (isAppLanguage(language)) void saveLanguage(language, "chooser");
+  });
+}
+settingsAppLanguage.addEventListener("change", () => {
+  const language = settingsAppLanguage.value;
+  if (isAppLanguage(language)) void saveLanguage(language, "settings");
+});
 setupRetry.addEventListener("click", () => {
   if (provisioningAction === "refresh") void refreshProvisioning();
   else void provision();
@@ -3155,7 +3320,7 @@ backupCreateAnother.addEventListener("click", () => showBackupPasswordStep());
 backupRetry.addEventListener("click", () => showBackupPasswordStep());
 backupPasswordCancel.addEventListener("click", () => {
   clearBackupPasswordFields();
-  setTextIfChanged(backupState, "Sẵn sàng");
+  setTextIfChanged(backupState, t("common.ready"));
   selectBackupView("landing", true);
   setBackupControls();
 });
@@ -3200,7 +3365,7 @@ setupForm.addEventListener("submit", async (event) => {
     applySetupInfo(info);
     selectSetupStep("review", true);
   } catch (error) {
-    message.textContent = nativeErrorText(error);
+    message.textContent = localizedNativeError(error, "errors.config");
     message.hidden = false;
   } finally {
     setupProfileBusy = false;

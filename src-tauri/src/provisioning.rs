@@ -5362,6 +5362,7 @@ fn provisioning_error(
     RuntimeErrorInfo {
         component: "provisioning".into(),
         operation: operation.into(),
+        code: "provisioning_error".into(),
         message: message.into(),
         recovery: recovery.into(),
     }

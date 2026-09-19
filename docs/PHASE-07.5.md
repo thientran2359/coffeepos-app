@@ -2,7 +2,7 @@
 
 Phase 7.5 thêm localization cho **CoffeePOS Desktop shell** với hai locale đầu tiên: `vi` và `en`. Người dùng chọn ngôn ngữ trước khi bắt đầu fresh onboarding, toàn bộ Desktop UI sau đó dùng locale đã chọn, và preference có thể đổi lại trong **Cấu hình** mà không cần restart app.
 
-> **Trạng thái:** đặc tả đã chốt cho implementation Phase 7.5. Windows-first. Scope này chỉ sở hữu ngôn ngữ của CoffeePOS Desktop; WordPress Admin, WooCommerce và CoffeePOS POS web app tiếp tục dùng locale riêng của chúng.
+> **Trạng thái:** đã triển khai Windows-first; automated UI/Rust checks pass, chờ manual Windows smoke/acceptance cho cả `vi` và `en`. Scope này chỉ sở hữu ngôn ngữ của CoffeePOS Desktop; WordPress Admin, WooCommerce và CoffeePOS POS web app tiếp tục dùng locale riêng của chúng.
 
 ## Mục tiêu
 

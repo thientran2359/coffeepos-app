@@ -132,6 +132,7 @@ impl CoffeePosHealthInfo {
 pub struct RuntimeErrorInfo {
     pub component: String,
     pub operation: String,
+    pub code: String,
     pub message: String,
     pub recovery: String,
 }
@@ -3501,7 +3502,8 @@ fn machine_component_error(
     component: &'static str,
     display_name: &'static str,
 ) -> RuntimeErrorInfo {
-    error_info(
+    error_info_with_code(
+        "runtime_health_error",
         component,
         "application health",
         format!(
@@ -3621,7 +3623,8 @@ fn append_bounded_log(path: &Path, stream: &str, text: &str) -> Result<(), Runti
 }
 
 fn log_error(error: io::Error) -> RuntimeErrorInfo {
-    error_info(
+    error_info_with_code(
+        "runtime_log_error",
         "runtime",
         "write log",
         format!("Cannot write runtime diagnostics: {error}."),
@@ -3630,7 +3633,8 @@ fn log_error(error: io::Error) -> RuntimeErrorInfo {
 }
 
 fn manifest_error(message: impl Into<String>) -> RuntimeErrorInfo {
-    error_info(
+    error_info_with_code(
+        "runtime_manifest_error",
         "runtime",
         "resolve manifest",
         message,
@@ -3639,7 +3643,8 @@ fn manifest_error(message: impl Into<String>) -> RuntimeErrorInfo {
 }
 
 fn not_installed_error(message: impl Into<String>) -> RuntimeErrorInfo {
-    error_info(
+    error_info_with_code(
+        "runtime_not_installed",
         "runtime",
         "preflight",
         message,
@@ -3653,9 +3658,20 @@ fn error_info(
     message: impl Into<String>,
     recovery: impl Into<String>,
 ) -> RuntimeErrorInfo {
+    error_info_with_code("runtime_error", component, operation, message, recovery)
+}
+
+fn error_info_with_code(
+    code: impl Into<String>,
+    component: impl Into<String>,
+    operation: impl Into<String>,
+    message: impl Into<String>,
+    recovery: impl Into<String>,
+) -> RuntimeErrorInfo {
     RuntimeErrorInfo {
         component: component.into(),
         operation: operation.into(),
+        code: code.into(),
         message: message.into(),
         recovery: recovery.into(),
     }

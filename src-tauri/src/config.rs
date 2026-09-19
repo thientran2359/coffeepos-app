@@ -16,6 +16,14 @@ pub enum StartupView {
     Diagnostics,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppLanguage {
+    #[default]
+    Vi,
+    En,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -24,6 +32,8 @@ pub struct AppConfig {
     pub bind_host: String,
     #[serde(default)]
     pub startup_view: StartupView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_language: Option<AppLanguage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_admin_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -37,6 +47,7 @@ impl Default for AppConfig {
             store_name: "My Coffee".into(),
             bind_host: "127.0.0.1".into(),
             startup_view: StartupView::Home,
+            app_language: None,
             setup_admin_username: None,
             setup_admin_email: None,
         }
@@ -155,6 +166,25 @@ fn disk_error(operation: &str, error: impl std::fmt::Display) -> String {
     format!("Configuration: cannot {operation}: {error}. Check application-data permissions and available disk space, then retry. Existing files are not reset automatically.")
 }
 
+fn invalid_config_error() -> String {
+    "Cannot read config/app.json: invalid configuration. The file has been preserved. Correct it or restore a known-good copy, then retry."
+        .to_string()
+}
+
+fn decode_config(bytes: &[u8]) -> Result<AppConfig, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| invalid_config_error())?;
+    if let Some(language) = value.get("app_language") {
+        if !language.is_null() && !matches!(language.as_str(), Some("vi" | "en")) {
+            return Err(
+                "Cannot read config/app.json: unsupported app_language. Use \"vi\" or \"en\". The file has been preserved."
+                    .to_string(),
+            );
+        }
+    }
+    serde_json::from_value(value).map_err(|_| invalid_config_error())
+}
+
 fn persist(path: &Path, config: &AppConfig) -> Result<(), String> {
     config.validate()?;
     let parent = path.parent().ok_or("Configuration directory is missing.")?;
@@ -175,6 +205,18 @@ fn persist(path: &Path, config: &AppConfig) -> Result<(), String> {
     Ok(())
 }
 
+pub fn read_app_language(root: &Path) -> Result<Option<AppLanguage>, String> {
+    let path = root.join("config/app.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(disk_error("read configuration", error)),
+    };
+    let config = decode_config(&bytes)?;
+    config.validate()?;
+    Ok(config.app_language)
+}
+
 impl Store {
     pub fn open(root: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(&root).map_err(|e| disk_error("create data directory", e))?;
@@ -192,7 +234,7 @@ impl Store {
         }
         let path = root.join("config/app.json");
         let config: AppConfig = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| "Cannot read config/app.json: invalid configuration. The file has been preserved. Correct it or restore a known-good copy, then retry.".to_string())?,
+            Ok(bytes) => decode_config(&bytes)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let config = AppConfig::default();
                 persist(&path, &config)?;
@@ -242,14 +284,27 @@ impl Store {
     }
 
     pub fn save_startup_view(&mut self, startup_view: StartupView) -> Result<(), String> {
+        self.save_desktop_preferences(startup_view, self.config.app_language)
+    }
+
+    pub fn save_desktop_preferences(
+        &mut self,
+        startup_view: StartupView,
+        app_language: Option<AppLanguage>,
+    ) -> Result<(), String> {
         let next = AppConfig {
             startup_view,
+            app_language,
             ..self.config.clone()
         };
         persist(&self.root.join("config/app.json"), &next)?;
         self.config = next;
         self.log("desktop application settings saved");
         Ok(())
+    }
+
+    pub fn save_app_language(&mut self, app_language: AppLanguage) -> Result<(), String> {
+        self.save_desktop_preferences(self.config.startup_view.clone(), Some(app_language))
     }
 
     fn log(&self, event: &str) {
@@ -316,8 +371,55 @@ mod tests {
         let reopened = Store::open(temp.path().to_owned()).unwrap();
         assert_eq!(reopened.config.store_name, "Legacy Coffee");
         assert_eq!(reopened.config.startup_view, StartupView::Home);
+        assert!(reopened.config.app_language.is_none());
         assert!(reopened.config.setup_admin_username.is_none());
         assert!(reopened.config.setup_admin_email.is_none());
+    }
+
+    #[test]
+    fn app_language_persists_without_changing_existing_profile_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_owned();
+        let mut store = Store::open(root.clone()).unwrap();
+        store
+            .save_setup_profile("Coffee & \"Co\" Café", "owner_52", "owner52@example.com")
+            .unwrap();
+        store.save_startup_view(StartupView::Diagnostics).unwrap();
+        store.save_app_language(AppLanguage::En).unwrap();
+
+        assert_eq!(store.config.app_language, Some(AppLanguage::En));
+        assert_eq!(store.config.startup_view, StartupView::Diagnostics);
+        assert_eq!(store.config.store_name, "Coffee & \"Co\" Café");
+        assert_eq!(
+            store.config.setup_admin_username.as_deref(),
+            Some("owner_52")
+        );
+        drop(store);
+
+        let reopened = Store::open(root.clone()).unwrap();
+        assert_eq!(reopened.config.app_language, Some(AppLanguage::En));
+        assert_eq!(read_app_language(&root).unwrap(), Some(AppLanguage::En));
+        let json = fs::read_to_string(root.join("config/app.json")).unwrap();
+        assert!(json.contains("\"schema_version\": 1"));
+        assert!(json.contains("\"app_language\": \"en\""));
+    }
+
+    #[test]
+    fn unsupported_app_language_is_rejected_without_rewriting_legacy_config() {
+        let temp = tempfile::tempdir().unwrap();
+        drop(Store::open(temp.path().to_owned()).unwrap());
+        let path = temp.path().join("config/app.json");
+        let bytes = r#"{"schema_version":1,"store_name":"Legacy Coffee","bind_host":"127.0.0.1","app_language":"fr"}"#;
+        fs::write(&path, bytes).unwrap();
+
+        let error = match Store::open(temp.path().to_owned()) {
+            Ok(_) => panic!("unsupported locale unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(error.contains("app_language"));
+        let language_error = read_app_language(temp.path()).unwrap_err();
+        assert!(language_error.contains("app_language"));
+        assert_eq!(fs::read_to_string(path).unwrap(), bytes);
     }
 
     #[test]
